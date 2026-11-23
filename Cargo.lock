@@ -2787,7 +2787,7 @@ dependencies = [
 
 [[package]]
 name = "mothrix-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2817,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "mothrix-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "mothrix-release"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "mothrix-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
