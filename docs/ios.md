@@ -12,7 +12,8 @@ reactions, threads and polls; search, room info, verification and key
 backup; drafts per chat. Polls show who voted for what. Swipe a message
 to answer it, double tap to react, hold it for the menu and who reacted;
 swipe a room to read, pin or mute it. Photos from the camera,
-voice messages, and "mothrix" in other apps' share sheet. Push
+voice messages, and "mothrix" in other apps' share sheet (it asks before
+sending to the room you tapped). Push
 notifications show who wrote what, decrypted on the phone; they can be
 answered or marked read right there, and go away once the room is read,
 here or on another device.

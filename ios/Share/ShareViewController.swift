@@ -4,7 +4,8 @@
 // the rooms the app last wrote into the shared folder (`share-rooms.json`;
 // the extension does not sync), and sends what was shared — pictures,
 // files, links, text — through Rust's short-lived client on the shared
-// store (`share`).
+// store (`share`), once the tapped room is confirmed (a mistap sends
+// nothing).
 
 import SwiftUI
 import UIKit
@@ -171,6 +172,8 @@ extension NSItemProvider {
 struct ShareView: View {
     @ObservedObject var model: ShareModel
     @State private var filter = ""
+    /// The room tapped: asked about before anything is sent.
+    @State private var confirming: ShareList.Room?
 
     private func color(_ hex: String?, _ fallback: Color) -> Color {
         guard let hex, let value = UInt32(hex.dropFirst(), radix: 16) else { return fallback }
@@ -210,7 +213,7 @@ struct ShareView: View {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(rooms(list)) { room in
                             Button {
-                                model.send(to: room)
+                                confirming = room
                             } label: {
                                 HStack(spacing: 0) {
                                     Text(room.isDm ? "@ " : "# ").foregroundStyle(dim)
@@ -230,11 +233,39 @@ struct ShareView: View {
                 Spacer()
             }
         }
+        .confirmationDialog(
+            confirmTitle,
+            isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+            titleVisibility: .visible,
+            presenting: confirming
+        ) { room in
+            Button("send") { model.send(to: room) }
+            Button("cancel", role: .cancel) {}
+        } message: { _ in
+            Text(what)
+        }
         .font(.system(.body, design: .monospaced))
         .padding(16)
         .background(bg)
         .foregroundStyle(fg)
         .preferredColorScheme(.dark)
+    }
+
+    /// "Send to # lunch?", with the account when there are several.
+    private var confirmTitle: String {
+        guard let room = confirming else { return "" }
+        let mark = room.isDm ? "@" : "#"
+        let several = Set(model.list?.rooms.map(\.account) ?? []).count > 1
+        let account = several ? " (" + room.account + ")" : ""
+        return "Send to " + mark + " " + room.name + account + "?"
+    }
+
+    /// What would go: the files by name, and the start of the message.
+    private var what: String {
+        var parts = model.files.map(\.lastPathComponent)
+        let text = model.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty { parts.append(text.count > 80 ? String(text.prefix(80)) + "…" : text) }
+        return parts.joined(separator: "\n")
     }
 
     private func rooms(_ list: ShareList) -> [ShareList.Room] {
