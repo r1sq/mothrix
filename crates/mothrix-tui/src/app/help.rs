@@ -83,6 +83,10 @@ const MESSAGE_BOX: &[(&str, &str)] = &[
         "Esc",
         "stop replying or editing; else leave the thread, or go to the room list",
     ),
+    (
+        "F6 or + format",
+        "format the word or line at the cursor (b bold, i italic, k code block …)",
+    ),
 ];
 
 const EMOJI_PICKER: &[(&str, &str)] = &[
@@ -94,6 +98,7 @@ const EMOJI_PICKER: &[(&str, &str)] = &[
 
 const MOUSE: &[(&str, &str)] = &[
     ("click", "open a room, select a message, press a button"),
+    ("double-click", "open a file or picture"),
     ("click a header", "fold or unfold a section"),
     ("right-click", "a room's menu"),
     ("wheel", "scroll the room list or the conversation"),
@@ -110,6 +115,7 @@ fn shortcut(name: &str) -> &'static str {
         "accounts" => "with several accounts: all of them, or one at a time",
         "unread" => "only unread chats, or all",
         "emoji" => "the emoji picker, for the message box",
+        "format" => "the format menu: bold, code, headings, lists … at the cursor",
         "theme" => "the next theme",
         "paste" => "paste a picture or text from the clipboard",
         "previous_room" => "the room above",

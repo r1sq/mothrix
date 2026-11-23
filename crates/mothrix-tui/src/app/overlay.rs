@@ -32,6 +32,7 @@ pub enum Overlay {
     Verify(VerifyState),
     EmojiPicker(EmojiPicker),
     Help(Help),
+    FormatMenu(FormatMenu),
 }
 
 /// The settings dialog.
@@ -105,7 +106,7 @@ impl Overlay {
                 help.filter.insert_str(text);
                 help.scroll = 0;
             }
-            Self::RecoveryKey(_) | Self::RoomMenu(_) | Self::Verify(_) => {}
+            Self::RecoveryKey(_) | Self::RoomMenu(_) | Self::Verify(_) | Self::FormatMenu(_) => {}
         }
     }
 }
@@ -165,6 +166,7 @@ overlay_kinds!(
     Verify(VerifyState),
     EmojiPicker(EmojiPicker),
     Help(Help),
+    FormatMenu(FormatMenu),
 );
 
 impl Overlays {
@@ -249,6 +251,7 @@ impl App {
             Overlay::Verify(_) => App::on_verify_key,
             Overlay::EmojiPicker(_) => App::on_emoji_picker_key,
             Overlay::Help(_) => |app, key, _| app.on_help_key(key),
+            Overlay::FormatMenu(_) => |app, key, _| app.on_format_menu_key(key),
         };
         handler(self, key, commands);
         true
@@ -368,6 +371,7 @@ mod tests {
             .into(),
             EmojiPicker::new(PickFor::Insert).into(),
             Help::default().into(),
+            FormatMenu::default().into(),
         ];
         // A new kind of dialog stops this from compiling until it is in
         // the list above.
@@ -385,7 +389,8 @@ mod tests {
                 | Overlay::Search(_)
                 | Overlay::Verify(_)
                 | Overlay::EmojiPicker(_)
-                | Overlay::Help(_) => {}
+                | Overlay::Help(_)
+                | Overlay::FormatMenu(_) => {}
             }
         }
         all

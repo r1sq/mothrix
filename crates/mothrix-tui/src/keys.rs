@@ -8,7 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The shortcuts that can be given another key: (name in the config, the
 /// built-in key).
-pub const ACTIONS: [(&str, &str); 13] = [
+pub const ACTIONS: [(&str, &str); 14] = [
     ("quit", "ctrl+q"),
     ("find_room", "ctrl+k"),
     ("search", "ctrl+f"),
@@ -16,6 +16,7 @@ pub const ACTIONS: [(&str, &str); 13] = [
     ("accounts", "f3"),
     ("unread", "f4"),
     ("emoji", "f5"),
+    ("format", "f6"),
     ("theme", "ctrl+t"),
     ("paste", "ctrl+v"),
     ("previous_room", "alt+up"),

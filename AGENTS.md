@@ -89,6 +89,7 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `app/suggestions.rs` | the popup above the message box (commands, files, @, emoji, spelling) |
 | `app/emoji_picker.rs` | the emoji picker dialog: search, the grid by group, reacting or putting one in |
 | `app/actions.rs` | what can be done to the selected message, with keys and labels |
+| `app/format_menu.rs` | the format menu (`F6`, `+ format`), and double-clicks opening files and pictures (tests) |
 | `app/help.rs` | the help dialog (`F1`, `?`, `/help`): the rebindable shortcuts and slash commands from their tables, the rest written there |
 | `app/dialogs.rs` | search, spelling, sections, the room menu |
 | `app/effects.rs` | `Effect`: what `App` asks of the world outside |
@@ -99,6 +100,7 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `accounts_tests.rs` | `Accounts` serving `App`, against stand-in backends |
 | `ui.rs` | drawing; records the clickable regions (`app.hits`) while drawing |
 | `input.rs` | the text field |
+| `format.rs` | Markdown formats for the message box, at the cursor (the format menu) |
 | `keys.rs` | key bindings, built in and from the config |
 | `theme.rs` | the core's themes (and the config's own) in ratatui colours |
 | `kitty.rs`, `sixel.rs` | pictures in the terminal |
@@ -270,7 +272,7 @@ target/debug/mothrix --snapshot 16 --room lunch \
 ```
 
 In a key script, words are typed and names in angle brackets are keys:
-`<enter> <tab> <esc> <up> <down> <space> <f1> <f2> <f3> <f4> <f5> <c-f>`; `<wait>` pauses
+`<enter> <tab> <esc> <up> <down> <space> <f1> <f2> <f3> <f4> <f5> <f6> <c-f>`; `<wait>` pauses
 two seconds. Keys start two seconds after the room opened, one every 150
 ms. `--room` matches a room's name or key. Leave enough `<wait>`s and
 seconds for the server to answer: a result that is "not there" is often

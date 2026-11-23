@@ -88,6 +88,10 @@ Everything the terminal client can do, by topic. Keys and commands are in
   mention that notifies them
 - `:name` suggests emoji (`:tada` → 🎉), the ones you take most first; an
   emoji picker (`F5`) with every emoji by group and a search line
+- A format menu (`F6`, `+ format`): bold, italic, strikethrough, code,
+  code blocks, headings, quotes, lists and links for the word or line at
+  the cursor
+- A double-click on a file or picture opens it
 - Spell checking while you type, several languages at once, offline
   (Hunspell); optional grammar and style checking by a LanguageTool server
   you name (see [usage.md](usage.md#spell-checking))

@@ -17,6 +17,7 @@ there is to find is in [features.md](features.md); the config file in
 | `F3` | with several accounts: all of them, or one at a time |
 | `F4` | only unread chats, or all |
 | `F5` | emoji picker: search and pick an emoji for the message box |
+| `F6` | format menu: bold, italic, strikethrough, code, code block, heading, quote, lists, link, for the word or line at the cursor |
 | `Alt+↑` `Alt+↓` | previous / next room |
 | `PgUp` `PgDn` | scroll the conversation |
 | `Ctrl+T` | next theme |
@@ -39,6 +40,13 @@ who reacted or read it, `d` delete, `o` open attachment, `Esc` back.
 **While typing:** `Alt+Enter` starts a new line. `@name` opens the member
 suggestions (`↑` `↓` choose, `Tab` or `Enter` completes, `Esc` closes);
 `:name` does the same for emoji. Clicking into the text places the cursor.
+`F6` or the `+ format` button opens the format menu: a letter (`b` bold,
+`i` italic, `s` strikethrough, `c` code, `k` code block, `h` heading, `q`
+quote, `l` list, `n` numbered list, `u` link) formats the word at the
+cursor, or the start of its line; doing it again takes it away. Messages
+are sent as Markdown, so typing the marks yourself works the same.
+
+**With the mouse**, a double-click on a file or picture opens it (as `o`).
 
 **In the emoji picker** (`F5`, the `+ emoji` button, or `0` on the
 reaction row): type to search by name (`heart`, `party`, `tada`), arrows

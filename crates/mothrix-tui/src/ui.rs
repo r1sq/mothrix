@@ -36,6 +36,7 @@ const JUMP_LABEL: &str = " ↓ jump to newest ";
 const POLL_BUTTON: &str = " + poll ";
 const FILE_BUTTON: &str = " + file ";
 const EMOJI_BUTTON: &str = " + emoji ";
+const FORMAT_BUTTON: &str = " + format ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits.clear();
@@ -103,6 +104,7 @@ fn draw_overlays(frame: &mut Frame, app: &mut App, area: Rect) {
             Overlay::Verify(state) => draw_verify(frame, app, area, state),
             Overlay::EmojiPicker(picker) => draw_emoji_picker(frame, app, area, picker),
             Overlay::Help(help) => draw_help(frame, app, area, help),
+            Overlay::FormatMenu(menu) => draw_format_menu(frame, app, area, menu),
         }
     }
 }
@@ -1739,11 +1741,17 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
         title,
         Style::new().fg(title_color),
     )));
-    let buttons_width = EMOJI_BUTTON.width() + FILE_BUTTON.width() + POLL_BUTTON.width() + 2;
+    let buttons_width = FORMAT_BUTTON.width()
+        + EMOJI_BUTTON.width()
+        + FILE_BUTTON.width()
+        + POLL_BUTTON.width()
+        + 3;
     let show_buttons = app.state.open_room.is_some() && area.width as usize > buttons_width + 24;
     if show_buttons {
         block = block.title(
             Line::from(vec![
+                Span::styled(FORMAT_BUTTON, Style::new().fg(theme.accent)),
+                Span::raw(" "),
                 Span::styled(EMOJI_BUTTON, Style::new().fg(theme.accent)),
                 Span::raw(" "),
                 Span::styled(FILE_BUTTON, Style::new().fg(theme.accent)),
@@ -1802,6 +1810,20 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
                 height: 1,
             },
             action: HitAction::OpenEmojiPicker,
+        });
+        let format_width = FORMAT_BUTTON.width() as u16;
+        let format_x = poll_x - 3 - file_width - emoji_width - format_width;
+        app.hits.push(Hit {
+            rect: Rect {
+                x: format_x,
+                y: area.y,
+                width: format_width,
+                height: 1,
+            },
+            action: HitAction::OpenFormatMenu {
+                x: format_x,
+                y: area.y,
+            },
         });
     }
     if inner.width < 4 || inner.height == 0 {
@@ -2736,6 +2758,72 @@ fn draw_reset(frame: &mut Frame, app: &mut App, area: Rect, input: &Input) {
         Paragraph::new(Span::styled(" Enter reset · Esc cancel", dim)),
         line_at(inner, inner.height.saturating_sub(1)),
     );
+}
+
+/// The format menu: each format with its key, over the message box.
+fn draw_format_menu(frame: &mut Frame, app: &mut App, area: Rect, menu: crate::app::FormatMenu) {
+    use crate::format::Format;
+    let theme = app.theme;
+    let rows: Vec<(Format, String)> = Format::ALL
+        .iter()
+        .map(|format| {
+            let label = format!(" {}  {:<14}", format.key(), format.label());
+            (*format, label)
+        })
+        .collect();
+    let example_width = Format::ALL
+        .iter()
+        .map(|format| format.example().width())
+        .max()
+        .unwrap_or(0);
+    let width = (rows[0].1.width() + example_width + 3) as u16;
+    let height = rows.len() as u16 + 2;
+    if area.width < width || area.height < height {
+        return;
+    }
+    // Above the button (the message box is at the bottom), else below.
+    let y = if menu.y >= area.y + height {
+        menu.y - height
+    } else {
+        (menu.y + 1).min(area.bottom() - height)
+    };
+    let rect = Rect {
+        x: menu.x.min(area.right() - width),
+        y,
+        width,
+        height,
+    };
+    app.hits.push(Hit {
+        rect,
+        action: HitAction::Blocked,
+    });
+    frame.render_widget(Clear, rect);
+    let block = panel(&theme, true);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    for (index, (format, label)) in rows.iter().enumerate() {
+        let row = Rect {
+            y: inner.y + index as u16,
+            height: 1,
+            ..inner
+        };
+        let mut style = Style::new().fg(theme.fg);
+        if index == menu.cursor {
+            style = style.bg(theme.selection_bg).fg(theme.selection_fg);
+        }
+        let line = Line::from(vec![
+            Span::styled(label.clone(), style),
+            Span::styled(
+                format!("{:<example_width$} ", format.example()),
+                style.fg(theme.dim),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(style), row);
+        app.hits.push(Hit {
+            rect: row,
+            action: HitAction::FormatPick(*format),
+        });
+    }
 }
 
 /// The help: every key and command, narrowed by what is typed.

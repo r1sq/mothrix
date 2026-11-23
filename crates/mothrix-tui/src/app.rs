@@ -29,6 +29,7 @@ mod actions;
 mod dialogs;
 mod effects;
 mod emoji_picker;
+mod format_menu;
 mod help;
 mod overlay;
 mod roominfo;
@@ -55,6 +56,7 @@ pub use dialogs::{
     RoomMenu, RoomMenuItem, Search, SectionEdit, SectionManager, SectionPicker, SectionRow,
 };
 
+pub use format_menu::FormatMenu;
 pub use help::{Help, HelpLine};
 pub use settings::Setting;
 pub use updates::Updates;
@@ -102,6 +104,9 @@ impl Graphics {
 }
 
 /// The commands of the message box: (name, what it does, takes an argument).
+/// Two clicks on a message within this are a double-click.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
 pub const COMMANDS: [(&str, &str, bool); 23] = [
     ("me", "<action>  say what you are doing", true),
     (
@@ -260,6 +265,13 @@ pub enum HitAction {
     FileTemplate,
     /// Open the emoji picker for the message box.
     OpenEmojiPicker,
+    /// Open the format menu (where its button is).
+    OpenFormatMenu {
+        x: u16,
+        y: u16,
+    },
+    /// Apply this format to the message box.
+    FormatPick(crate::format::Format),
     /// Take this emoji of the picker.
     EmojiPick(String),
     /// Complete the @-mention with this suggestion (index into the popup).
@@ -317,6 +329,8 @@ pub struct App {
     pub state: crate::client_state::ClientState,
     /// New releases of mothrix itself.
     pub updates: updates::Updates,
+    /// The message clicked last, and when: for double-clicks.
+    last_click: Option<(String, std::time::Instant)>,
     /// What is to be done outside, in order (see [`Effect`]).
     effects: Vec<Effect>,
     /// The dialogs and menus open over the main screen.
@@ -421,6 +435,7 @@ impl App {
                 verified: None,
             }]),
             updates: updates::Updates::new(crate::update::Build::Development, false),
+            last_click: None,
             overlays: Overlays::default(),
             viewport: Viewport::default(),
             effects: Vec::new(),
@@ -1323,6 +1338,7 @@ impl App {
                 self.open_emoji_picker(PickFor::Insert);
                 return;
             }
+            KeyCode::F(6) => return self.open_format_menu_at_composer(),
             KeyCode::Up if alt => return self.open_neighbour(-1, commands),
             KeyCode::Down if alt => return self.open_neighbour(1, commands),
             KeyCode::PageUp => {
@@ -1797,6 +1813,23 @@ impl App {
             HitAction::CloseThread => self.leave_thread(commands),
             HitAction::OpenLink(address) => commands.push(Command::OpenLink(address)),
             HitAction::Select(event_id) => {
+                // A second click on the same message soon after: a
+                // double-click, which opens a file or picture.
+                let now = std::time::Instant::now();
+                let double = self.last_click.take().is_some_and(|(id, at)| {
+                    id == event_id && now.duration_since(at) <= DOUBLE_CLICK
+                });
+                if double {
+                    self.select(event_id);
+                    let media = self
+                        .selected_item()
+                        .is_some_and(|item| matches!(item.kind, ItemKind::Media));
+                    if media {
+                        self.on_bar(BarAction::Open, commands);
+                    }
+                    return;
+                }
+                self.last_click = Some((event_id.clone(), now));
                 if self.selected.as_deref() == Some(event_id.as_str()) {
                     self.clear_selection();
                 } else {
@@ -1833,6 +1866,8 @@ impl App {
                 );
             }
             HitAction::OpenEmojiPicker => self.open_emoji_picker(PickFor::Insert),
+            HitAction::OpenFormatMenu { x, y } => self.open_format_menu(x, y),
+            HitAction::FormatPick(format) => self.apply_format(format),
             HitAction::EmojiPick(emoji) => self.pick_emoji(emoji, commands),
             HitAction::CancelCompose => self.cancel_compose(),
             HitAction::MentionPick(index) => {

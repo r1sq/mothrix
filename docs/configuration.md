@@ -69,7 +69,7 @@ settings = "f9"
 ```
 
 Shortcuts that can get another key: `quit`, `find_room`, `search`,
-`settings`, `accounts`, `unread`, `emoji`, `theme`, `paste`,
+`settings`, `accounts`, `unread`, `emoji`, `format`, `theme`, `paste`,
 `previous_room`, `next_room`, `switch_pane`, `scroll_up`. A key needs
 Ctrl or Alt, or is an F key, so that typing stays possible. A mistake in
 these entries is named in the status bar at the start.

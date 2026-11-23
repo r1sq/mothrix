@@ -6,6 +6,7 @@
 mod accounts_tests;
 mod app;
 mod config;
+mod format;
 mod input;
 mod keys;
 mod kitty;
@@ -114,6 +115,7 @@ Inside mothrix (F1 or ? shows every key and command):
   F3           with several accounts: show all, or one at a time
   F4           only unread chats, or all
   F5           all emoji: search, pick one for the message box
+  F6           format the word or line at the cursor (bold, code, lists …)
   PgUp/PgDn    scroll the conversation Ctrl+T        next colour theme
   Enter        open room / send        Ctrl+Q        quit
   room list    p pin, l low priority, s sort, i room info, M notifications,
@@ -1421,6 +1423,7 @@ fn script_keys(script: &str) -> std::collections::VecDeque<Event> {
             Some("f3") => KeyCode::F(3),
             Some("f4") => KeyCode::F(4),
             Some("f5") => KeyCode::F(5),
+            Some("f6") => KeyCode::F(6),
             Some("wait") => {
                 keys.push_back(Event::FocusGained);
                 continue;
