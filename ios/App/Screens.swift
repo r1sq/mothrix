@@ -1827,6 +1827,8 @@ struct ForwardView: View {
     @EnvironmentObject var store: Store
     @Environment(\.dismiss) private var dismiss
     let message: Message
+    /// The room tapped: asked about before the message goes.
+    @State private var confirming: RoomEntry?
 
     /// The rooms of every account, the open room's first.
     private var rooms: [RoomEntry] {
@@ -1845,8 +1847,7 @@ struct ForwardView: View {
         NavigationStack {
             List(rooms) { room in
                 Button {
-                    store.forward(message.eventId, to: room.id)
-                    dismiss()
+                    confirming = room
                 } label: {
                     Text(name(room)).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                 }
@@ -1863,6 +1864,18 @@ struct ForwardView: View {
                 Title(text: "forward to")
                 ToolbarItem(placement: .topBarTrailing) { WordButton("[cancel]") { dismiss() } }
                     .sharedBackgroundVisibility(.hidden)
+            }
+            .confirmationDialog(
+                "Forward to " + (confirming.map { name($0) } ?? "") + "?",
+                isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+                titleVisibility: .visible,
+                presenting: confirming
+            ) { room in
+                Button("forward") {
+                    store.forward(message.eventId, to: room.id)
+                    dismiss()
+                }
+                Button("cancel", role: .cancel) {}
             }
             .toolbarBackground(store.theme.bg, for: .navigationBar)
         }
