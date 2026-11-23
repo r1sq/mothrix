@@ -1,0 +1,188 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# The iOS app, on a Mac runner (label `macos`, a background service: no GUI
+# session, no actions cache; cargo keeps its target folder in
+# ~/ci-target). On every push that touches it: build and
+# test in the simulator. By hand (Actions → ios → Run workflow, with
+# "testflight"): an archive, signed with the App Store Connect API key,
+# uploaded to TestFlight.
+#
+# Secrets: APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8 (the key
+# file's text), CI_KEYCHAIN_PASSWORD.
+name: ios
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "ios/**"
+      - "Cargo.lock"
+      - ".forgejo/workflows/ios.yml"
+  workflow_dispatch:
+    inputs:
+      testflight:
+        description: Upload to TestFlight
+        type: boolean
+        default: false
+
+jobs:
+  ios:
+    runs-on: macos
+    timeout-minutes: 120
+    env:
+      # Xcode, whatever `xcode-select` says: with the Command Line Tools
+      # selected there is no iOS SDK and no simulator.
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    steps:
+      - name: What the Mac has
+        run: |
+          set +e
+          whoami; sw_vers -productVersion; df -h / | tail -1
+          xcode-select -p; xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun simctl list runtimes
+          command -v git cargo rustup xcodegen node
+          which -a xcrun clang cc ld
+          echo "PATH=$PATH"
+          rustup show
+          xcodegen --version
+          true
+
+      - uses: actions/checkout@v4
+
+      # Cargo's target folder lives outside the work folder, which every
+      # run starts empty: otherwise all three builds (iPhone, simulator,
+      # the host's for the bindings) start from nothing each time. Old
+      # builds pile up in it, so past 40 GB it starts over.
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --target aarch64-apple-ios --target aarch64-apple-ios-sim
+          rustup default stable
+          dir="$HOME/ci-target/mothrix"
+          if [ -d "$dir" ] && [ "$(du -sk "$dir" | cut -f1)" -gt $((40 * 1024 * 1024)) ]; then
+            echo "The kept target folder is over 40 GB: starting it over."
+            rm -rf "$dir"
+          fi
+          mkdir -p "$dir"
+          echo "CARGO_TARGET_DIR=$dir" >> "$GITHUB_ENV"
+
+      # caffeinate -i: no idle sleep while it builds (a sleeping Mac
+      # ends the job). On battery the Mac goes to sleep all the same, lid
+      # open or not, and the job then runs only in its short maintenance
+      # wakes (seen 2026-11-20: 45 minutes instead of 15): keep it on power.
+      - name: The Rust library and its Swift bindings
+        run: caffeinate -i ios/build-rust.sh
+
+      - name: The Xcode project
+        run: cd ios && xcodegen
+
+      # Not for TestFlight: those builds were tested when they were pushed.
+      - name: Build and test in the simulator
+        if: ${{ !inputs.testflight }}
+        run: |
+          cd ios
+          # A plain iPhone, not the foldable that comes first in the list,
+          # and not the iPhone 18 Pro that is driven by hand over SSH.
+          device=$(xcrun simctl list devices available | grep -o 'iPhone 17e' | head -1)
+          [ -n "$device" ] || device=$(xcrun simctl list devices available | grep -v "18 Pro\|Duo" | grep -m1 -o 'iPhone [^(]*' | sed 's/ *$//')
+          if [ -n "$device" ]; then
+            caffeinate -i xcodebuild test -project Mothrix.xcodeproj -scheme Mothrix \
+              -destination "platform=iOS Simulator,name=$device" \
+              CODE_SIGNING_ALLOWED=NO | tail -n 60
+          else
+            echo "No simulator here: building only."
+            caffeinate -i xcodebuild build -project Mothrix.xcodeproj -scheme Mothrix \
+              -destination 'generic/platform=iOS Simulator' \
+              CODE_SIGNING_ALLOWED=NO | tail -n 60
+          fi
+          exit ${PIPESTATUS[0]}
+
+      - name: Keychain for signing
+        if: ${{ inputs.testflight }}
+        env:
+          PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
+        run: |
+          # Kept between runs, so that Xcode's certificate is reused. The
+          # ci user never logged in: it has no login keychain, which is
+          # where Xcode puts the certificates it makes (elsewhere it fails
+          # with "Write permissions error"). So the login keychain is ours.
+          mkdir -p "$HOME/Library/Keychains"
+          keychain="$HOME/Library/Keychains/login.keychain-db"
+          [ -f "$keychain" ] || security create-keychain -p "$PASSWORD" "$keychain"
+          security unlock-keychain -p "$PASSWORD" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          security list-keychains -d user
+          security default-keychain -d user
+          # Can a private key be stored here? If not, stop now: Xcode would
+          # make a certificate it cannot keep, and that one has to be
+          # revoked by hand before the next try.
+          probe="$RUNNER_TEMP/probe"
+          mkdir -p "$probe"
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$probe/k.pem" -out "$probe/c.pem" \
+            -days 1 -subj "/CN=mothrix keychain probe" 2>/dev/null
+          openssl pkcs12 -export -inkey "$probe/k.pem" -in "$probe/c.pem" -out "$probe/p.p12" -passout pass:probe
+          if ! security import "$probe/p.p12" -k "$keychain" -P probe -T /usr/bin/codesign; then
+            rm -rf "$probe"
+            echo "::error::A key cannot be stored in the keychain: stopping before Xcode makes a certificate."
+            exit 1
+          fi
+          security delete-identity -c "mothrix keychain probe" "$keychain" || true
+          rm -rf "$probe"
+          # Apple's intermediate certificate, which a developer certificate
+          # is checked against; without it codesign cannot build the chain.
+          curl -fsSL -o "$RUNNER_TEMP/wwdr-g3.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          security import "$RUNNER_TEMP/wwdr-g3.cer" -k "$keychain" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/wwdr-g3.cer"
+          # codesign may use the keys without asking (nobody is there to
+          # answer): errSecInternalComponent otherwise.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$keychain" >/dev/null
+
+      - name: Archive and upload to TestFlight
+        if: ${{ inputs.testflight }}
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          cd ios
+          key="$RUNNER_TEMP/asc-key.p8"
+          printf '%s\n' "$KEY_P8" > "$key"
+          trap 'rm -f "$key"' EXIT
+          auth=(-allowProvisioningUpdates
+                -authenticationKeyPath "$key"
+                -authenticationKeyID "$KEY_ID"
+                -authenticationKeyIssuerID "$ISSUER")
+          # codesign cannot use keychain keys from the runner's session (no
+          # user is logged in: errSecInternalComponent). So the archive is
+          # built unsigned, signed ad hoc here with its entitlements (no
+          # keychain needed), and the export below signs with Apple's
+          # cloud-managed distribution certificate.
+          caffeinate -i xcodebuild archive -project Mothrix.xcodeproj -scheme Mothrix \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath build/Mothrix.xcarchive \
+            DEVELOPMENT_TEAM="$TEAM" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            CODE_SIGNING_ALLOWED=NO
+          app=build/Mothrix.xcarchive/Products/Applications/Mothrix.app
+          codesign --force --sign - --entitlements NSE/MothrixNSE.entitlements "$app/PlugIns/MothrixNSE.appex"
+          codesign --force --sign - --entitlements Share/MothrixShare.entitlements "$app/PlugIns/MothrixShare.appex"
+          codesign --force --sign - --entitlements App/Mothrix.entitlements "$app"
+          codesign -d --entitlements - "$app" 2>/dev/null | head -20
+          cat > build/export.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$TEAM</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath build/Mothrix.xcarchive \
+            -exportOptionsPlist build/export.plist -exportPath build/export \
+            "${auth[@]}" || { find "$TMPDIR" -name "IDEDistribution*.log" -newer build/export.plist \
+              -exec tail -n 40 {} \; 2>/dev/null; exit 1; }

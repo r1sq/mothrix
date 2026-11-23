@@ -1,0 +1,4 @@
+# Made by build-rust.sh and xcodegen.
+/Generated/
+/build/
+/Mothrix.xcodeproj/

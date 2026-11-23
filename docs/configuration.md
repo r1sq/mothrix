@@ -1,0 +1,75 @@
+# Configuration
+
+Most of it is in the settings dialog (`F2`); this is what the file holds,
+and what only the file can do: your own colours and keys.
+
+## Where mothrix keeps its files
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Settings | `~/.config/mothrix/config.toml` | `~/Library/Application Support/mothrix/config.toml` | `%APPDATA%\mothrix\config.toml` |
+| Accounts | `~/.local/share/mothrix/<profile>/` | `~/Library/Application Support/mothrix/<profile>/` | `%APPDATA%\mothrix\<profile>\` |
+| Attachments you opened | `~/.cache/mothrix/media/` | `~/Library/Caches/mothrix/media/` | `%LOCALAPPDATA%\mothrix\media\` |
+
+Each account's folder holds its session, encryption keys and log; the
+session file contains your access token and is readable only by you.
+Next to the accounts: `emoji.json` (the emoji you take most) and
+`dictionaries/`; next to the settings: `words.txt` (words the spell check
+ignores).
+
+## The settings
+
+`config.toml` holds what the settings dialog changes:
+
+- `theme`, `sort`, `images = "auto"|"kitty"|"sixel"|"blocks"|"off"` (set
+  `"blocks"` if pictures show up as odd characters, e.g. inside a terminal
+  multiplexer)
+- switches (`true`/`false`): `notifications`, `spellcheck`, `room_events`,
+  `mixed_list`, `spaces`, `typing_notices`, `read_receipts`,
+  `link_previews`, `updates` (look for a new release daily; see
+  [updates.md](updates.md))
+- `long_messages` (lines before a message folds, `0` for never)
+- `spell_languages`, `languagetool_url`, `languagetool_languages`,
+  `languagetool_username`, `languagetool_api_key`
+- `proxy = "http://proxy:3128"` for networks without a direct way out;
+  without it, the `HTTPS_PROXY` or `ALL_PROXY` environment variable, else
+  direct (automatic proxy discovery is not used)
+- `account` (the profile the room list shows; empty for all),
+  `[account_names]` (your names for accounts), `folded` (folded sections),
+  `[[sections]]` (your sections; the accounts keep them too, and what they
+  keep wins at the start)
+
+## Your own colours
+
+Write themes into `config.toml`, as many as you like:
+
+```toml
+theme = "goa"
+
+[[themes]]
+name = "goa"
+base = "catppuccin"         # start from a built-in theme (default: mothrix)
+accent = "#ff00aa"          # change what you want: fg, dim, accent, border,
+unread = "#ffee00"          # selection_bg, selection_fg, unread, mention,
+senders = ["#00ffcc", "#ffee00", "#ff00aa"]   # error, success; names of people
+```
+
+The built-in themes are `mothrix`, `tokyo-night`, `catppuccin`,
+`gruvbox`, `nord`, `everforest` and `rose-pine`. `Ctrl+T` goes through
+them all, yours included.
+
+## Your own keys
+
+A second key for a shortcut; the built-in one stays:
+
+```toml
+[keys]
+search = "ctrl+s"
+settings = "f9"
+```
+
+Shortcuts that can get another key: `quit`, `find_room`, `search`,
+`settings`, `accounts`, `unread`, `emoji`, `theme`, `paste`,
+`previous_room`, `next_room`, `switch_pane`, `scroll_up`. A key needs
+Ctrl or Alt, or is an F key, so that typing stays possible. A mistake in
+these entries is named in the status bar at the start.

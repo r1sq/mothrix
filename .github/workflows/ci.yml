@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# Formatting, lints and tests of all crates, on Linux. The iPhone app is
+# built elsewhere (.forgejo/workflows/ios.yml, on a Mac runner).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: What the build and the spell-check test use
+        run: sudo apt-get update && sudo apt-get install -y cmake clang hunspell-en-us
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

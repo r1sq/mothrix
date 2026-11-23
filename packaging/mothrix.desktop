@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=mothrix
+GenericName=Matrix Client
+Comment=A terminal Matrix client with a room sidebar and mouse support
+Exec=mothrix
+Icon=mothrix
+Terminal=true
+Categories=Network;InstantMessaging;Chat;ConsoleOnly;
+Keywords=matrix;chat;messenger;

@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MPL-2.0
+#
+# By hand: does signing work on the Mac's runner? Sets up the keychain as
+# the ios workflow does and signs a small binary with the Apple Development
+# identity, printing what codesign and the keychain say. A minute, instead
+# of a whole iOS build, to find out.
+name: ios-sign-check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sign:
+    runs-on: macos
+    timeout-minutes: 10
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
+    steps:
+      - name: Keychain and a test signature
+        run: |
+          set -x
+          keychain="$HOME/Library/Keychains/login.keychain-db"
+          security unlock-keychain -p "$PASSWORD" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          security list-keychains
+          security show-keychain-info "$keychain"
+          security find-identity -v -p codesigning
+          security find-identity -v -p codesigning "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$keychain" | tail -3
+          cp /bin/echo "$RUNNER_TEMP/probe"
+          # The intermediate certificates: which, and until when.
+          security find-certificate -a -c "Apple Worldwide Developer Relations" -p "$keychain" > "$RUNNER_TEMP/wwdr.pem"
+          csplit -s -k -f "$RUNNER_TEMP/wwdr-" "$RUNNER_TEMP/wwdr.pem" '/BEGIN CERT/' '{9}' 2>/dev/null || true
+          for c in "$RUNNER_TEMP"/wwdr-*; do
+            openssl x509 -in "$c" -noout -subject -enddate 2>/dev/null || true
+          done
+          # The developer certificate's chain, as the system sees it.
+          security find-certificate -c "Apple Development" -p "$keychain" > "$RUNNER_TEMP/dev.pem"
+          openssl x509 -in "$RUNNER_TEMP/dev.pem" -noout -issuer -enddate
+          security verify-cert -c "$RUNNER_TEMP/dev.pem" -p codeSign -k "$keychain" || true
+          security verify-cert -c "$RUNNER_TEMP/dev.pem" -p codeSign || true
+          # Signing by fingerprint, with no timestamp server in between.
+          codesign --force --timestamp=none --sign D93C3A68218568F1CB704D4D320680753AD62761 \
+            --keychain "$keychain" "$RUNNER_TEMP/probe" || true
+          rm -f "$RUNNER_TEMP"/wwdr* "$RUNNER_TEMP/dev.pem" "$RUNNER_TEMP/probe"
+          # Apple's root certificate in the keychain itself: the runner's
+          # session may not reach the system's roots when building a chain.
+          curl -fsSL -o "$RUNNER_TEMP/root.cer" https://www.apple.com/appleca/AppleIncRootCertificate.cer
+          security import "$RUNNER_TEMP/root.cer" -k "$keychain" || true
+          rm -f "$RUNNER_TEMP/root.cer"
+          cp /bin/echo "$RUNNER_TEMP/probe2"
+          codesign --force --timestamp=none --sign D93C3A68218568F1CB704D4D320680753AD62761 \
+            --keychain "$keychain" "$RUNNER_TEMP/probe2" && codesign -dvv "$RUNNER_TEMP/probe2" 2>&1 | grep Authority
+          rm -f "$RUNNER_TEMP/probe2"

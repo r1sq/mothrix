@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: MPL-2.0
+# The Xcode project, made with `xcodegen` (after ios/build-rust.sh).
+name: Mothrix
+options:
+  bundleIdPrefix: de.tmrk
+  deploymentTarget:
+    iOS: "26.0"
+# The version is Cargo.toml's: build-rust.sh writes it there.
+configFiles:
+  Debug: build/Version.xcconfig
+  Release: build/Version.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    # Given at build time: xcodebuild … DEVELOPMENT_TEAM=<team id>
+    DEVELOPMENT_TEAM: ""
+    # iPhone only for now (the iPad would need its layout, see docs/ios.md).
+    TARGETED_DEVICE_FAMILY: "1"
+    CURRENT_PROJECT_VERSION: "1"
+    # What the Rust library needs of the system.
+    OTHER_LDFLAGS: ["-framework", "Security", "-framework", "SystemConfiguration", "-lresolv"]
+targets:
+  Mothrix:
+    type: application
+    platform: iOS
+    sources:
+      - App
+      - Generated
+    dependencies:
+      - framework: build/MothrixFFI.xcframework
+        embed: false
+      - target: MothrixNSE
+      - target: MothrixShare
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: mothrix
+        # The theme's night with the logo, before the app draws itself.
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+          UIImageName: LaunchLogo
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIRequiresFullScreen: true
+        UIBackgroundModes: [remote-notification]
+        ITSAppUsesNonExemptEncryption: false
+        NSPhotoLibraryUsageDescription: Pictures you choose are sent to the chat.
+        NSCameraUsageDescription: Photos you take are sent to the chat.
+        NSMicrophoneUsageDescription: Voice messages you record are sent to the chat.
+    entitlements:
+      path: App/Mothrix.entitlements
+      properties:
+        aps-environment: development
+        com.apple.security.application-groups: [group.de.tmrk.mothrix]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: de.tmrk.mothrix
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Per target: XcodeGen's iOS preset sets "1,2" (iPhone and iPad) here.
+        TARGETED_DEVICE_FAMILY: "1"
+  MothrixNSE:
+    type: app-extension
+    platform: iOS
+    sources:
+      - NSE
+      - Generated
+    dependencies:
+      - framework: build/MothrixFFI.xcframework
+        embed: false
+    info:
+      path: NSE/Info.plist
+      properties:
+        CFBundleDisplayName: mothrix
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    entitlements:
+      path: NSE/MothrixNSE.entitlements
+      properties:
+        com.apple.security.application-groups: [group.de.tmrk.mothrix]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: de.tmrk.mothrix.nse
+        TARGETED_DEVICE_FAMILY: "1"
+  MothrixShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Share
+      - Generated
+    dependencies:
+      - framework: build/MothrixFFI.xcframework
+        embed: false
+    info:
+      path: Share/Info.plist
+      properties:
+        CFBundleDisplayName: mothrix
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 10
+              NSExtensionActivationSupportsMovieWithMaxCount: 5
+              NSExtensionActivationSupportsFileWithMaxCount: 10
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
+    entitlements:
+      path: Share/MothrixShare.entitlements
+      properties:
+        com.apple.security.application-groups: [group.de.tmrk.mothrix]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: de.tmrk.mothrix.share
+        TARGETED_DEVICE_FAMILY: "1"
+  MothrixTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: MothrixTests
+        excludes: ["Fixtures/**"]
+    dependencies:
+      - target: Mothrix
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: de.tmrk.mothrix.tests
+schemes:
+  Mothrix:
+    build:
+      targets:
+        Mothrix: all
+    test:
+      targets: [MothrixTests]

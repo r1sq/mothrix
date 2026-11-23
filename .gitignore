@@ -1,0 +1,8 @@
+/target
+
+# Pictures dropped into the root to work from (the logo sources); they
+# live in assets/ once used.
+/*.png
+
+# Where this machine finds the Mac for the iOS builds (dev/local.env.example).
+/dev/local.env

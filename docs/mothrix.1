@@ -1,0 +1,171 @@
+.\" SPDX-License-Identifier: MPL-2.0
+.TH MOTHRIX 1 "2026" "mothrix 0.1.0" "User Commands"
+.SH NAME
+mothrix \- a terminal Matrix client with a room sidebar and mouse support
+.SH SYNOPSIS
+.B mothrix
+.RB [ \-\-profile
+.IR NAME ]
+.br
+.B mothrix login
+.RI [ SERVER ]
+.RB [ \-\-user
+.IR NAME ]
+.RB [ \-\-password ]
+.RB [ \-\-profile
+.IR NAME ]
+.br
+.B mothrix accounts
+.br
+.B mothrix logout
+.RB [ \-\-profile
+.IR NAME ]
+.br
+.B mothrix dictionary
+.RI [ LANGUAGE ]
+.br
+.B mothrix events
+.RI [ ROOM ]
+.RB [ \-\-limit
+.IR N ]
+.br
+.B mothrix pushers
+.RB [ list | add
+.I URL
+.B \-\-app\-id
+.I ID
+.B \-\-pushkey
+.IR KEY | remove
+.B \-\-app\-id
+.I ID
+.B \-\-pushkey
+.IR KEY ]
+.SH DESCRIPTION
+.B mothrix
+is a Matrix client for the terminal. Rooms and people are listed on the
+left, the conversation is on the right, and everything that can be done
+with a key can also be clicked.
+.PP
+Without arguments it starts with all signed-in accounts, and asks for a
+homeserver first if there is none.
+.PP
+New messages are announced on the desktop with
+.BR notify-send ,
+on Windows as toasts. In kitty the terminal shows the notifications
+itself. Clicking one, in kitty or on Windows, brings the terminal to the
+front with that chat open.
+.SH COMMANDS
+.TP
+.BI "login " "[SERVER]"
+Sign in.
+.I SERVER
+is a homeserver name or address, or a full Matrix ID. Browser sign-in is
+used where the server offers it;
+.B \-\-password
+asks for the password instead. With
+.BI \-\-profile " NAME"
+the account is added next to the ones already there, under that name.
+.TP
+.B accounts
+List the signed-in accounts.
+.TP
+.B update
+Install a new release, if there is one (only the release files from
+GitHub; a package says to update it with the package manager). The
+release is checked against mothrix's signature first.
+.TP
+.B logout
+Sign out and delete the account's data on this computer, including its
+encryption keys.
+.TP
+.BI "dictionary " "[LANGUAGE]"
+List the spell-check dictionaries, or download one (like de_DE).
+.TP
+.BI "events " "[ROOM]"
+Show the types and structure of a room's recent events with all text
+masked, for reporting what another client sends.
+.TP
+.B pushers
+List the account's pushers: where its homeserver sends push
+notifications for phones. With
+.B add
+or
+.BR remove ,
+add or remove one by hand, for trying a push gateway such as Sygnal.
+Added ones ask for event ids only, never message text.
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-profile " \fINAME\fR"
+The account to use. When starting: only this account.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the commands and keys.
+.TP
+.BR \-V ", " \-\-version
+Show the version; a build that is not a release adds the commit it was
+made from (the settings dialog shows the same).
+.SH KEYS
+.TP
+.B Tab
+Switch between the room list and the message box.
+.TP
+.BR Ctrl+K ", " /
+Find a room.
+.TP
+.B Ctrl+F
+Search messages.
+.TP
+.B F2
+Settings (accounts, spell checking, what is shown).
+.TP
+.B F3
+With several accounts: all of them, or one at a time.
+.TP
+.B F5
+The emoji picker: search every emoji and put one into the message box.
+.TP
+.BR Alt+Up ", " Alt+Down
+Previous and next room.
+.TP
+.B Ctrl+Q
+Quit.
+.PP
+Typing
+.B /
+in the message box lists the commands available there. The full list of
+keys is in
+.I usage.md
+with the documentation (/usr/share/doc/mothrix, or docs/ in the source).
+.SH FILES
+.TP
+.I ~/.config/mothrix/config.toml
+Settings, your own themes and key bindings, and
+.B proxy
+(an HTTP proxy for every connection; else the
+.B HTTPS_PROXY
+or
+.B ALL_PROXY
+environment variable). Readable only by you.
+.TP
+.I ~/.local/share/mothrix/<profile>/
+One folder per account: session, encryption keys, log.
+.TP
+.I ~/.local/share/mothrix/state.json
+The room open last time and unsent drafts.
+.TP
+.I ~/.cache/mothrix/
+Attachments you opened and pictures you pasted.
+.SH ENVIRONMENT
+.TP
+.B MOTHRIX_PASSWORD
+The password for
+.BR "mothrix login" ,
+instead of typing it.
+.TP
+.B MOTHRIX_LOG
+.BR debug " or " info
+for a more detailed log file.
+.SH BUGS
+Source, issues and releases:
+.UR https://github.com/r1sq/mothrix
+.UE

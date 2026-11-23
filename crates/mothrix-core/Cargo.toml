@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MPL-2.0
+[package]
+name = "mothrix-core"
+description = "What mothrix's front ends share: the Matrix backend, accounts, and the data the UI shows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+matrix-sdk.workspace = true
+matrix-sdk-ui.workspace = true
+matrix-sdk-base.workspace = true
+spellbook.workspace = true
+emojis.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+rpassword.workspace = true
+unicode-width.workspace = true
+image.workspace = true
+mime.workspace = true
+mime_guess.workspace = true
+tracing.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+
+[target."cfg(windows)".dependencies]
+tauri-winrt-notification = "0.8.1"
+winreg = "0.56"

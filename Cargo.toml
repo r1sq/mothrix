@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: MPL-2.0
+[workspace]
+resolver = "3"
+members = ["crates/mothrix-core", "crates/mothrix-tui", "crates/mothrix-ffi", "dev/release"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/r1sq/mothrix"
+publish = false
+
+[workspace.dependencies]
+mothrix-core = { path = "crates/mothrix-core" }
+matrix-sdk = { version = "0.19.0", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "bundled-sqlite", "rustls-aws-lc-rs", "sso-login", "markdown"] }
+matrix-sdk-ui = "0.19.0"
+matrix-sdk-base = "0.19.0"
+spellbook = "0.4.0"
+emojis = "0.6"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+dirs = "6"
+rpassword = "7"
+unicode-width = "0.2"
+textwrap = "0.16"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+# Palette for Sixel pictures (already used by `image` for GIFs).
+color_quant = "1.1"
+mime = "0.3"
+base64 = "0.22"
+# Checking updates (crates/mothrix-core/src/update.rs) and signing releases
+# (dev/release): the versions the SDK already uses.
+ed25519-dalek = "3"
+sha2 = "0.11"
+hex = "0.4"
+getrandom = "0.4"
+mime_guess = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Disk space on the development machine is tight: full debug info made
+# a debug binary close to 1 GB. Line numbers for mothrix's own code,
+# nothing for the dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = 2
+strip = true
