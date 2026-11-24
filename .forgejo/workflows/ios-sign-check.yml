@@ -19,9 +19,10 @@ jobs:
     steps:
       - name: Keychain and a test signature
         run: |
-          set -x
           keychain="$HOME/Library/Keychains/login.keychain-db"
+          # Before the trace starts: it would write the password out.
           security unlock-keychain -p "$PASSWORD" "$keychain"
+          set -x
           security set-keychain-settings -lut 7200 "$keychain"
           security list-keychains -d user -s "$keychain"
           security default-keychain -d user -s "$keychain"
@@ -29,7 +30,10 @@ jobs:
           security show-keychain-info "$keychain"
           security find-identity -v -p codesigning
           security find-identity -v -p codesigning "$keychain"
+          # No trace of the line with the password.
+          { set +x; } 2>/dev/null
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$PASSWORD" "$keychain" | tail -3
+          set -x
           cp /bin/echo "$RUNNER_TEMP/probe"
           # The intermediate certificates: which, and until when.
           security find-certificate -a -c "Apple Worldwide Developer Relations" -p "$keychain" > "$RUNNER_TEMP/wwdr.pem"
@@ -55,3 +59,8 @@ jobs:
           codesign --force --timestamp=none --sign D93C3A68218568F1CB704D4D320680753AD62761 \
             --keychain "$keychain" "$RUNNER_TEMP/probe2" && codesign -dvv "$RUNNER_TEMP/probe2" 2>&1 | grep Authority
           rm -f "$RUNNER_TEMP/probe2"
+
+      # Unlocked for two hours above: closed again, however the job ends.
+      - name: Lock the keychain
+        if: ${{ always() }}
+        run: security lock-keychain "$HOME/Library/Keychains/login.keychain-db" || true

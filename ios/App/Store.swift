@@ -26,6 +26,30 @@ func sharedFolder() -> URL {
         ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
 }
 
+/// The shared folder's files can be read from the first unlock after the
+/// phone started (not before; the notification extension reads the store
+/// while the phone is locked, so not "only while unlocked"): new files
+/// take this from their folder. What holds the accounts, their keys and
+/// fetched attachments stays out of backups: restored onto another phone
+/// it would be this device a second time.
+func protectSharedFolder() {
+    let files = FileManager.default
+    let root = sharedFolder()
+    let afterFirstUnlock: [FileAttributeKey: Any] =
+        [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+    // Rust's folders (`folders.rs`): made here if this is the first start.
+    for folder in [root] + ["config", "data", "cache"].map({ root.appendingPathComponent($0, isDirectory: true) }) {
+        try? files.createDirectory(at: folder, withIntermediateDirectories: true, attributes: afterFirstUnlock)
+        try? files.setAttributes(afterFirstUnlock, ofItemAtPath: folder.path)
+    }
+    for name in ["data", "cache"] {
+        var folder = root.appendingPathComponent(name, isDirectory: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? folder.setResourceValues(values)
+    }
+}
+
 /// Hands Rust's events to the store. Decoding (JSON, pictures) happens
 /// here, on Rust's thread, in order; only the result goes to the main
 /// thread, which a picture's megabyte of base64 would otherwise hold up.
@@ -97,6 +121,11 @@ final class Store: ObservableObject {
     @Published var favourites: [String] = ["👍", "❤️", "😂"]
     @Published var notice: String?
     @Published var started = false
+    /// Why mothrix did not start, if it did not (it stays on the start
+    /// screen).
+    @Published var startProblem: String?
+    /// Accounts that could not be restored, and why.
+    @Published var problems: [String] = []
     /// The push token, once iOS gave it (base64).
     private var pushToken: String?
     private var mothrix: Mothrix?
@@ -105,11 +134,32 @@ final class Store: ObservableObject {
     func start() {
         guard mothrix == nil else { return }
         sink.store = self
+        protectSharedFolder()
+        // Recordings of the last run: nothing is sending them any more.
+        VoiceRecorder.tidy(olderThan: 0)
         do {
             mothrix = try Mothrix(folder: sharedFolder().path, listener: sink)
+            startProblem = nil
         } catch {
-            notice = "mothrix could not start: \(error)"
+            startProblem = "mothrix could not start: \(error)"
         }
+    }
+
+    /// Another room or thread is shown (or none): what was known about the
+    /// last one goes, as it does in Rust (`ClientState::open`, `close`,
+    /// and the pictures of `View`).
+    private func show(room: String?, thread: String?) {
+        if room != openRoom {
+            typing = []
+            members = []
+            pictures = [:]
+        }
+        if room != openRoom || thread != self.thread {
+            // Its file would open over another conversation.
+            fetchingMedia = nil
+        }
+        openRoom = room
+        self.thread = thread
     }
 
     func couldNotRead(_ error: Error) {
@@ -125,8 +175,7 @@ final class Store: ObservableObject {
             accounts = snapshot.accounts
             rooms = snapshot.rooms
             lines = snapshot.lines
-            openRoom = snapshot.openRoom
-            thread = snapshot.thread
+            show(room: snapshot.openRoom, thread: snapshot.thread)
             items = snapshot.items
             theme = snapshot.settings.theme
             themes = snapshot.settings.themes
@@ -135,9 +184,11 @@ final class Store: ObservableObject {
             accountFilter = snapshot.settings.accountFilter
             unreadOnly = snapshot.settings.unreadOnly
             signIn = snapshot.signIn
+            problems = snapshot.problems
             favourites = snapshot.favourites
             emojiGroups = snapshot.emoji
             started = true
+            pushFollowsPrefs()
             registerPush()
         case .accounts(let list):
             let added = list.count > accounts.count
@@ -148,14 +199,12 @@ final class Store: ObservableObject {
             notificationsFollowRooms()
         case .sidebar(let list): lines = list
         case .opened(let room, let thread):
-            openRoom = room
+            show(room: room, thread: thread)
             if let room { Self.clearNotifications(of: [room]) }
-            self.thread = thread
         case .timeline(let room, let thread, let list):
             // Rust only sends the open room or thread, and may do so
             // before the `opened` event that says which it is.
-            openRoom = room
-            self.thread = thread
+            show(room: room, thread: thread)
             items = list
         case .picture: break  // Decoded by the sink, off the main thread.
         case .typing(let room, let names):
@@ -168,10 +217,15 @@ final class Store: ObservableObject {
             sections = settings.sections
             accountFilter = settings.accountFilter
             unreadOnly = settings.unreadOnly
+            // As Rust drops its own when pictures are switched off.
+            if settings.prefs.images == "off" { pictures = [:] }
+            pushFollowsPrefs()
         case .searchResults(let query, let hits):
             searchQuery = query
             searchHits = hits
-        case .roomDetails(let details): roomDetails = details
+        case .roomDetails(let details):
+            // Not a late answer about the room shown before.
+            if details.roomId == openRoom { roomDetails = details }
         case .verify(let state): verify = state
         case .reveal(let eventId): revealed = eventId
         case .recoveryKey(let key): recoveryKey = key
@@ -328,6 +382,7 @@ final class Store: ObservableObject {
     /// Changed preferences, sent back whole in Rust's spelling.
     func setPrefs(_ changed: Prefs) {
         prefs = changed
+        pushFollowsPrefs()
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         guard let data = try? encoder.encode(changed),
@@ -354,6 +409,26 @@ final class Store: ObservableObject {
         registerPush()
     }
 
+    /// What the "notifications" switch was when iOS was last told.
+    private var pushesOn: Bool?
+
+    /// The "notifications" switch: off, iOS is told to deliver this app no
+    /// pushes (the homeservers keep their pushers and go on sending; they
+    /// just do not arrive), on again, it registers anew and the token goes
+    /// to the homeservers again. While it is on from the start nothing is
+    /// done here: the app's delegate registers once notifications are
+    /// allowed.
+    private func pushFollowsPrefs() {
+        guard let on = prefs?.notifications, on != pushesOn else { return }
+        let before = pushesOn
+        pushesOn = on
+        if !on {
+            UIApplication.shared.unregisterForRemoteNotifications()
+        } else if before != nil {
+            UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
+
     private func registerPush() {
         guard let token = pushToken else { return }
         let lang = Locale.current.language.languageCode?.identifier ?? "en"
@@ -376,18 +451,33 @@ final class Store: ObservableObject {
     func room(_ key: String?) -> RoomEntry? { rooms.first { $0.id == key } }
 
     /// The logs of the app and its extensions in one file to send: the last
-    /// part of each (they only grow), newest at the end.
-    func logFile() -> URL? {
+    /// part of each (they only grow), newest at the end. Read and written
+    /// off the main thread.
+    func logFile() async -> URL? {
+        let head = "mothrix \(versionText), iOS \(UIDevice.current.systemVersion)\n"
+        return await Task.detached(priority: .utility) { Store.writeLog(head: head) }.value
+    }
+
+    nonisolated private static func writeLog(head: String) -> URL? {
         let folder = sharedFolder()
-        var all = "mothrix \(versionText), iOS \(UIDevice.current.systemVersion)\n"
+        var all = head
         for part in ["app", "nse", "action", "share"] {
-            guard let data = try? Data(contentsOf: folder.appendingPathComponent("mothrix-\(part).log"))
+            guard let tail = lastPart(of: folder.appendingPathComponent("mothrix-\(part).log"), bytes: 400_000)
             else { continue }
-            let tail = data.suffix(400_000)
             all += "\n===== mothrix-\(part).log =====\n" + String(decoding: tail, as: UTF8.self)
         }
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("mothrix-log.txt")
         return (try? all.write(to: file, atomically: true, encoding: .utf8)) != nil ? file : nil
+    }
+
+    /// The end of a file, without reading what is before it.
+    nonisolated private static func lastPart(of file: URL, bytes: UInt64) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd(),
+              (try? handle.seek(toOffset: size > bytes ? size - bytes : 0)) != nil
+        else { return nil }
+        return try? handle.readToEnd()
     }
 
     private var badge = -1
@@ -412,7 +502,8 @@ final class Store: ObservableObject {
     /// itself: `share-rooms.json` in the shared folder, when it changed.
     private func writeShareList() {
         let list: [String: Any] = [
-            "rooms": rooms.filter { !$0.isInvite }.map { room in
+            // What something can be sent to: no invitations, no spaces.
+            "rooms": rooms.filter { !$0.isInvite && !$0.isSpace }.map { room in
                 [
                     "id": room.id, "name": room.name, "is_dm": room.isDm,
                     "account": room.account < accounts.count ? accounts[room.account].label : "",

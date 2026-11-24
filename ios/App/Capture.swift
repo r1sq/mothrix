@@ -51,6 +51,26 @@ final class VoiceRecorder: ObservableObject {
     private var recorder: AVAudioRecorder?
     private var timer: Timer?
 
+    /// Where the recordings are, each in a folder of its own.
+    nonisolated private static var recordings: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("voice", isDirectory: true)
+    }
+
+    /// Delete the recordings made more than `age` seconds ago (0: all).
+    nonisolated static func tidy(olderThan age: TimeInterval) {
+        let files = FileManager.default
+        let folders = (try? files.contentsOfDirectory(
+            at: recordings, includingPropertiesForKeys: [.creationDateKey])) ?? []
+        for folder in folders {
+            let made = (try? folder.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+            // One whose age is not known goes too.
+            let old = made.map { Date().timeIntervalSince($0) > age } ?? true
+            if age <= 0 || old {
+                try? files.removeItem(at: folder)
+            }
+        }
+    }
+
     func start() {
         Task {
             guard await AVAudioApplication.requestRecordPermission() else {
@@ -61,10 +81,13 @@ final class VoiceRecorder: ObservableObject {
                 let session = AVAudioSession.sharedInstance()
                 try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
                 try session.setActive(true)
+                // Recordings sent a while ago go: Rust has long read them
+                // (it does not say when; the one just sent it may still be
+                // reading).
+                Self.tidy(olderThan: 3600)
                 // Its own folder, so that the name other clients show can
                 // be plain.
-                let folder = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(UUID().uuidString)
+                let folder = Self.recordings.appendingPathComponent(UUID().uuidString)
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                 let file = folder.appendingPathComponent("Voice message.m4a")
                 let recorder = try AVAudioRecorder(url: file, settings: [
@@ -107,7 +130,7 @@ final class VoiceRecorder: ObservableObject {
         let length = recorder.currentTime
         stop()
         guard length >= 0.5 else {
-            try? FileManager.default.removeItem(at: recorder.url)
+            try? FileManager.default.removeItem(at: recorder.url.deletingLastPathComponent())
             return nil
         }
         return (recorder.url, UInt64(length * 1000), Self.shrink(levels, to: 100))
@@ -116,7 +139,7 @@ final class VoiceRecorder: ObservableObject {
     func cancel() {
         guard let recorder else { return }
         stop()
-        try? FileManager.default.removeItem(at: recorder.url)
+        try? FileManager.default.removeItem(at: recorder.url.deletingLastPathComponent())
     }
 
     private func stop() {

@@ -1136,6 +1136,12 @@ impl View {
 
     /// A click on a notification about this room.
     pub fn notification_clicked(&mut self, room: String) -> Vec<Command> {
+        // Tapped before the rooms are known (the app was not running):
+        // it opens when its account's list has come.
+        if !self.state.rooms.iter().any(|entry| entry.id == room) {
+            self.state.goto = Some(room);
+            return Vec::new();
+        }
         self.open(room)
     }
 

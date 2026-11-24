@@ -88,7 +88,10 @@ final class ShareModel: ObservableObject {
         Task.detached {
             do {
                 try share(folder: folder, room: room.id, text: text, files: paths)
-                await MainActor.run { self.context?.completeRequest(returningItems: nil) }
+                await MainActor.run {
+                    self.tidy()
+                    self.context?.completeRequest(returningItems: nil)
+                }
             } catch {
                 await MainActor.run {
                     self.sending = nil
@@ -99,7 +102,16 @@ final class ShareModel: ObservableObject {
     }
 
     func cancel() {
+        tidy()
         context?.cancelRequest(withError: NSError(domain: "mothrix", code: 0))
+    }
+
+    /// Delete the copies made of what was shared (each in a folder of its
+    /// own, see `file(from:)`): sent or given up, they are not needed.
+    private func tidy() {
+        for file in files {
+            try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+        }
     }
 
     /// A picture (made JPEG: no location goes out, every client shows it),
@@ -109,25 +121,35 @@ final class ShareModel: ObservableObject {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let name = provider.suggestedName ?? (provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) ? "picture" : "file")
         if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-            guard let data = try? await provider.loadData(for: .image),
-                  let jpeg = UIImage(data: data)?.jpegData(compressionQuality: 0.85)
-            else { return nil }
             let file = folder.appendingPathComponent((name as NSString).deletingPathExtension + ".jpg")
-            return (try? jpeg.write(to: file)) != nil ? file : nil
+            guard let data = try? await provider.loadData(for: .image),
+                  let jpeg = UIImage(data: data)?.jpegData(compressionQuality: 0.85),
+                  (try? jpeg.write(to: file)) != nil
+            else {
+                try? FileManager.default.removeItem(at: folder)
+                return nil
+            }
+            return file
         }
         let isLink = provider.hasItemConformingToTypeIdentifier(UTType.url.identifier)
             && !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
         let isText = provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
         guard !isLink, !isText,
               provider.hasItemConformingToTypeIdentifier(UTType.item.identifier)
-        else { return nil }
-        return await withCheckedContinuation { done in
+        else {
+            try? FileManager.default.removeItem(at: folder)
+            return nil
+        }
+        let copied: URL? = await withCheckedContinuation { done in
             _ = provider.loadFileRepresentation(for: .item) { url, _, _ in
                 guard let url else { return done.resume(returning: nil) }
                 let copy = folder.appendingPathComponent(url.lastPathComponent)
                 done.resume(returning: (try? FileManager.default.copyItem(at: url, to: copy)) != nil ? copy : nil)
             }
         }
+        // Nothing came of it: its folder is not left behind.
+        if copied == nil { try? FileManager.default.removeItem(at: folder) }
+        return copied
     }
 
     /// A link or plain text, for the message.

@@ -19,6 +19,11 @@ struct MothrixApp: App {
                 .onAppear {
                     delegate.store = store
                     store.start()
+                    // A notification tapped before there was a store (the
+                    // app was not running): its room opens now.
+                    if let room = delegate.takeWaiting() {
+                        store.openFromNotification(room)
+                    }
                 }
                 .onChange(of: phase) { _, phase in
                     store.focus(phase == .active)
@@ -37,7 +42,15 @@ struct Root: View {
                 VStack(spacing: 12) {
                     Moth(size: 280)
                     Text("mothrix").font(.mono(.title)).foregroundStyle(store.theme.accentColor)
-                    ProgressView().tint(store.theme.accentColor)
+                    if let problem = store.startProblem {
+                        Text(problem)
+                            .font(.mono(.footnote))
+                            .foregroundStyle(store.theme.errorColor)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    } else {
+                        ProgressView().tint(store.theme.accentColor)
+                    }
                 }
             } else if store.accounts.isEmpty {
                 SignInView()
@@ -86,6 +99,15 @@ struct Notices: ViewModifier {
 /// Push: permission, the token, and taps on notifications.
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     weak var store: Store?
+    /// The room of a notification tapped before `store` was set.
+    private var waiting: String?
+
+    /// That room, once.
+    func takeWaiting() -> String? {
+        let room = waiting
+        waiting = nil
+        return room
+    }
 
     func application(
         _ application: UIApplication,
@@ -104,7 +126,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         ])
         center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
             guard granted else { return }
-            DispatchQueue.main.async { application.registerForRemoteNotifications() }
+            DispatchQueue.main.async {
+                // Not when the "notifications" switch is known to be off
+                // (the store follows the switch from then on).
+                if self.store?.prefs?.notifications != false {
+                    application.registerForRemoteNotifications()
+                }
+            }
         }
         return true
     }
@@ -144,7 +172,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         case "read":
             await Self.answer(room: room, text: nil)
         case UNNotificationDefaultActionIdentifier:
-            await MainActor.run { self.store?.openFromNotification(room) }
+            await MainActor.run {
+                if let store = self.store {
+                    store.openFromNotification(room)
+                } else {
+                    self.waiting = room
+                }
+            }
         default:
             break
         }

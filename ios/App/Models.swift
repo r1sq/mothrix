@@ -315,7 +315,12 @@ enum ItemKind: Decodable, Hashable {
             }
         } else {
             let poll = try decoder.singleValueContainer().decode([String: Poll].self)
-            self = .poll(poll["Poll"]!)
+            guard let found = poll["Poll"] else {
+                throw DecodingError.dataCorrupted(DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "a kind of item this app does not know"))
+            }
+            self = .poll(found)
         }
     }
 }
@@ -392,6 +397,9 @@ struct Prefs: Codable, Equatable {
     var languagetoolApiKey: String
     var proxy: String
     var longMessages: Int
+    /// The terminal's (looking for new releases): kept so that sending
+    /// the preferences back does not reset it. Not there in older JSON.
+    var updates: Bool?
 }
 
 struct SearchHit: Decodable, Hashable, Identifiable {

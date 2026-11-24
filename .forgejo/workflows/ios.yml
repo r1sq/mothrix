@@ -151,8 +151,10 @@ jobs:
         run: |
           cd ios
           key="$RUNNER_TEMP/asc-key.p8"
-          printf '%s\n' "$KEY_P8" > "$key"
           trap 'rm -f "$key"' EXIT
+          # Only this user reads the key file (and what else is made here).
+          umask 077
+          printf '%s\n' "$KEY_P8" > "$key"
           auth=(-allowProvisioningUpdates
                 -authenticationKeyPath "$key"
                 -authenticationKeyID "$KEY_ID"
@@ -186,3 +188,9 @@ jobs:
             -exportOptionsPlist build/export.plist -exportPath build/export \
             "${auth[@]}" || { find "$TMPDIR" -name "IDEDistribution*.log" -newer build/export.plist \
               -exec tail -n 40 {} \; 2>/dev/null; exit 1; }
+
+      # The keychain was unlocked for two hours above: closed again when
+      # the job ends, however it ends.
+      - name: Lock the keychain
+        if: ${{ always() && inputs.testflight }}
+        run: security lock-keychain "$HOME/Library/Keychains/login.keychain-db" || true

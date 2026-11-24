@@ -37,6 +37,10 @@ struct SignInView: View {
                 if let error = store.signIn.error {
                     Text(error).font(.mono(.footnote)).foregroundStyle(store.theme.errorColor)
                 }
+                // Accounts that are signed in but did not start, and why.
+                ForEach(store.problems, id: \.self) { problem in
+                    Text(problem).font(.mono(.footnote)).foregroundStyle(store.theme.errorColor)
+                }
             }
             .padding()
         }
@@ -351,6 +355,9 @@ struct RoomView: View {
     @StateObject private var recorder = VoiceRecorder()
     /// The people completed with @ in what is being written.
     @State private var mentioned: [Member] = []
+    /// A draft the app itself just put into the message box: that change
+    /// of the text is not the user writing.
+    @State private var restored: String?
     @State private var searching = false
     @State private var showingInfo = false
 
@@ -433,12 +440,25 @@ struct RoomView: View {
         // video; sharing and saving from there.
         .quickLookPreview($store.mediaFile)
         // Each room (and thread) keeps what was typed and not sent.
-        .onAppear { text = store.draft(draftKey) }
+        .onAppear { restoreDraft(draftKey) }
         .onChange(of: draftKey) { old, new in
-            store.keepDraft(old, text)
-            text = store.draft(new)
+            // An edit under way is no draft of that conversation.
+            store.keepDraft(old, editing == nil ? text : "")
+            // What was being answered or edited, and who was mentioned,
+            // belong to the conversation left.
+            replyTo = nil
+            editing = nil
+            mentioned = []
+            restoreDraft(new)
         }
-        .onChange(of: text) { _, now in store.keepDraft(draftKey, now) }
+        .onChange(of: text) { _, now in
+            store.keepDraft(draftKey, now)
+            // Others see "typing" for what is written, not for a draft
+            // that was only put back.
+            let written = restored != now
+            restored = nil
+            if written { store.typing(!now.isEmpty) }
+        }
         .sheet(isPresented: $showingInfo) { RoomInfoView().environmentObject(store) }
         .fileImporter(isPresented: $pickingFile, allowedContentTypes: [.item]) { result in
             guard case .success(let url) = result else { return }
@@ -538,7 +558,6 @@ struct RoomView: View {
                 TextField("", text: $text, prompt: Text("message").foregroundColor(store.theme.faint), axis: .vertical)
                     .font(.mono())
                     .lineLimit(1...6)
-                    .onChange(of: text) { _, now in store.typing(!now.isEmpty) }
                 WordButton("[send]", action: send)
             }
             }
@@ -565,12 +584,20 @@ struct RoomView: View {
         .overlay(alignment: .top) { Rectangle().fill(store.theme.line).frame(height: 1) }
         .onChange(of: picked) { _, item in
             guard let item else { return }
+            // Loading can take seconds (a photo still in iCloud): it goes to
+            // the chat it was picked in, or nowhere.
+            let pickedIn = store.openRoom
             Task {
                 // Drawn anew as JPEG: no location or other metadata of the
                 // photo goes out, and every client can show it (not HEIC).
                 if let data = try? await item.loadTransferable(type: Data.self),
                    let jpeg = UIImage(data: data)?.jpegData(compressionQuality: 0.85)
                 {
+                    guard store.openRoom == pickedIn else {
+                        store.notice = "Not sent: another chat was opened meanwhile."
+                        picked = nil
+                        return
+                    }
                     // What is in the message box goes with it as its caption.
                     store.sendPicture(jpeg, name: "picture.jpg", caption: text)
                     text = ""
@@ -657,6 +684,14 @@ struct RoomView: View {
     }
 
     private var draftKey: String { (store.openRoom ?? "") + "|" + (store.thread ?? "") }
+
+    /// Put a conversation's draft into the message box.
+    private func restoreDraft(_ key: String) {
+        let draft = store.draft(key)
+        guard draft != text else { return }
+        restored = draft
+        text = draft
+    }
 
     /// Out of the thread, or out of the room to the list.
     private func back() {
@@ -1014,6 +1049,8 @@ struct MenuView: View {
     @State private var recoveryKey = ""
     @State private var renaming: String?
     @State private var newName = ""
+    /// The account to sign out: asked about first.
+    @State private var signingOut: Account?
 
     /// The room list's order: recent, then by name, then unread first.
     private func sortButton(_ prefs: Prefs) -> some View {
@@ -1124,10 +1161,7 @@ struct MenuView: View {
                                         store.act("verify_device", ["account": index])
                                     }
                                 }
-                                WordButton("[sign out]") {
-                                    store.act("sign_out", ["account": index])
-                                    dismiss()
-                                }
+                                WordButton("[sign out]") { signingOut = account }
                             }
                         }
                         .listRowBackground(store.theme.bg)
@@ -1140,6 +1174,11 @@ struct MenuView: View {
                     }
                     .buttonStyle(.plain)
                     .listRowBackground(store.theme.bg)
+                    // Accounts that are signed in but did not start, and why.
+                    ForEach(store.problems, id: \.self) { problem in
+                        Text(problem).font(.mono(.footnote)).foregroundStyle(store.theme.errorColor)
+                            .listRowBackground(store.theme.bg)
+                    }
                 } header: {
                     Text("ACCOUNTS").foregroundStyle(store.theme.faint)
                 }
@@ -1206,7 +1245,25 @@ struct MenuView: View {
                     .sharedBackgroundVisibility(.hidden)
             }
             .toolbarBackground(store.theme.bg, for: .navigationBar)
-            .task { log = store.logFile() }
+            .task { log = await store.logFile() }
+            .confirmationDialog(
+                "Sign out \(signingOut?.label ?? "") (\(signingOut?.userId ?? ""))?",
+                isPresented: Binding(get: { signingOut != nil }, set: { if !$0 { signingOut = nil } }),
+                titleVisibility: .visible
+            ) {
+                Button("sign out", role: .destructive) {
+                    // The account asked about, wherever it is in the list now.
+                    if let asked = signingOut,
+                       let index = store.accounts.firstIndex(where: { $0.profile == asked.profile })
+                    {
+                        store.act("sign_out", ["account": index])
+                        dismiss()
+                    }
+                }
+                Button("cancel", role: .cancel) {}
+            } message: {
+                Text("Its messages and keys go from this phone. Encrypted messages can be read again after signing in only with the recovery key or another verified device.")
+            }
             .sheet(isPresented: $addingAccount) {
                 AddAccountView().environmentObject(store)
             }
