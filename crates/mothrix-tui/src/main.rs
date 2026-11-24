@@ -199,7 +199,14 @@ fn parse_args() -> Result<Option<Args>> {
             }
             "--profile" | "-p" => {
                 let name = value(&mut args, "--profile")?;
-                if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+                // A folder's name, and none mothrix keeps something else
+                // under; ":" would also name a drive on Windows.
+                if name.is_empty()
+                    || name.contains(['/', '\\', ':'])
+                    || name.contains(char::is_control)
+                    || name.starts_with('.')
+                    || name == "dictionaries"
+                {
                     bail!("'{name}' cannot be used as a profile name");
                 }
                 profile = Some(name);

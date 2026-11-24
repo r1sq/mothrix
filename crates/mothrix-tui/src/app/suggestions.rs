@@ -141,6 +141,15 @@ impl App {
                 let more_to_type = self.accept(suggestions, index);
                 return more_to_type || key.code == KeyCode::Tab;
             }
+            // ":D" or a lone ":" at the end of a message is no emoji being
+            // looked for: Enter sends, Tab still takes the suggestion.
+            KeyCode::Enter
+                if self
+                    .emoji_query()
+                    .is_some_and(|(_, query)| query.chars().count() < 2) =>
+            {
+                return false;
+            }
             KeyCode::Tab | KeyCode::Enter => {
                 self.accept(suggestions, index);
             }

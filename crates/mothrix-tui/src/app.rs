@@ -549,7 +549,8 @@ impl App {
             (Compose::Edit { .. }, aside) => aside.unwrap_or_default(),
             _ => self.composer.text().to_owned(),
         };
-        if text.trim().is_empty() {
+        // Nothing with a secret in it goes into the drafts' file.
+        if text.trim().is_empty() || text.trim_start().starts_with("/recover") {
             self.drafts.remove(room_id);
         } else {
             self.drafts.insert(room_id.to_owned(), text);

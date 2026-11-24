@@ -88,10 +88,14 @@ jobs:
         with:
           name: dist
           path: dist
+      # Built before the key is in the environment: the build scripts and
+      # macros of the signing tool's dependencies never see it.
+      - name: Build the signing tool
+        run: cargo build --release --locked -p mothrix-release
       - name: Sign
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-        run: cargo run --release --locked -p mothrix-release -- sign "${GITHUB_REF_NAME#v}" dist
+        run: target/release/mothrix-release sign "${GITHUB_REF_NAME#v}" dist
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

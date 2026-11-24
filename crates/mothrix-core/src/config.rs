@@ -154,11 +154,12 @@ impl Config {
         if !configured.is_empty() {
             return Some(configured.to_owned());
         }
+        // The first that says something: an empty one names no proxy.
         ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
             .iter()
-            .find_map(|name| std::env::var(name).ok())
+            .filter_map(|name| std::env::var(name).ok())
             .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
+            .find(|value| !value.is_empty())
     }
 
     /// An HTTP client for what is not Matrix (LanguageTool, downloads),

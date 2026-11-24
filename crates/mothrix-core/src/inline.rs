@@ -125,19 +125,27 @@ fn address_at(chars: &[char], at: usize) -> Option<usize> {
         .then_some(end)
 }
 
+/// How long a link's text and its address may be, in characters.
+const MAX_LINK_TEXT: usize = 400;
+const MAX_ADDRESS: usize = 2000;
+const MAX_SPAN: usize = 5000;
+
 /// A `[text](address)` link opening at `at`: the ranges of text and
 /// address, and where the text goes on after it.
 fn link_at(chars: &[char], at: usize) -> Option<(usize, usize, usize, usize, usize)> {
     if chars[at] != '[' {
         return None;
     }
-    let text_end = (at + 1..chars.len()).find(|i| chars[*i] == ']' || chars[*i] == '\n')?;
+    // No further than a link's text ever is: a message of nothing but
+    // "[" would else be read to its end from each of them.
+    let text_end = (at + 1..chars.len().min(at + MAX_LINK_TEXT))
+        .find(|i| chars[*i] == ']' || chars[*i] == '\n')?;
     if chars[text_end] != ']' || text_end == at + 1 || chars.get(text_end + 1) != Some(&'(') {
         return None;
     }
     let address = text_end + 2;
-    let address_end =
-        (address..chars.len()).find(|i| chars[*i] == ')' || chars[*i].is_whitespace())?;
+    let address_end = (address..chars.len().min(address + MAX_ADDRESS))
+        .find(|i| chars[*i] == ')' || chars[*i].is_whitespace())?;
     (chars[address_end] == ')' && opens(&chars[address..address_end])).then_some((
         at + 1,
         text_end,
@@ -232,7 +240,8 @@ fn span(
         return None;
     }
     let mut close = inside + 1;
-    while close + marker.len() <= chars.len() {
+    // Nor further than a marked stretch ever is (see `MAX_LINK_TEXT`).
+    while close + marker.len() <= chars.len() && close < inside + MAX_SPAN {
         // A span does not run across a blank line.
         if chars[close] == '\n' && chars.get(close + 1) == Some(&'\n') {
             return None;
@@ -536,6 +545,20 @@ mod tests {
         let (styled, links) = parse_links("[x](javascript:alert) `https://in.code/x`");
         assert!(links.is_empty());
         assert_eq!(text(&styled, LINK), "");
+    }
+
+    #[test]
+    fn a_message_of_nothing_but_marks_is_read_quickly() {
+        let started = std::time::Instant::now();
+        for marks in ["[", "*a ", "`x "] {
+            let hostile = marks.repeat(60_000 / marks.len());
+            assert!(!parse_links(&hostile).0.is_empty());
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
