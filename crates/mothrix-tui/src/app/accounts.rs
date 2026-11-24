@@ -152,12 +152,7 @@ impl App {
     /// open room): let go of what was shown of it.
     pub fn account_gone(&mut self, closed: bool) {
         if closed {
-            self.previews.clear();
-            self.sixel.clear();
-            for (_, id) in self.terminal_images.drain() {
-                self.effects
-                    .push(Effect::Terminal(crate::kitty::delete(id)));
-            }
+            self.drop_pictures();
             self.clear_selection();
             self.cancel_compose();
             self.focus = Focus::Sidebar;

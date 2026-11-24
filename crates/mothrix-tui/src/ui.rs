@@ -7,7 +7,7 @@ use chrono::{Local, TimeZone};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, Paragraph},
 };
@@ -16,7 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 mod conversation;
 
 pub(crate) use conversation::can_expand;
-use conversation::{Options, preview_lines, terminal_image_lines, wrap};
+use conversation::{Options, wrap};
 
 use crate::{
     app::{
@@ -29,7 +29,8 @@ use crate::{
     inline,
     input::Input,
     matrix::SyncStatus,
-    model::{Item, ItemKind, Poll, Preview, VerifyState},
+    model::{Item, ItemKind, Poll, VerifyState},
+    pictures::{Drawn, Placement},
     theme::Theme,
     verify::VerifyInput,
 };
@@ -43,7 +44,7 @@ const FORMAT_BUTTON: &str = " + format ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits.clear();
-    app.sixel_placements.clear();
+    app.pictures.start_frame();
     app.ensure_logo();
     let area = frame.area();
     let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
@@ -575,40 +576,30 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         let fits = |rows: usize, columns: usize| {
             rows + 7 <= inner.height as usize && columns + 2 <= inner.width as usize
         };
-        let logo = app.previews.get(crate::logo::KEY).cloned();
-        let logo = logo.and_then(|logo| {
-            let (rows, columns) = match app.graphics {
-                crate::app::Graphics::Kitty | crate::app::Graphics::Sixel => {
-                    (logo.png_rows, logo.png_columns)
-                }
-                crate::app::Graphics::Blocks => (logo.rows(), logo.width),
-                crate::app::Graphics::Off => return None,
-            };
-            fits(rows, columns).then_some((logo, rows, columns))
-        });
+        let logo = app
+            .pictures
+            .size(crate::logo::KEY)
+            .filter(|(rows, columns)| fits(*rows, *columns));
         // Leave the moth out on small screens rather than squeeze the text.
-        if let Some((logo, rows, columns)) = logo {
+        if let Some((rows, columns)) = logo
+            && let Some(drawn) = app.pictures.drawn(crate::logo::KEY, inner.width as usize)
+        {
             hint.push(Line::default());
-            let width = inner.width as usize;
-            let mut lines = match app.graphics {
-                crate::app::Graphics::Kitty => match app.terminal_images.get(crate::logo::KEY) {
-                    Some(id) => terminal_image_lines(&logo, *id, width),
-                    None => vec![Line::default(); rows],
-                },
-                crate::app::Graphics::Sixel => {
+            let mut lines = match drawn {
+                Drawn::Lines(lines) => lines,
+                Drawn::Painted { .. } => {
                     if !app.dialog_open() {
-                        app.sixel_placements.push(crate::app::SixelPlacement {
+                        app.pictures.place(Placement {
                             x: inner.x + (inner.width - columns as u16) / 2,
                             y: inner.y + 1,
                             columns: columns as u16,
                             rows: rows as u16,
-                            event_id: crate::logo::KEY.to_owned(),
+                            key: crate::logo::KEY.to_owned(),
                             selected: false,
                         });
                     }
                     vec![Line::default(); rows]
                 }
-                _ => preview_lines(&logo, width),
             };
             for line in &mut lines {
                 // Without the indent pictures in messages have.
@@ -708,12 +699,12 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
                 && offset + 1 >= rows
                 && !app.dialog_open()
             {
-                app.sixel_placements.push(crate::app::SixelPlacement {
+                app.pictures.place(Placement {
                     x: view.x + 2,
                     y: rect.y + 1 - rows as u16,
                     columns: columns as u16,
                     rows: rows as u16,
-                    event_id,
+                    key: event_id,
                     selected,
                 });
             }
@@ -2887,7 +2878,7 @@ mod tests {
         }
         // With pictures off, the text moth stands in for the logo.
         let mut app = sample();
-        app.graphics = crate::app::Graphics::Off;
+        app.pictures.graphics = crate::app::Graphics::Off;
         let screen = render_to_text(&mut app, 100, 30);
         assert!(screen.contains(r"( ◆ )   \_ |=| _/   ( ◆ )"), "{screen}");
         assert!(screen.contains("m o t h r i x"), "{screen}");
@@ -2896,7 +2887,7 @@ mod tests {
     #[test]
     fn the_start_screen_shows_the_logo_as_a_picture() {
         let mut app = sample();
-        assert_eq!(app.graphics, crate::app::Graphics::Blocks);
+        assert_eq!(app.pictures.graphics, crate::app::Graphics::Blocks);
         let screen = render_to_text(&mut app, 100, 40);
         assert!(screen.contains('▀'), "{screen}");
         assert!(!screen.contains("|=|"), "no text moth as well: {screen}");
@@ -3703,7 +3694,7 @@ mod tests {
     #[test]
     fn kitty_pictures_reserve_placeholder_cells_and_upload_once() {
         let mut app = sample();
-        app.graphics = crate::app::Graphics::Kitty;
+        app.pictures.graphics = crate::app::Graphics::Kitty;
         app.state.open_room = Some("!lunch".into());
         let mut picture = message("pic", "Amy", "[image] cat.png", 1_000);
         picture.kind = ItemKind::Media;

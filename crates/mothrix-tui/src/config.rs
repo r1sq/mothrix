@@ -7,10 +7,7 @@
 //! A new preference is a field of `Prefs` (in mothrix-core) with its
 //! default; its row in the settings dialog is `app::Setting`.
 
-use crate::{
-    app::{App, Graphics},
-    theme,
-};
+use crate::{app::App, theme};
 pub use mothrix_core::config::Config;
 
 /// What the terminal does with the config, beyond what `mothrix-core` does.
@@ -29,11 +26,7 @@ impl ConfigExt for Config {
         self.name_accounts(&mut app.state.accounts);
         app.state.account_filter = self.account_filter(&app.state.accounts);
         app.state.prefs = self.prefs.tidied(dictionaries);
-        app.graphics = Graphics::from_label(
-            &app.state.prefs.images,
-            app.kitty_supported,
-            app.sixel_supported,
-        );
+        app.pictures.set_mode(&app.state.prefs.images);
         app.state.sections = crate::sections::OwnSections::new(self.sections.clone());
         app.state.folded = crate::sidebar::Folds::new(self.folded.iter().cloned());
     }

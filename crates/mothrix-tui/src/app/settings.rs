@@ -158,7 +158,7 @@ impl App {
         match setting {
             Setting::Theme => self.theme.name.to_owned(),
             Setting::RoomOrder => self.state.prefs.sort.label().to_owned(),
-            Setting::Pictures => match (self.state.prefs.images.as_str(), self.graphics) {
+            Setting::Pictures => match (self.state.prefs.images.as_str(), self.pictures.graphics) {
                 ("auto", Graphics::Kitty) => "auto (sharp, kitty graphics)".to_owned(),
                 ("auto", Graphics::Sixel) => "auto (sharp, sixel graphics)".to_owned(),
                 ("auto", _) => "auto (blocks)".to_owned(),
@@ -253,11 +253,7 @@ impl App {
                     .find(|mode| *mode == self.state.prefs.images)
                     .unwrap_or(IMAGE_MODES[0]);
                 self.state.prefs.images = step(&IMAGE_MODES, current, forward).to_owned();
-                self.graphics = Graphics::from_label(
-                    &self.state.prefs.images,
-                    self.kitty_supported,
-                    self.sixel_supported,
-                );
+                self.pictures.set_mode(&self.state.prefs.images);
                 self.notice =
                     Some("The picture setting applies to pictures loaded from now on.".to_owned());
             }

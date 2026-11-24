@@ -999,27 +999,27 @@ mod tests {
     #[test]
     fn picture_setting_cycles_and_follows_what_the_terminal_supports() {
         let mut app = chat();
-        app.kitty_supported = true;
+        app.pictures.kitty_supported = true;
         app.change_setting(Setting::Pictures, true);
         assert_eq!(
-            (app.state.prefs.images.as_str(), app.graphics),
+            (app.state.prefs.images.as_str(), app.pictures.graphics),
             ("kitty", Graphics::Kitty)
         );
         app.change_setting(Setting::Pictures, true);
         assert_eq!(
-            (app.state.prefs.images.as_str(), app.graphics),
+            (app.state.prefs.images.as_str(), app.pictures.graphics),
             ("sixel", Graphics::Sixel)
         );
         app.change_setting(Setting::Pictures, true);
         assert_eq!(
-            (app.state.prefs.images.as_str(), app.graphics),
+            (app.state.prefs.images.as_str(), app.pictures.graphics),
             ("blocks", Graphics::Blocks)
         );
         app.change_setting(Setting::Pictures, true);
-        assert_eq!(app.graphics, Graphics::Off);
+        assert_eq!(app.pictures.graphics, Graphics::Off);
         app.change_setting(Setting::Pictures, true);
         assert_eq!(
-            (app.state.prefs.images.as_str(), app.graphics),
+            (app.state.prefs.images.as_str(), app.pictures.graphics),
             ("auto", Graphics::Kitty)
         );
     }

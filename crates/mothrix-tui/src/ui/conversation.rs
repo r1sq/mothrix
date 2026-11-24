@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{Local, TimeZone};
 
 use super::*;
-use crate::model::Reaction;
+use crate::{app::Pictures, model::Reaction};
 
 /// Messages from the same sender within this window share one header.
 const GROUP_WINDOW_MS: u64 = 5 * 60 * 1000;
@@ -104,9 +104,7 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// What the layout of a conversation depends on, besides its messages.
 pub(crate) struct Options<'a> {
-    pub previews: &'a HashMap<String, Preview>,
-    pub terminal_images: &'a HashMap<String, u32>,
-    pub sixel: &'a HashMap<String, String>,
+    pub pictures: &'a Pictures,
     pub show_room_events: bool,
     pub show_receipts: bool,
     pub link_previews: &'a HashMap<String, (String, String)>,
@@ -123,9 +121,7 @@ impl<'a> Options<'a> {
     /// As `app` shows its conversation, `width` cells wide.
     pub(crate) fn of(app: &'a App, width: usize) -> Self {
         Self {
-            previews: &app.previews,
-            terminal_images: &app.terminal_images,
-            sixel: &app.sixel,
+            pictures: &app.pictures,
             show_room_events: app.state.prefs.room_events,
             show_receipts: app.state.prefs.read_receipts,
             link_previews: &app.state.link_previews,
@@ -179,9 +175,7 @@ pub(crate) fn can_expand(app: &App, item: &Item) -> bool {
 
 fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) -> Vec<Row> {
     let Options {
-        previews,
-        terminal_images,
-        sixel,
+        pictures,
         show_room_events,
         show_receipts,
         link_previews,
@@ -469,31 +463,21 @@ fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) ->
             }
         }
 
-        if item.image
-            && let Some(preview) = previews.get(&item.event_id)
-        {
-            // A Sixel picture is painted over rows kept free for it, once
-            // all of them are in view.
-            let as_sixel = sixel.contains_key(&item.event_id) && preview.png_columns + 2 <= width;
-            if as_sixel {
-                for row in 0..preview.png_rows {
-                    let mut entry = Row::of(item, Line::default());
-                    entry.picture = Some((
-                        item.event_id.clone(),
-                        row,
-                        preview.png_rows,
-                        preview.png_columns,
-                    ));
-                    lines.push(entry);
+        if item.image {
+            match pictures.drawn(&item.event_id, width.saturating_sub(2)) {
+                // A Sixel picture is painted over rows kept free for it,
+                // once all of them are in view.
+                Some(Drawn::Painted { rows, columns }) => {
+                    for row in 0..rows {
+                        let mut entry = Row::of(item, Line::default());
+                        entry.picture = Some((item.event_id.clone(), row, rows, columns));
+                        lines.push(entry);
+                    }
                 }
-            } else {
-                let drawn = match terminal_images.get(&item.event_id) {
-                    Some(id) => terminal_image_lines(preview, *id, width.saturating_sub(2)),
-                    None => preview_lines(preview, width.saturating_sub(2)),
-                };
-                for line in drawn {
-                    lines.push(Row::of(item, line));
+                Some(Drawn::Lines(drawn)) => {
+                    lines.extend(drawn.into_iter().map(|line| Row::of(item, line)));
                 }
+                None => {}
             }
         }
 
@@ -773,58 +757,6 @@ fn read_by_lines(item: &Item, open: bool, width: usize, theme: &Theme) -> Vec<Ro
     } else {
         vec![right(format!("✓ read by {}", names.join(", ")), None)]
     }
-}
-
-/// Reserve the cells for a picture the terminal draws itself (kitty
-/// graphics): each cell holds a placeholder that names the picture (by
-/// its colour) and which part of it belongs there.
-pub(super) fn terminal_image_lines(
-    preview: &Preview,
-    id: u32,
-    max_width: usize,
-) -> Vec<Line<'static>> {
-    let columns = preview
-        .png_columns
-        .min(max_width)
-        .min(crate::kitty::MAX_CELLS);
-    let (r, g, b) = crate::kitty::id_color(id);
-    let style = Style::new().fg(Color::Rgb(r, g, b));
-    (0..preview.png_rows.min(crate::kitty::MAX_CELLS))
-        .map(|row| {
-            let mut spans = vec![Span::raw("  ")];
-            spans.extend(
-                (0..columns)
-                    .map(|column| Span::styled(crate::kitty::placeholder(row, column), style)),
-            );
-            Line::from(spans)
-        })
-        .collect()
-}
-
-/// Draw a picture with half-block characters: each cell shows the upper
-/// pixel as foreground and the lower one as background of `▀`.
-pub(super) fn preview_lines(preview: &Preview, max_width: usize) -> Vec<Line<'static>> {
-    let width = preview.width.min(max_width);
-    let visible = |pixel: [u8; 4]| pixel[3] >= 128;
-    let color = |pixel: [u8; 4]| Color::Rgb(pixel[0], pixel[1], pixel[2]);
-    (0..preview.rows())
-        .map(|row| {
-            let mut spans = vec![Span::raw("  ")];
-            for x in 0..width {
-                let top = preview.pixel(x, row * 2);
-                let bottom = preview.pixel(x, row * 2 + 1);
-                spans.push(match (visible(top), visible(bottom)) {
-                    (true, true) => {
-                        Span::styled("▀", Style::new().fg(color(top)).bg(color(bottom)))
-                    }
-                    (true, false) => Span::styled("▀", Style::new().fg(color(top))),
-                    (false, true) => Span::styled("▄", Style::new().fg(color(bottom))),
-                    (false, false) => Span::raw(" "),
-                });
-            }
-            Line::from(spans)
-        })
-        .collect()
 }
 
 fn push_poll(lines: &mut Vec<Row>, item: &Item, poll: &Poll, width: usize, theme: &Theme) {

@@ -18,7 +18,7 @@ use crate::{
     client_state::{Opening, Taken},
     input::Input,
     matrix::{Command, SyncStatus, Update},
-    model::{Item, ItemKind, Member, PollFormat, Preview, RoomEntry, VerifyState},
+    model::{Item, ItemKind, Member, PollFormat, RoomEntry, VerifyState},
     spell::Speller,
     theme::{self, Theme},
     verify::VerifyInput,
@@ -40,6 +40,7 @@ mod updates;
 mod viewport;
 
 pub use crate::accounts::Account;
+pub use crate::pictures::{Graphics, Pictures};
 pub use effects::Effect;
 
 pub use emoji_picker::{CELL_WIDTH, EmojiPicker, GridRow, PickFor, reveal as emoji_picker_reveal};
@@ -73,34 +74,6 @@ pub enum Focus {
     Sidebar,
     Timeline,
     Composer,
-}
-
-/// How pictures are drawn in the conversation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Graphics {
-    /// Sharp pictures through the kitty graphics protocol.
-    Kitty,
-    /// Sharp pictures as Sixel graphics.
-    Sixel,
-    /// Coloured half-block characters; works in any true-colour terminal.
-    #[default]
-    Blocks,
-    Off,
-}
-
-impl Graphics {
-    /// `auto` (or anything unknown) picks kitty graphics where supported.
-    pub fn from_label(label: &str, kitty_supported: bool, sixel_supported: bool) -> Self {
-        match label.trim() {
-            "kitty" => Self::Kitty,
-            "sixel" => Self::Sixel,
-            "blocks" => Self::Blocks,
-            "off" => Self::Off,
-            _ if kitty_supported => Self::Kitty,
-            _ if sixel_supported => Self::Sixel,
-            _ => Self::Blocks,
-        }
-    }
 }
 
 /// The commands of the message box: (name, what it does, takes an argument).
@@ -304,18 +277,6 @@ pub struct Hit {
     pub action: HitAction,
 }
 
-/// A Sixel picture and the cells it fills on screen.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SixelPlacement {
-    pub x: u16,
-    pub y: u16,
-    pub columns: u16,
-    pub rows: u16,
-    pub event_id: String,
-    /// The message is selected (its background differs).
-    pub selected: bool,
-}
-
 /// The dialog for choosing where a message is forwarded to.
 #[derive(Clone, Debug)]
 pub struct Forward {
@@ -369,27 +330,10 @@ pub struct App {
     pub mention_selected: usize,
     /// Esc closed the popup; typing more opens it again.
     mention_hidden: bool,
-    /// Downloaded pictures by event id.
-    pub previews: HashMap<String, Preview>,
-    pub graphics: Graphics,
-    /// Pictures uploaded to the terminal (kitty graphics): event id to
-    /// the terminal-side picture id.
-    pub terminal_images: HashMap<String, u32>,
-    next_image_id: u32,
+    /// The pictures of the conversation shown, and how they are drawn.
+    pub pictures: Pictures,
     /// Languages of the loaded dictionaries (empty until loaded).
     pub spell_languages: Vec<String>,
-    /// Whether the terminal can show pictures itself (kitty graphics).
-    pub kitty_supported: bool,
-    /// Whether the terminal is known to draw Sixel graphics.
-    pub sixel_supported: bool,
-    /// The size of a terminal cell in pixels, for Sixel pictures.
-    pub cell_px: (u16, u16),
-    /// For which way of drawing pictures (and cell size) the logo was made.
-    logo_for: Option<(Graphics, (u16, u16))>,
-    /// Pictures as Sixel sequences, by event id.
-    pub sixel: HashMap<String, String>,
-    /// Where the last draw wants Sixel pictures painted.
-    pub sixel_placements: Vec<SixelPlacement>,
     /// A search result waiting for its message to be loaded.
     pending_reveal: Option<String>,
     speller: Option<Arc<dyn Speller>>,
@@ -457,17 +401,8 @@ impl App {
             composer_mentions: Vec::new(),
             mention_selected: 0,
             mention_hidden: false,
-            previews: HashMap::new(),
-            graphics: Graphics::default(),
-            terminal_images: HashMap::new(),
-            next_image_id: 1,
+            pictures: Pictures::default(),
             spell_languages: Vec::new(),
-            kitty_supported: false,
-            sixel_supported: false,
-            cell_px: (10, 20),
-            logo_for: None,
-            sixel: HashMap::new(),
-            sixel_placements: Vec::new(),
             pending_reveal: None,
             speller: None,
             misspelled: Vec::new(),
@@ -556,13 +491,8 @@ impl App {
         };
         self.went_to_room(&room_id);
         self.effects.push(Effect::RoomOpened(room_id.clone()));
-        self.previews.clear();
-        self.sixel.clear();
         // Pictures of the room we are leaving are no longer needed.
-        for (_, id) in self.terminal_images.drain() {
-            self.effects
-                .push(Effect::Terminal(crate::kitty::delete(id)));
-        }
+        self.drop_pictures();
         self.composer_mentions.clear();
         self.viewport.follow_newest();
         self.notice = None;
@@ -742,12 +672,7 @@ impl App {
     /// else of the same room.
     fn reset_conversation(&mut self) {
         self.state.items.clear();
-        self.previews.clear();
-        self.sixel.clear();
-        for (_, id) in self.terminal_images.drain() {
-            self.effects
-                .push(Effect::Terminal(crate::kitty::delete(id)));
-        }
+        self.drop_pictures();
         self.viewport.follow_newest();
         self.clear_selection();
         self.cancel_compose();
@@ -1033,24 +958,17 @@ impl App {
 
     // -- backend updates ----------------------------------------------------
 
-    /// Have the logo of the start screen ready as a picture, made for how
-    /// this terminal draws pictures (again when that changed). Nothing
-    /// when pictures are off: the start screen shows the text moth then.
+    /// Have the logo of the start screen ready as a picture.
     pub fn ensure_logo(&mut self) {
-        let now = (self.graphics, self.cell_px);
-        if self.graphics == Graphics::Off || self.logo_for == Some(now) {
-            return;
-        }
-        self.logo_for = Some(now);
-        self.previews.remove(crate::logo::KEY);
-        self.sixel.remove(crate::logo::KEY);
-        self.terminal_images.remove(crate::logo::KEY);
-        if let Some(preview) = crate::logo::preview(self.graphics == Graphics::Kitty) {
-            self.on_update(Update::Preview {
-                event_id: crate::logo::KEY.to_owned(),
-                preview,
-            });
-        }
+        let sequence = self.pictures.ensure_logo();
+        self.effects.extend(sequence.map(Effect::Terminal));
+    }
+
+    /// Let go of the pictures of the conversation shown.
+    pub(crate) fn drop_pictures(&mut self) {
+        let sequences = self.pictures.clear();
+        self.effects
+            .extend(sequences.into_iter().map(Effect::Terminal));
     }
 
     pub fn on_update(&mut self, update: Update) {
@@ -1118,38 +1036,9 @@ impl App {
                 self.notice = None;
                 self.overlays.open(RecoveryKey(key));
             }
-            Update::Preview {
-                event_id,
-                mut preview,
-            } => {
-                if self.graphics == Graphics::Off {
-                    return;
-                }
-                if self.graphics == Graphics::Sixel
-                    && !preview.png.is_empty()
-                    && let Some(sixel) = crate::sixel::for_preview(
-                        &preview.png,
-                        preview.png_columns,
-                        preview.png_rows,
-                        self.cell_px,
-                    )
-                {
-                    self.sixel.insert(event_id.clone(), sixel);
-                }
-                if self.graphics == Graphics::Kitty && !preview.png.is_empty() {
-                    let id = self.next_image_id;
-                    self.next_image_id += 1;
-                    self.effects.push(Effect::Terminal(crate::kitty::transmit(
-                        id,
-                        &preview.png,
-                        preview.png_columns,
-                        preview.png_rows,
-                    )));
-                    self.terminal_images.insert(event_id.clone(), id);
-                }
-                // The terminal has its copy now (or does not want one).
-                preview.png = Vec::new();
-                self.previews.insert(event_id, preview);
+            Update::Preview { event_id, preview } => {
+                let sequence = self.pictures.add(event_id, preview);
+                self.effects.extend(sequence.map(Effect::Terminal));
             }
             Update::Verify(Some(state)) => self.overlays.open(state),
             Update::Verify(None) => self.overlays.close::<VerifyState>(),

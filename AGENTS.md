@@ -105,7 +105,8 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `format.rs` | Markdown formats for the message box, at the cursor (the format menu) |
 | `keys.rs` | key bindings, built in and from the config |
 | `theme.rs` | the core's themes (and the config's own) in ratatui colours |
-| `kitty.rs`, `sixel.rs` | pictures in the terminal |
+| `pictures.rs` | `Pictures`: the pictures on the terminal, which way they are drawn (`Graphics`), their rows in a layout (`drawn`), what to write to the terminal for them (kitty copies, the Sixel repaint) |
+| `kitty.rs`, `sixel.rs` | the two picture protocols' escape sequences |
 | `logo.rs` | the logo on the start screen, as a picture under the key `mothrix:logo`; its edge fades (dithered for sixel and blocks) |
 
 `crates/mothrix-ffi/` (the iOS app's Rust side):

@@ -12,6 +12,7 @@ mod keys;
 mod kitty;
 mod logo;
 mod notify;
+mod pictures;
 mod sixel;
 mod theme;
 mod ui;
@@ -622,8 +623,8 @@ fn new_app(paths: &Paths, accounts: Vec<app::Account>) -> App {
         app.notice = Some(format!("config.toml: {first}"));
     }
     app.state.accounts = accounts;
-    app.kitty_supported = kitty::supported();
-    app.sixel_supported = sixel::supported();
+    app.pictures.kitty_supported = kitty::supported();
+    app.pictures.sixel_supported = sixel::supported();
     config.apply(&mut app, &config.dictionaries());
     app.emoji_usage = mothrix_core::emoji::Usage::load();
     app.ignored_words = std::fs::read_to_string(words_file(paths))
@@ -738,8 +739,6 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-/// Draw a frame. Returns the Sixel pictures that can be painted over it:
-/// those whose cells nothing else (a popup, say) was drawn into.
 /// Write escape sequences straight to the terminal, between frames.
 fn write_terminal(sequence: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -748,27 +747,14 @@ fn write_terminal(sequence: &str) -> std::io::Result<()> {
     out.flush()
 }
 
+/// Draw a frame. Returns the Sixel pictures that can be painted over it:
+/// those whose cells nothing else (a popup, say) was drawn into.
 fn paint_frame(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
-) -> Result<Vec<app::SixelPlacement>> {
+) -> Result<Vec<pictures::Placement>> {
     let frame = terminal.draw(|frame| ui::draw(frame, app))?;
-    let free = |placement: &app::SixelPlacement| {
-        (placement.y..placement.y + placement.rows).all(|y| {
-            (placement.x..placement.x + placement.columns).all(|x| {
-                frame
-                    .buffer
-                    .cell((x, y))
-                    .is_some_and(|cell| cell.symbol() == " ")
-            })
-        })
-    };
-    Ok(app
-        .sixel_placements
-        .iter()
-        .filter(|placement| free(placement))
-        .cloned()
-        .collect())
+    Ok(app.pictures.visible(frame.buffer))
 }
 
 /// Do what the accounts dialog asked for: start signing in, or sign out.
@@ -1009,8 +995,6 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
     let mut clicks = notify::ClickReader::default();
     let (toast_clicks, mut toast_clicked) = tokio::sync::mpsc::unbounded_channel();
     let mut notifier = notify::Notifier::new(toast_clicks);
-    // The Sixel pictures on screen right now.
-    let mut sixel_shown: Vec<app::SixelPlacement> = Vec::new();
     let result: Result<()> = async {
         let mut updated = false;
         loop {
@@ -1018,13 +1002,14 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
                 app.updates.looks(&app.state.prefs),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            if app.graphics == app::Graphics::Sixel
+            if app.pictures.graphics == app::Graphics::Sixel
                 && let Ok(size) = crossterm::terminal::window_size()
                 && size.width > 0
                 && size.columns > 0
                 && size.rows > 0
             {
-                app.cell_px = (size.width / size.columns, size.height / size.rows);
+                app.pictures
+                    .set_cell_px((size.width / size.columns, size.height / size.rows));
             }
             // Sections changed here go to the accounts that keep them.
             backend.sync_sections(&mut app);
@@ -1032,22 +1017,10 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
             // Sixel pictures sit on top of the text. When what is to be
             // seen of them changed, wipe the screen, draw it again and
             // paint the pictures anew.
-            if app.graphics == app::Graphics::Sixel && shown != sixel_shown {
+            if app.pictures.stale(&shown) {
                 terminal.clear()?;
                 let shown = paint_frame(&mut terminal, &mut app)?;
-                use std::io::Write;
-                let mut out = stdout();
-                // Leave the cursor where the frame put it.
-                out.write_all(b"\x1b7")?;
-                for placement in &shown {
-                    if let Some(sixel) = app.sixel.get(&placement.event_id) {
-                        write!(out, "\x1b[{};{}H", placement.y + 1, placement.x + 1)?;
-                        out.write_all(sixel.as_bytes())?;
-                    }
-                }
-                out.write_all(b"\x1b8")?;
-                out.flush()?;
-                sixel_shown = shown;
+                write_terminal(&app.pictures.paint(shown))?;
             }
 
             let commands = tokio::select! {
@@ -1192,9 +1165,8 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
 
     // The text in the message box right now is a draft too.
     save_state(&mut app);
-    if app.graphics == app::Graphics::Kitty {
-        use std::io::Write;
-        let _ = stdout().write_all(kitty::delete_all().as_bytes());
+    if let Some(sequence) = app.pictures.leave() {
+        let _ = write_terminal(&sequence);
     }
     restore_terminal();
     result
