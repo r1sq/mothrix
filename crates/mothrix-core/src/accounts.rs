@@ -143,6 +143,172 @@ pub fn pick_profile(typed: &str, server: &str, taken: &[String]) -> Result<Strin
         .unwrap_or(profile))
 }
 
+/// A sign-in a front end asks for ([`start_sign_in`]).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SignIn {
+    /// The profile the account is kept under.
+    pub profile: String,
+    /// The name as typed, for the room list; empty for none.
+    pub label: String,
+    pub server: String,
+    pub user: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for SignIn {
+    /// Without the password: this may end up in a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignIn")
+            .field("profile", &self.profile)
+            .field("label", &self.label)
+            .field("server", &self.server)
+            .field("user", &self.user)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What is wrong with a sign-in form, and in which of its fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormProblem {
+    Server(String),
+    Name(String),
+}
+
+impl FormProblem {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Server(text) | Self::Name(text) => text,
+        }
+    }
+}
+
+impl SignIn {
+    /// From what was typed into a sign-in form; `taken`: the profiles
+    /// of the accounts there are. The name may be empty (the profile is
+    /// then made from the server), and so may the user where the server
+    /// is a full Matrix id, which then is the user too.
+    pub fn from_form(
+        server: &str,
+        user: &str,
+        password: &str,
+        name: &str,
+        taken: &[String],
+    ) -> Result<Self, FormProblem> {
+        let server = server.trim();
+        if server.is_empty() {
+            return Err(FormProblem::Server(
+                "Which server? Like matrix.org, or your full Matrix ID.".to_owned(),
+            ));
+        }
+        let profile = pick_profile(name, server, taken).map_err(FormProblem::Name)?;
+        let user = match user.trim() {
+            "" if server.starts_with('@') => server,
+            user => user,
+        };
+        Ok(Self {
+            profile,
+            label: name.trim().to_owned(),
+            server: server.to_owned(),
+            user: user.to_owned(),
+            password: password.to_owned(),
+        })
+    }
+}
+
+/// News from a sign-in under way ([`start_sign_in`]).
+pub enum SignInEvent {
+    /// A line the user should see, like the address to open.
+    Progress(String),
+    /// It came to an end: the client, or what went wrong.
+    /// [`Accounts::signed_in`] takes the client on.
+    Done {
+        profile: String,
+        label: String,
+        result: Result<Client, String>,
+    },
+}
+
+/// Sign in, in a task of its own; `tell` hears how it goes. `browser`:
+/// through the browser where the server offers that and no password was
+/// typed (a password typed means: use it). Nothing of a sign-in that
+/// failed stays on disk.
+pub fn start_sign_in(
+    request: SignIn,
+    browser: bool,
+    tell: impl Fn(SignInEvent) + Clone + Send + Sync + 'static,
+) {
+    tokio::spawn(async move {
+        let SignIn {
+            profile,
+            label,
+            server,
+            user,
+            password,
+        } = request;
+        let result = sign_in(&profile, &server, user, password, browser, tell.clone()).await;
+        tell(SignInEvent::Done {
+            profile,
+            label,
+            result: result.map_err(|error| format!("{error:#}")),
+        });
+    });
+}
+
+async fn sign_in(
+    profile: &str,
+    server: &str,
+    user: String,
+    password: String,
+    browser: bool,
+    tell: impl Fn(SignInEvent) + Clone + Send + Sync + 'static,
+) -> anyhow::Result<Client> {
+    let paths = matrix::Paths::for_profile(profile)?;
+    // Before anything is written: what is there is that account's.
+    if matrix::signed_in_as(&paths).is_some() {
+        anyhow::bail!("there is already an account called '{profile}'");
+    }
+    let password_login = !browser || !password.is_empty();
+    let result = matrix::sign_in(
+        &paths,
+        server,
+        password_login,
+        move || {
+            if user.is_empty() || password.is_empty() {
+                anyhow::bail!("this server signs in with a user name and a password; fill in both");
+            }
+            Ok((user, password))
+        },
+        move |line| tell(SignInEvent::Progress(line)),
+    )
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&paths.data_dir);
+    }
+    result
+}
+
+/// Start these signed-in profiles' accounts, in this order. Returns the
+/// clients of those that started, and for the others why not (one that
+/// is not signed in after all is left out silently).
+pub async fn restore_all(
+    profiles: Vec<String>,
+) -> (Vec<(String, Client)>, Vec<(String, anyhow::Error)>) {
+    let mut clients = Vec::new();
+    let mut problems = Vec::new();
+    for profile in profiles {
+        let restored = match matrix::Paths::for_profile(&profile) {
+            Ok(paths) => matrix::restore(&paths).await,
+            Err(error) => Err(error),
+        };
+        match restored {
+            Ok(Some(client)) => clients.push((profile, client)),
+            Ok(None) => {}
+            Err(error) => problems.push((profile, error)),
+        }
+    }
+    (clients, problems)
+}
+
 /// What [`Accounts`] keeps of one account.
 struct Slot {
     /// What its updates are marked with. Positions shift when an account
@@ -202,6 +368,28 @@ impl Accounts {
     pub fn add(&mut self, profile: String, client: Client) -> Account {
         let backend = matrix::spawn(client.clone());
         self.add_backend(profile, backend, Some(client))
+    }
+
+    /// Take on the account a sign-in ended with ([`SignInEvent::Done`]),
+    /// under the name typed for it, if any. The front end lists it.
+    pub fn signed_in(&mut self, profile: String, label: String, client: Client) -> Account {
+        let mut account = self.add(profile, client);
+        if !label.is_empty() {
+            account.label = label;
+        }
+        account
+    }
+
+    /// Sign an account out: off the server and off the disk (in a task of
+    /// its own), out of the UI at once. Returns its profile.
+    pub fn sign_out(&mut self, app: &mut impl Frontend, account: usize) -> Option<String> {
+        let (profile, client) = self.remove(app, account)?;
+        if let Some(client) = client
+            && let Ok(paths) = matrix::Paths::for_profile(&profile)
+        {
+            tokio::spawn(matrix::sign_out(client, paths));
+        }
+        Some(profile)
     }
 
     /// Take on the backend of one more account: the one `matrix::spawn`
@@ -474,6 +662,38 @@ impl Accounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sign_in_form_names_a_free_profile_and_takes_the_user_from_a_matrix_id() {
+        let taken = ["default".to_owned(), "work".to_owned()];
+        let form = |server: &str, user: &str, name: &str| {
+            SignIn::from_form(server, user, "pw", name, &taken)
+        };
+        assert!(matches!(form("  ", "amy", ""), Err(FormProblem::Server(_))));
+        assert!(matches!(
+            form("x.example", "amy", "Work"),
+            Err(FormProblem::Name(_))
+        ));
+        let typed = form(" https://chat.example.org ", " amy ", " Club ").unwrap();
+        assert_eq!(
+            (typed.profile.as_str(), typed.label.as_str()),
+            ("club", "Club")
+        );
+        assert_eq!(
+            (typed.server.as_str(), typed.user.as_str()),
+            ("https://chat.example.org", "amy")
+        );
+        // A full Matrix id is the user too; the profile is its server's,
+        // numbered where that is taken.
+        let id = form("@amy:work.example", "", "").unwrap();
+        assert_eq!(
+            (id.profile.as_str(), id.user.as_str()),
+            ("work2", "@amy:work.example")
+        );
+        assert_eq!(form("@amy:work.example", "amy", "").unwrap().user, "amy");
+        // The password is not in what a log would show.
+        assert!(!format!("{id:?}").contains("pw"));
+    }
 
     #[test]
     fn a_room_key_names_its_profile() {

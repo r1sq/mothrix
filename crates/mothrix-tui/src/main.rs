@@ -68,6 +68,7 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use matrix_sdk::Client;
+use mothrix_core::accounts::SignInEvent;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use serde::{Deserialize, Serialize};
 
@@ -487,17 +488,11 @@ async fn restore_accounts(named: &Option<String>) -> Result<Vec<(String, Client)
             profiles
         }
     };
-    let mut clients = Vec::new();
+    let (clients, problems) = accounts::restore_all(profiles).await;
     let mut failure = None;
-    for profile in profiles {
-        match matrix::restore(&Paths::for_profile(&profile)?).await {
-            Ok(Some(client)) => clients.push((profile, client)),
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!("mothrix: account '{profile}' left out: {error:#}");
-                failure = Some(error.context(format!("account '{profile}'")));
-            }
-        }
+    for (profile, error) in problems {
+        eprintln!("mothrix: account '{profile}' left out: {error:#}");
+        failure = Some(error.context(format!("account '{profile}'")));
     }
     match failure {
         Some(error) if clients.is_empty() => Err(error),
@@ -776,14 +771,6 @@ fn paint_frame(
         .collect())
 }
 
-/// News from a sign-in started in the accounts dialog.
-enum SignInEvent {
-    Progress(String),
-    /// The profile, the name typed for it, and its client if signing in
-    /// worked.
-    Done(String, String, Result<Client>),
-}
-
 /// Do what the accounts dialog asked for: start signing in, or sign out.
 fn start_account_request(
     request: app::AccountRequest,
@@ -792,53 +779,15 @@ fn start_account_request(
     signin_tx: &tokio::sync::mpsc::UnboundedSender<SignInEvent>,
 ) {
     match request {
-        app::AccountRequest::Add {
-            profile,
-            label,
-            server,
-            user,
-            password,
-        } => {
+        app::AccountRequest::Add(request) => {
             let tx = signin_tx.clone();
-            tokio::spawn(async move {
-                let progress = tx.clone();
-                let result = async {
-                    let paths = Paths::for_profile(&profile)?;
-                    if matrix::signed_in_as(&paths).is_some() {
-                        bail!("there is already an account called '{profile}'");
-                    }
-                    // A password typed in means: use it, also where
-                    // the browser would do.
-                    let password_login = !password.is_empty();
-                    matrix::sign_in(
-                        &paths,
-                        &server,
-                        password_login,
-                        move || {
-                            if user.is_empty() || password.is_empty() {
-                                bail!(
-                                    "this server signs in with a user name and a \
-                                     password; fill in both"
-                                );
-                            }
-                            Ok((user, password))
-                        },
-                        move |line| {
-                            let _ = progress.send(SignInEvent::Progress(line));
-                        },
-                    )
-                    .await
-                }
-                .await;
-                let _ = tx.send(SignInEvent::Done(profile, label, result));
+            accounts::start_sign_in(request, true, move |event| {
+                let _ = tx.send(event);
             });
         }
         app::AccountRequest::Swap(a, b) => backend.swap(app, a, b),
         app::AccountRequest::Remove(account) => {
-            if let Some((profile, Some(client))) = backend.remove(app, account)
-                && let Ok(paths) = Paths::for_profile(&profile)
-            {
-                tokio::spawn(matrix::sign_out(client, paths));
+            if let Some(profile) = backend.sign_out(app, account) {
                 app.notice = Some(format!("Signed out '{profile}'."));
             }
         }
@@ -849,23 +798,20 @@ fn start_account_request(
 fn finish_sign_in(app: &mut App, backend: &mut accounts::Accounts, event: SignInEvent) {
     match event {
         SignInEvent::Progress(line) => app.account_progress(line),
-        SignInEvent::Done(profile, label, Ok(client)) => {
-            let mut account = backend.add(profile, client);
-            if !label.is_empty() {
-                account.label = label;
-            }
+        SignInEvent::Done {
+            profile,
+            label,
+            result: Ok(client),
+        } => {
+            let account = backend.signed_in(profile, label, client);
             app.state.accounts.push(account);
             // The name is worth keeping.
             app.state.config_dirty = true;
             app.account_added(Ok(()));
         }
-        SignInEvent::Done(profile, _, Err(error)) => {
-            // Nothing of a failed sign-in is worth keeping.
-            if let Ok(paths) = Paths::for_profile(&profile) {
-                let _ = std::fs::remove_dir_all(&paths.data_dir);
-            }
-            app.account_added(Err(format!("{error:#}")));
-        }
+        SignInEvent::Done {
+            result: Err(error), ..
+        } => app.account_added(Err(error)),
     }
 }
 

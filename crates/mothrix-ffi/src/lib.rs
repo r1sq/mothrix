@@ -273,13 +273,7 @@ enum Request {
     /// A notification about this room was tapped.
     Clicked(String),
     /// News from a sign-in under way.
-    SignIn(SignInEvent),
-}
-
-enum SignInEvent {
-    Progress(String),
-    /// The profile, the name typed for it, and its client if it worked.
-    Done(String, String, anyhow::Result<matrix_sdk::Client>),
+    SignIn(mothrix_core::accounts::SignInEvent),
 }
 
 #[derive(Clone)]
@@ -420,19 +414,16 @@ fn carry_out(
             listener,
             &serde_json::json!({ "type": "notify", "room": room, "title": title }),
         ),
-        Effect::SignIn {
-            profile,
-            label,
-            server,
-            user,
-            password,
-        } => start_sign_in(profile, label, server, user, password, requests.clone()),
+        Effect::SignIn(request) => {
+            let requests = requests.clone();
+            // Browser sign-in (SSO) is not there yet in the app: always
+            // with the password.
+            mothrix_core::accounts::start_sign_in(request, false, move |event| {
+                requests.ask(Request::SignIn(event));
+            });
+        }
         Effect::SignOut(account) => {
-            if let Some((profile, Some(client))) = accounts.remove(view, account)
-                && let Ok(paths) = Paths::for_profile(&profile)
-            {
-                tokio::spawn(matrix::sign_out(client, paths));
-            }
+            accounts.sign_out(view, account);
         }
         Effect::Upload {
             name,
@@ -481,79 +472,31 @@ fn keep_upload(name: &str, data: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-fn start_sign_in(
-    profile: String,
-    label: String,
-    server: String,
-    user: String,
-    password: String,
-    requests: Requests,
+fn finish_sign_in(
+    event: mothrix_core::accounts::SignInEvent,
+    view: &mut View,
+    accounts: &mut Accounts,
 ) {
-    tokio::spawn(async move {
-        let progress = requests.clone();
-        let result = async {
-            let paths = Paths::for_profile(&profile)?;
-            if matrix::signed_in_as(&paths).is_some() {
-                anyhow::bail!("there is already an account called '{profile}'");
-            }
-            // Browser sign-in (SSO) is not there yet in the app: always
-            // with the password.
-            matrix::sign_in(
-                &paths,
-                &server,
-                true,
-                move || {
-                    if user.is_empty() || password.is_empty() {
-                        anyhow::bail!("fill in the user name and the password");
-                    }
-                    Ok((user, password))
-                },
-                move |line| progress.ask(Request::SignIn(SignInEvent::Progress(line))),
-            )
-            .await
-        }
-        .await;
-        requests.ask(Request::SignIn(SignInEvent::Done(profile, label, result)));
-    });
-}
-
-fn finish_sign_in(event: SignInEvent, view: &mut View, accounts: &mut Accounts) {
+    use mothrix_core::accounts::SignInEvent;
     match event {
         SignInEvent::Progress(line) => view.sign_in_progress(line),
-        SignInEvent::Done(profile, label, Ok(client)) => {
-            let mut account = accounts.add(profile, client);
-            if !label.is_empty() {
-                account.label = label;
-            }
-            view.sign_in_done(Ok(account));
-        }
-        SignInEvent::Done(profile, _, Err(error)) => {
-            // Nothing of a failed sign-in is worth keeping.
-            if let Ok(paths) = Paths::for_profile(&profile) {
-                let _ = std::fs::remove_dir_all(&paths.data_dir);
-            }
-            view.sign_in_done(Err(format!("{error:#}")));
-        }
+        SignInEvent::Done {
+            profile,
+            label,
+            result,
+        } => view.sign_in_done(result.map(|client| accounts.signed_in(profile, label, client))),
     }
 }
 
 /// Every signed-in account, in the config's order. One that cannot start
 /// is left out and named.
 async fn restore_accounts(config: &Config) -> (Vec<(String, matrix_sdk::Client)>, Vec<String>) {
-    let mut clients = Vec::new();
-    let mut problems = Vec::new();
     let mut profiles = matrix::signed_in_profiles();
     config.order_profiles(&mut profiles);
-    for profile in profiles {
-        let restored = match Paths::for_profile(&profile) {
-            Ok(paths) => matrix::restore(&paths).await,
-            Err(error) => Err(error),
-        };
-        match restored {
-            Ok(Some(client)) => clients.push((profile, client)),
-            Ok(None) => {}
-            Err(error) => problems.push(format!("{profile}: {error:#}")),
-        }
-    }
+    let (clients, problems) = mothrix_core::accounts::restore_all(profiles).await;
+    let problems = problems
+        .into_iter()
+        .map(|(profile, error)| format!("{profile}: {error:#}"))
+        .collect();
     (clients, problems)
 }

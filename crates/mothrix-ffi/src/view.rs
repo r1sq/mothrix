@@ -452,13 +452,7 @@ pub enum Effect {
         room: String,
         title: String,
     },
-    SignIn {
-        profile: String,
-        label: String,
-        server: String,
-        user: String,
-        password: String,
-    },
+    SignIn(accounts::SignIn),
     SignOut(usize),
     /// Keep this file (base64) on disk and send it to the open room.
     Upload {
@@ -1164,37 +1158,20 @@ impl View {
         if self.sign_in.busy {
             return;
         }
-        let server = server.trim().to_owned();
         self.sign_in = SignIn::default();
-        if server.is_empty() {
-            self.sign_in.error =
-                Some("Which server? Like matrix.org, or your full Matrix ID.".to_owned());
-        } else {
-            let taken: Vec<String> = self
-                .state
-                .accounts
-                .iter()
-                .map(|account| account.profile.clone())
-                .collect();
-            match accounts::pick_profile(&name, &server, &taken) {
-                Ok(profile) => {
-                    self.sign_in.busy = true;
-                    self.sign_in.lines.push("Signing in…".to_owned());
-                    // With no user name typed, a full Matrix id is one.
-                    let user = match user.trim() {
-                        "" if server.starts_with('@') => server.clone(),
-                        user => user.to_owned(),
-                    };
-                    self.effects.push(Effect::SignIn {
-                        profile,
-                        label: name.trim().to_owned(),
-                        server,
-                        user,
-                        password,
-                    });
-                }
-                Err(problem) => self.sign_in.error = Some(problem),
+        let taken: Vec<String> = self
+            .state
+            .accounts
+            .iter()
+            .map(|account| account.profile.clone())
+            .collect();
+        match accounts::SignIn::from_form(&server, &user, &password, &name, &taken) {
+            Ok(request) => {
+                self.sign_in.busy = true;
+                self.sign_in.lines.push("Signing in…".to_owned());
+                self.effects.push(Effect::SignIn(request));
             }
+            Err(problem) => self.sign_in.error = Some(problem.text().to_owned()),
         }
         self.events.push(Event::SignIn(self.sign_in.clone()));
     }
@@ -2094,13 +2071,13 @@ mod tests {
         );
         assert_eq!(
             view.take_effects(),
-            [Effect::SignIn {
+            [Effect::SignIn(accounts::SignIn {
                 profile: "work2".into(),
                 label: String::new(),
                 server: "@amy:work.example".into(),
                 user: "@amy:work.example".into(),
                 password: "pw".into(),
-            }]
+            })]
         );
         assert!(view.snapshot().sign_in.busy);
         view.sign_in_done(Ok(account("work2")));

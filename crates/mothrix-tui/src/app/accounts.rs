@@ -7,6 +7,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, Effect, Focus, SettingsDialog};
+use crate::accounts::FormProblem;
 use crate::input::Input;
 use crate::matrix::Update;
 
@@ -62,14 +63,7 @@ pub enum AccountsAction {
 /// Work for the main loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountRequest {
-    Add {
-        profile: String,
-        /// The name as typed, for the sidebar; empty for none.
-        label: String,
-        server: String,
-        user: String,
-        password: String,
-    },
+    Add(crate::accounts::SignIn),
     /// Sign out the account at this index of [`App::accounts`].
     Remove(usize),
     /// Let these two accounts change places in the list.
@@ -193,36 +187,31 @@ impl App {
         if form.busy {
             return;
         }
-        let server = form.fields[SERVER].text().trim().to_owned();
-        if server.is_empty() {
-            form.field = SERVER;
-            form.failed = true;
-            form.status = "Which server? Like matrix.org, or your full Matrix ID.".to_owned();
-            return;
-        }
-        let typed = form.fields[NAME].text().trim().to_owned();
-        let profile = match crate::accounts::pick_profile(&typed, &server, &taken) {
-            Ok(profile) => profile,
+        let request = match crate::accounts::SignIn::from_form(
+            form.fields[SERVER].text(),
+            form.fields[USER].text(),
+            form.fields[PASSWORD].text(),
+            form.fields[NAME].text(),
+            &taken,
+        ) {
+            Ok(request) => request,
             Err(problem) => {
-                form.field = NAME;
+                form.field = match problem {
+                    FormProblem::Server(_) => SERVER,
+                    FormProblem::Name(_) => NAME,
+                };
                 form.failed = true;
-                form.status = problem;
+                form.status = problem.text().to_owned();
                 return;
             }
         };
         form.busy = true;
         form.failed = false;
         form.status = "Signing in…".to_owned();
-        let request = AccountRequest::Add {
-            profile,
-            label: typed,
-            server,
-            user: form.fields[USER].text().trim().to_owned(),
-            password: form.fields[PASSWORD].text().to_owned(),
-        };
         // Not kept longer than needed.
         form.fields[PASSWORD].clear();
-        self.effects.push(Effect::Account(request));
+        self.effects
+            .push(Effect::Account(AccountRequest::Add(request)));
     }
 
     pub(super) fn accounts_action(&mut self, action: AccountsAction) {
@@ -455,13 +444,13 @@ mod tests {
         // "work" is taken, so the name made from the server gets a number.
         assert_eq!(
             app.take_account_request(),
-            Some(AccountRequest::Add {
+            Some(AccountRequest::Add(crate::accounts::SignIn {
                 profile: "work2".into(),
                 label: String::new(),
                 server: "work.example.org".into(),
                 user: "amy".into(),
                 password: "secret".into(),
-            })
+            }))
         );
 
         app.account_added(Err("wrong password".into()));
