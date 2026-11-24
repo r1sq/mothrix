@@ -79,6 +79,7 @@ const MESSAGE_BOX: &[(&str, &str)] = &[
     ),
     (":name", "suggests emoji the same way"),
     ("/", "suggests the commands below"),
+    ("//", "starts a message that begins with a slash"),
     (
         "Esc",
         "stop replying or editing; else leave the thread, or go to the room list",

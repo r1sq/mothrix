@@ -85,12 +85,37 @@ impl App {
         if let Some(info) = self.overlays.get_mut::<RoomInfo>()
             && info.room_id == details.room_id
         {
-            info.cursor = info.cursor.min(details.members.len().saturating_sub(1));
+            // The cursor stays on the person it was on: the list comes
+            // anew after every invite and removal, and a "remove?" still
+            // open must not then mean whoever moved up to that row.
+            let on = info.selected().map(|member| member.user_id.clone());
+            let at = on.and_then(|on| details.members.iter().position(|m| m.user_id == on));
+            if at.is_none()
+                && matches!(
+                    info.mode,
+                    InfoMode::Confirm(InfoConfirm::Kick | InfoConfirm::Ban)
+                )
+            {
+                info.mode = InfoMode::List;
+            }
+            info.cursor = at
+                .unwrap_or(info.cursor)
+                .min(details.members.len().saturating_sub(1));
             info.details = Some(details);
         }
     }
 
     pub(super) fn room_info_action(&mut self, action: InfoAction, commands: &mut Vec<Command>) {
+        // The room's account, which need not be the open room's: its
+        // user is "me" here, and it starts the chat or the verification.
+        if let Some(info) = self.overlays.get::<RoomInfo>() {
+            self.state.named_account = self
+                .state
+                .rooms
+                .iter()
+                .find(|room| room.id == info.room_id)
+                .map(|room| room.account);
+        }
         let own = self.account().user_id.clone();
         let Some(info) = self.overlays.get_mut::<RoomInfo>() else {
             return;
@@ -333,6 +358,45 @@ mod tests {
         assert!(matches!(&commands[..], [Command::RoomDetails { room_id }] if room_id == "!a"));
         app.on_update(Update::RoomDetails(details(moderator)));
         app
+    }
+
+    #[test]
+    fn removing_means_the_person_asked_about_even_when_the_list_changes() {
+        let mut app = open(true);
+        let with = |members: Vec<RoomMember>| {
+            Update::RoomDetails(RoomDetails {
+                members,
+                ..details(true)
+            })
+        };
+        let me = || member("@me:x", "Me", "admin");
+        app.on_update(with(vec![
+            me(),
+            member("@amy:x", "Amy", ""),
+            member("@ben:x", "Ben", ""),
+            member("@cleo:x", "Cleo", ""),
+        ]));
+        let mut commands = Vec::new();
+        app.room_info_action(InfoAction::Select(2), &mut commands);
+        app.room_info_action(InfoAction::Kick, &mut commands);
+        // Amy went meanwhile: Ben is one row up, and still the one meant.
+        app.on_update(with(vec![
+            me(),
+            member("@ben:x", "Ben", ""),
+            member("@cleo:x", "Cleo", ""),
+        ]));
+        app.room_info_action(InfoAction::Confirm, &mut commands);
+        assert!(
+            matches!(&commands[..], [Command::Kick { user_id, .. }] if user_id == "@ben:x"),
+            "{commands:?}"
+        );
+        // The person asked about went: nobody else is removed instead.
+        let mut commands = Vec::new();
+        app.room_info_action(InfoAction::Select(2), &mut commands);
+        app.room_info_action(InfoAction::Ban, &mut commands);
+        app.on_update(with(vec![me(), member("@ben:x", "Ben", "")]));
+        app.room_info_action(InfoAction::Confirm, &mut commands);
+        assert!(commands.is_empty(), "{commands:?}");
     }
 
     #[test]

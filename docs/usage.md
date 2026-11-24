@@ -73,7 +73,9 @@ Typing `/` in the message box lists the commands; `Tab` completes one,
 | `/update` | install a new release of mothrix ([updates.md](updates.md)) |
 | `/settings`, `/accounts`, `/theme <name>`, `/stop`, `/quit` | the rest |
 
-`<who>` is a Matrix ID, or a name completed with `@`.
+`<who>` is a Matrix ID, or a name completed with `@`. A message that is to
+begin with a slash starts with two (`//usr/bin` sends `/usr/bin`); what is
+no command stays in the message box.
 
 ## Several accounts
 

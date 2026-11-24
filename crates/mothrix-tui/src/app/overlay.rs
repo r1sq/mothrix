@@ -269,6 +269,9 @@ impl App {
     }
 
     fn on_recovery_key(&mut self, key: KeyEvent) {
+        if self.unsettled() {
+            return;
+        }
         match key.code {
             KeyCode::Char('c') => {
                 if let Some(RecoveryKey(recovery_key)) = self.overlays.get() {
@@ -287,6 +290,11 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => self.overlays.close::<ResetPrompt>(),
+            // Not on an empty Enter: the command's name completes with
+            // Enter, and a second one must not go on to reset.
+            KeyCode::Enter if input.text().is_empty() => {
+                self.notice = Some("Type your account password, or Esc to leave it.".to_owned());
+            }
             KeyCode::Enter => {
                 let password = input.text().to_owned();
                 self.overlays.close::<ResetPrompt>();

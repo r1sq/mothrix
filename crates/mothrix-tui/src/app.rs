@@ -292,6 +292,16 @@ pub struct App {
     pub updates: updates::Updates,
     /// The message clicked last, and when: for double-clicks.
     last_click: Option<(String, std::time::Instant)>,
+    /// Until when a dialog that came up by itself (someone asks to
+    /// verify, the emoji to compare, the recovery key) takes no key: the
+    /// Enter of someone who was writing a message would else accept the
+    /// request, confirm emoji never looked at, or close the key.
+    settles: Option<std::time::Instant>,
+    /// What was in the message box when an edit of an earlier message
+    /// began; back there when the edit is sent or given up.
+    set_aside: Option<String>,
+    /// How long that is.
+    pub(crate) key_guard: std::time::Duration,
     /// What is to be done outside, in order (see [`Effect`]).
     effects: Vec<Effect>,
     /// The dialogs and menus open over the main screen.
@@ -378,6 +388,10 @@ impl App {
             }]),
             updates: updates::Updates::new(crate::update::Build::Development, false),
             last_click: None,
+            settles: None,
+            set_aside: None,
+            // Tests press their keys at once.
+            key_guard: std::time::Duration::from_millis(if cfg!(test) { 0 } else { 900 }),
             overlays: Overlays::default(),
             viewport: Viewport::default(),
             effects: Vec::new(),
@@ -476,6 +490,12 @@ impl App {
 
     fn open(&mut self, room_id: String, commands: &mut Vec<Command>) {
         let opening = self.state.open(&room_id);
+        // Whoever was told we are writing in the room we leave hears that
+        // we stopped, before the backend turns to the other room.
+        if matches!(opening, Opening::Opened { .. }) && !self.typing_told.is_empty() {
+            commands.push(Command::Typing(false));
+            self.typing_told.clear();
+        }
         commands.extend(opening.commands());
         let previous = match opening {
             Opening::NotListed => return,
@@ -503,8 +523,13 @@ impl App {
             self.keep_draft(&previous);
         }
         self.composer.clear();
-        if let Some(draft) = self.drafts.get(&room_id) {
-            self.composer.set(&draft.clone());
+        if let Some(draft) = self.drafts.get(&room_id).cloned() {
+            self.composer.set(&draft);
+            // A draft found there is not being written: no notice for it
+            // until it changes.
+            if !draft.trim().is_empty() && !draft.starts_with('/') {
+                self.typing_told = draft;
+            }
         }
         self.reopen = None;
         self.state_dirty = true;
@@ -519,11 +544,15 @@ impl App {
     }
 
     fn keep_draft(&mut self, room_id: &str) {
-        let text = self.composer.text();
-        if text.trim().is_empty() || matches!(self.compose, Compose::Edit { .. }) {
+        // While a message is edited, the draft is what was set aside.
+        let text = match (&self.compose, self.set_aside.take()) {
+            (Compose::Edit { .. }, aside) => aside.unwrap_or_default(),
+            _ => self.composer.text().to_owned(),
+        };
+        if text.trim().is_empty() {
             self.drafts.remove(room_id);
         } else {
-            self.drafts.insert(room_id.to_owned(), text.to_owned());
+            self.drafts.insert(room_id.to_owned(), text);
         }
     }
 
@@ -848,6 +877,10 @@ impl App {
                 self.bar = Bar::Actions;
             }
             BarAction::Edit => {
+                // What is being written waits until the edit is done.
+                if !matches!(self.compose, Compose::Edit { .. }) && !self.composer.is_empty() {
+                    self.set_aside = Some(self.composer.text().to_owned());
+                }
                 self.composer.set(&item.body);
                 self.compose = Compose::Edit {
                     event_id: item.event_id,
@@ -936,7 +969,21 @@ impl App {
         commands.push(Command::Verify(input));
     }
 
+    /// A dialog comes up by itself: no key for a moment.
+    fn settle(&mut self) {
+        self.settles = Some(std::time::Instant::now() + self.key_guard);
+    }
+
+    /// Whether such a dialog only just came up.
+    pub(crate) fn unsettled(&self) -> bool {
+        self.settles
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+
     fn on_verify_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
+        if self.unsettled() {
+            return;
+        }
         let input = match (self.overlays.get::<VerifyState>(), key.code) {
             (Some(VerifyState::Incoming { .. }), KeyCode::Enter) => VerifyInput::Accept,
             (Some(VerifyState::Emojis(_)), KeyCode::Enter) => VerifyInput::Confirm,
@@ -952,6 +999,7 @@ impl App {
     fn cancel_compose(&mut self) {
         if matches!(self.compose, Compose::Edit { .. }) {
             self.composer.clear();
+            self.take_up_again();
         }
         self.compose = Compose::Message;
     }
@@ -996,7 +1044,24 @@ impl App {
                 }
                 return;
             }
-            Taken::Show(room) => return self.open_later(room),
+            // A room a command asked for (joined, a chat started) has
+            // come. Not under the hands of someone who went on writing
+            // or opened a dialog meanwhile: the rest of the sentence
+            // would go into the new room.
+            Taken::Show(room) => {
+                if self.composer.is_empty() && !self.dialog_open() {
+                    return self.open_later(room);
+                }
+                let name = self
+                    .state
+                    .rooms
+                    .iter()
+                    .find(|entry| entry.id == room)
+                    .map_or_else(|| "The room".to_owned(), |entry| entry.name.clone());
+                self.cursor_room = Some(room);
+                self.notice = Some(format!("{name} is there: marked in the list."));
+                return;
+            }
             Taken::Items => {
                 // The selected message may have been deleted meanwhile.
                 if self.selected.is_some() && self.selected_item().is_none() {
@@ -1034,13 +1099,25 @@ impl App {
             Update::RoomDetails(details) => self.on_room_details(details),
             Update::RecoveryKey(key) => {
                 self.notice = None;
+                self.settle();
                 self.overlays.open(RecoveryKey(key));
             }
             Update::Preview { event_id, preview } => {
                 let sequence = self.pictures.add(event_id, preview);
                 self.effects.extend(sequence.map(Effect::Terminal));
             }
-            Update::Verify(Some(state)) => self.overlays.open(state),
+            Update::Verify(Some(state)) => {
+                // A step that asks for an answer, new on the screen.
+                let asks = matches!(state, VerifyState::Incoming { .. } | VerifyState::Emojis(_));
+                let shown = self
+                    .overlays
+                    .get::<VerifyState>()
+                    .map(std::mem::discriminant);
+                if asks && shown != Some(std::mem::discriminant(&state)) {
+                    self.settle();
+                }
+                self.overlays.open(state);
+            }
             Update::Verify(None) => self.overlays.close::<VerifyState>(),
             // Without several accounts (see `accounts::Accounts::deliver`)
             // these are about the only one.
@@ -1072,6 +1149,8 @@ impl App {
 
     pub fn on_event(&mut self, event: Event) -> Vec<Command> {
         let mut commands = Vec::new();
+        // Which account an earlier action named is no word about this one.
+        self.state.named_account = None;
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key, &mut commands),
             Event::Mouse(mouse) => self.on_mouse(mouse, &mut commands),
@@ -1398,7 +1477,13 @@ impl App {
         // The pinned messages are for reading; a message typed there
         // would not land where it seems to.
         let pinned_view = self.state.pinned_view();
-        if pinned_view && !self.composer.text().trim_start().starts_with('/') {
+        let typed = self.composer.text().trim_start();
+        let sends = !typed.starts_with('/')
+            || typed.starts_with("//")
+            || ["/me ", "/file ", "/poll ", "/paste"]
+                .iter()
+                .any(|command| typed.starts_with(command));
+        if pinned_view && sends {
             self.notice = Some("Esc goes back to the room, where you can write.".to_owned());
             return;
         }
@@ -1407,9 +1492,17 @@ impl App {
         if text.is_empty() {
             return;
         }
+        // A message being edited is text, whatever it starts with; and
+        // "//" starts a message that begins with a slash.
+        let editing = matches!(self.compose, Compose::Edit { .. });
+        let (text, literal) = match text.strip_prefix("//") {
+            Some(rest) if !editing => (&text[1..], !rest.is_empty()),
+            _ => (text, editing),
+        };
 
         if let Some(command) = text.strip_prefix('/')
             && !text.starts_with("/me ")
+            && !literal
         {
             let (name, argument) = command.split_once(' ').unwrap_or((command, ""));
             match name {
@@ -1537,8 +1630,11 @@ impl App {
                     commands.push(Command::Recover(argument.trim().to_owned()));
                 }
                 _ => {
+                    // Not a command: perhaps a message (a path, a typing
+                    // mistake in a long line). It stays to be put right.
+                    self.composer.set(text);
                     self.notice = Some(
-                        "Commands: /me, /poll Q | A | B [--multi] [--hidden], /file <path>, /paste, /search, /settings, /accounts, /info, /invite, /dm, /room, /join, /leave, /verify, /recover <key>, /theme, /quit"
+                        "No such command (a message that starts with a slash: type //). Commands: /me, /poll Q | A | B [--multi] [--hidden], /file <path>, /paste, /search, /settings, /accounts, /info, /invite, /dm, /room, /join, /leave, /verify, /recover <key>, /theme, /quit"
                             .to_owned(),
                     );
                 }
@@ -1566,11 +1662,21 @@ impl App {
                 text,
                 mentions: mentions.clone(),
             }),
-            Compose::Edit { event_id } => commands.push(Command::Edit {
-                event_id,
-                text,
-                mentions: mentions.clone(),
-            }),
+            Compose::Edit { event_id } => {
+                commands.push(Command::Edit {
+                    event_id,
+                    text,
+                    mentions: mentions.clone(),
+                });
+                self.take_up_again();
+            }
+        }
+    }
+
+    /// The edit is over: what was being written before it is back.
+    fn take_up_again(&mut self) {
+        if let Some(text) = self.set_aside.take() {
+            self.composer.set(&text);
         }
     }
 
@@ -2219,6 +2325,46 @@ mod tests {
         app.focus = Focus::Timeline;
         app.on_event(key(KeyCode::Char('u')));
         assert_eq!(app.selected.as_deref(), Some("$new1"));
+    }
+
+    #[test]
+    fn leaving_a_room_ends_the_writing_there_and_a_draft_found_is_not_writing() {
+        let mut app = chat();
+        type_text(&mut app, "half a");
+        app.take_commands();
+        let mut commands = Vec::new();
+        app.open("!b".into(), &mut commands);
+        // "Stopped" goes out before the backend turns to the other room.
+        assert!(
+            matches!(
+                &commands[..],
+                [Command::Typing(false), Command::Open { .. }, ..]
+            ),
+            "{commands:?}"
+        );
+        assert!(app.take_commands().is_empty());
+        // Back: the draft is there again, and nobody is told we write.
+        app.open("!a".into(), &mut Vec::new());
+        assert_eq!(app.composer.text(), "half a");
+        app.on_event(key(KeyCode::Left));
+        assert!(app.take_commands().is_empty(), "nothing was typed");
+    }
+
+    #[test]
+    fn a_room_that_comes_later_does_not_open_under_someone_writing() {
+        let mut app = chat();
+        type_text(&mut app, "still writing here");
+        app.on_update(Update::GoTo("!b".into()));
+        assert_eq!(app.state.open_room.as_deref(), Some("!a"));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("marked"))
+        );
+        // With nothing being written it opens.
+        app.composer.clear();
+        app.on_update(Update::GoTo("!b".into()));
+        assert_eq!(app.state.open_room.as_deref(), Some("!b"));
     }
 
     #[test]
@@ -3193,6 +3339,71 @@ mod tests {
         let commands = app.on_event(key(KeyCode::Enter));
         assert!(matches!(&commands[..], [Command::SendFile { path: sent, .. }] if *sent == path));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dialog_that_comes_by_itself_takes_no_key_at_first() {
+        let mut app = chat();
+        app.key_guard = std::time::Duration::from_secs(3600);
+        type_text(&mut app, "see you at");
+        app.on_update(Update::Verify(Some(VerifyState::Incoming {
+            device: "Phone".into(),
+        })));
+        // The Enter meant to send the message accepts nothing.
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        app.on_update(Update::RecoveryKey("EsTc 1234".into()));
+        app.on_event(key(KeyCode::Enter));
+        assert!(app.overlays.is_open::<RecoveryKey>());
+        // Later it does.
+        app.settles = None;
+        app.on_event(key(KeyCode::Enter));
+        assert!(!app.overlays.is_open::<RecoveryKey>());
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(matches!(
+            &commands[..],
+            [Command::Verify(VerifyInput::Accept)]
+        ));
+    }
+
+    #[test]
+    fn what_is_not_a_command_stays_and_two_slashes_start_a_message() {
+        let mut app = chat();
+        type_text(&mut app, "/usr/bin/foo is broken");
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.composer.text(), "/usr/bin/foo is broken");
+        app.composer.set("//usr/bin/foo is broken");
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::Send { text, .. }] if text == "/usr/bin/foo is broken"),
+            "{commands:?}"
+        );
+        // The identity reset wants its password, not just Enter again.
+        app.composer.set("/reset-identity");
+        app.on_event(key(KeyCode::Enter));
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert!(app.overlays.is_open::<ResetPrompt>());
+    }
+
+    #[test]
+    fn editing_an_earlier_message_keeps_what_was_being_written() {
+        let mut app = chat();
+        type_text(&mut app, "half a thought");
+        app.select("$2".into());
+        let mut commands = Vec::new();
+        app.on_bar(BarAction::Edit, &mut commands);
+        assert_eq!(app.composer.text(), "mine");
+        app.composer.set("/mine, corrected");
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::Edit { text, .. }] if text == "/mine, corrected"),
+            "an edit is text, whatever it starts with: {commands:?}"
+        );
+        assert_eq!(app.composer.text(), "half a thought");
+        // Given up: back as well.
+        app.select("$2".into());
+        app.on_bar(BarAction::Edit, &mut Vec::new());
+        app.on_event(key(KeyCode::Esc));
+        assert_eq!(app.composer.text(), "half a thought");
     }
 
     #[test]
