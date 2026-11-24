@@ -131,6 +131,7 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `App/Screens.swift`, `App/Look.swift` | sign-in, room list, conversation; theme colours, monospace, the moth |
 | `App/Capture.swift` | the camera, recording voice messages |
 | `Shared/StoreKey.swift` | in the app and both extensions: the stores' passphrase, made once and kept in the Keychain (the app group's access group), handed to Rust (`store_passphrase`) before anything starts |
+| `Shared/Badge.swift` | the number on the app's icon: one count per account in the app group's settings, written by the app (its unread chats) and by the notification extension (what each push says), shown as their sum |
 | `Share/ShareViewController.swift` | the share extension: rooms from `share-rooms.json` (the app writes it), sends through Rust's `share` |
 | `NSE/NotificationService.swift` | fetches and decrypts the message a push is about |
 | `MothrixTests/` | decoding the JSON samples `mothrix-ffi` writes (`MOTHRIX_WRITE_FIXTURES=1 cargo test -p mothrix-ffi`) |

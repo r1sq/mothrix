@@ -491,14 +491,22 @@ final class Store: ObservableObject {
     }
 
     private var badge = -1
+    private var badgeCounts: [String: Int]? = nil
 
     /// The app icon's number: rooms with something new (as Synapse counts
     /// for pushes), muted ones left out. Notifications of rooms that have
     /// nothing new any more (read here, or on another device) go.
     private func notificationsFollowRooms() {
         let new = rooms.filter { ($0.unread > 0 || $0.mentions > 0) && $0.notify != "Mute" }
-        if new.count != badge {
-            badge = new.count
+        // Per account, where the notification extension finds them: it
+        // goes on from these while the app does not run (`Badge`).
+        var perAccount: [String: Int] = [:]
+        for (index, account) in accounts.enumerated() {
+            perAccount[account.profile] = new.filter { $0.account == index }.count
+        }
+        if perAccount != badgeCounts {
+            badgeCounts = perAccount
+            badge = Badge.know(perAccount)
             UNUserNotificationCenter.current().setBadgeCount(badge)
         }
         let read = Set(rooms.filter { $0.unread == 0 && $0.mentions == 0 }.map(\.id))

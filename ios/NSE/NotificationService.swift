@@ -22,20 +22,27 @@ final class NotificationService: UNNotificationServiceExtension {
         let content = (request.content.mutableCopy() as? UNMutableNotificationContent)
             ?? UNMutableNotificationContent()
         let info = request.content.userInfo
+        // The profile becomes a folder's name: only what mothrix itself
+        // makes of one (`clean_profile`), so no path.
+        let profile = info["mothrix_profile"] as? String ?? "default"
+        // The number on the app's icon: this account's count as its
+        // server tells it, with the other accounts' last ones (`Badge`).
+        let badge: NSNumber? = (info["unread_count"] as? NSNumber).flatMap { unread in
+            Self.isProfile(profile)
+                ? NSNumber(value: Badge.heard(profile: profile, unread: unread.intValue))
+                : nil
+        }
         guard let roomId = info["room_id"] as? String,
               let eventId = info["event_id"] as? String
         else {
             // No message: the homeserver tells a new count (something was
             // read elsewhere). Only the app icon's number changes.
-            // The number on the app's icon is the app's: its unread rooms
-            // over all accounts. One server's count of messages is another
-            // number, and the two took turns there.
             let quiet = UNMutableNotificationContent()
+            quiet.badge = badge
             begin(handler, quiet)
             return finish()
         }
-        // (No badge from here, see above.)
-        content.badge = nil
+        content.badge = badge
         // Until the message is there, and if it never is: fixed words, not
         // the push's own (whoever sends pushes could write anything there),
         // no room for a tap or a reply to go to, and no Reply (it would
@@ -48,9 +55,6 @@ final class NotificationService: UNNotificationServiceExtension {
         content.userInfo.removeValue(forKey: "mothrix_room")
         content.userInfo.removeValue(forKey: "mothrix_thread")
         begin(handler, content)
-        // The profile becomes a folder's name: only what mothrix itself
-        // makes of one (`clean_profile`), so no path.
-        let profile = info["mothrix_profile"] as? String ?? "default"
         guard Self.isProfile(profile) else { return finish() }
         let folder = FileManager.default
             .containerURL(forSecurityApplicationGroupIdentifier: "group.de.tmrk.mothrix")?.path ?? ""
