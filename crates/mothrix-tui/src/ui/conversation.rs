@@ -72,7 +72,7 @@ fn hard_wrap(text: &str, width: usize) -> Vec<String> {
     let mut out = vec![String::new()];
     let mut used = 0;
     for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+        let w = crate::inline::cells(c);
         if used + w > width {
             out.push(String::new());
             used = 0;
@@ -308,7 +308,7 @@ fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) ->
                                 let mut link_spots: Vec<(usize, usize, usize)> = Vec::new();
                                 let mut column = 2usize;
                                 for (c, flags) in &styled {
-                                    let cells = c.width().unwrap_or(0);
+                                    let cells = crate::inline::cells(*c);
                                     if flags & inline::LINK == 0 {
                                         in_link = None;
                                     } else {

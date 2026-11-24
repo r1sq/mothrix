@@ -6,7 +6,6 @@
 //! so fields edit and look the same everywhere.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Debug, Default)]
 pub struct Input {
@@ -42,7 +41,7 @@ impl Input {
     pub fn view(&self, width: usize) -> (String, u16) {
         let chars: Vec<char> = self.text.chars().collect();
         let cursor = self.cursor.min(chars.len());
-        let cells = |c: &char| c.width().unwrap_or(0);
+        let cells = |c: &char| crate::inline::cells(*c);
         // Start as far left as the cursor (and a cell for it) allows.
         let mut skip = cursor;
         let mut used = 1;

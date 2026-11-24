@@ -20,6 +20,17 @@ pub const LINK: u8 = 64;
 /// A character and the styles (`BOLD` etc.) that apply to it.
 pub type Styled = (char, u8);
 
+/// The cells a character takes on the screen. A control character takes
+/// one: the screen shows a blank or a mark in its place (`ui::scrub`),
+/// and counting none would let a full line run one cell over.
+pub fn cells(c: char) -> usize {
+    if c.is_control() {
+        1
+    } else {
+        c.width().unwrap_or(0)
+    }
+}
+
 /// Tag the characters of `text`, dropping the Markdown markers that were
 /// understood. Anything unclear (a lone `*`, snake_case) stays as typed.
 #[cfg(test)]
@@ -274,7 +285,7 @@ fn walk(chars: &[char], flags: u8, out: &mut Vec<Styled>, links: &mut Vec<String
 /// the indentation at the start of a line.
 pub fn wrap(chars: &[Styled], width: usize) -> Vec<Vec<Styled>> {
     let width = width.max(4);
-    let cells = |c: &Styled| c.0.width().unwrap_or(0);
+    let cells = |c: &Styled| cells(c.0);
     let mut lines = Vec::new();
     for paragraph in chars.split(|(c, _)| *c == '\n') {
         let mut line: Vec<Styled> = Vec::new();

@@ -12,7 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Clear, Paragraph},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 mod conversation;
 
@@ -80,6 +80,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status(frame, app, status);
     draw_overlays(frame, app, area);
     scrub(frame.buffer_mut());
+}
+
+/// Draw `widget` in the part of `rect` that is on the screen, if any.
+/// ratatui's widgets write where they are told and panic outside the
+/// screen; a dialog laid out for more rows than a small or just shrunk
+/// terminal has must lose those rows, not end the program. All drawing
+/// here goes through this.
+fn put(frame: &mut Frame, widget: impl ratatui::widgets::Widget, rect: Rect) {
+    let rect = rect.intersection(frame.area());
+    if !rect.is_empty() {
+        frame.render_widget(widget, rect);
+    }
+}
+
+/// The row `offset` lines down in a dialog's inside, or nothing where the
+/// dialog (cut to a low terminal) has no such row.
+fn line_at(inner: Rect, offset: u16) -> Rect {
+    Rect {
+        y: inner.y.saturating_add(offset),
+        height: u16::from(offset < inner.height),
+        ..inner
+    }
 }
 
 /// Take out of the finished screen what would not be shown but obeyed.
@@ -159,7 +181,7 @@ fn fit(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+        let w = crate::inline::cells(c);
         if used + w + 1 > width {
             break;
         }
@@ -182,7 +204,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
     )));
     let inner = block.inner(area);
-    frame.render_widget(block, area);
+    put(frame, block, area);
     app.sidebar_area = area;
     if inner.width < 6 || inner.height < 2 {
         return;
@@ -207,7 +229,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::new().fg(theme.dim)
     };
     let gap = (inner.width as usize).saturating_sub(sort_label.width() + unread_label.width());
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Line::from(vec![
             Span::styled(sort_label.clone(), Style::new().fg(theme.accent)),
             Span::raw(" ".repeat(gap)),
@@ -264,7 +287,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::styled(label, style));
             spans.push(Span::raw(" "));
         }
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Line::from(spans)),
             Rect { height: 1, ..list },
         );
@@ -280,7 +304,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(" / ", Style::new().fg(theme.accent)),
             Span::styled(query, Style::new().fg(theme.fg)),
         ]);
-        frame.render_widget(Paragraph::new(line), Rect { height: 1, ..list });
+        put(frame, Paragraph::new(line), Rect { height: 1, ..list });
         if app.filtering && focused {
             frame.set_cursor_position((list.x + 3 + column, list.y));
         }
@@ -305,7 +329,8 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             "No rooms yet"
         };
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(format!(" {text}"), Style::new().fg(theme.dim))),
             list,
         );
@@ -414,7 +439,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 ])
             }
         };
-        frame.render_widget(Paragraph::new(drawn), rect);
+        put(frame, Paragraph::new(drawn), rect);
         app.hits.push(Hit {
             rect,
             action: line.action,
@@ -519,7 +544,7 @@ fn draw_bar(frame: &mut Frame, app: &mut App, rect: Rect) {
         spans.push(Span::raw(" "));
         column += width + 1;
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+    put(frame, Paragraph::new(Line::from(spans)), rect);
     app.hits.extend(hits);
 }
 
@@ -580,7 +605,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         )));
     }
     let inner = block.inner(area);
-    frame.render_widget(block, area);
+    put(frame, block, area);
     app.timeline_area = area;
     app.hits.push(Hit {
         rect: area,
@@ -671,7 +696,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
             ))
             .alignment(Alignment::Center),
         ]);
-        frame.render_widget(Paragraph::new(hint), inner);
+        put(frame, Paragraph::new(hint), inner);
         app.viewport.empty(inner.height as usize);
         return;
     }
@@ -704,7 +729,8 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
     let shown = app.viewport.laid_out(total, height, &newest, selected);
 
     if total == 0 {
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(
                 "  Loading messages…",
                 Style::new().fg(theme.dim),
@@ -767,7 +793,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
                 entry.line
             });
         }
-        frame.render_widget(Paragraph::new(text), view);
+        put(frame, Paragraph::new(text), view);
     }
 
     if has_bar {
@@ -821,7 +847,7 @@ fn composer_layout(text: &str, cursor: usize, width: u16) -> (Vec<String>, usize
             used = 0;
             continue;
         }
-        let w = c.width().unwrap_or(0);
+        let w = crate::inline::cells(c);
         if used + w > width {
             rows.push(String::new());
             used = 0;
@@ -896,7 +922,7 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     }
     let inner = block.inner(area);
-    frame.render_widget(block, area);
+    put(frame, block, area);
     app.hits.push(Hit {
         rect: area,
         action: HitAction::FocusComposer,
@@ -977,7 +1003,8 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             "Open a room to write"
         };
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(hint, Style::new().fg(theme.dim))),
             text_area,
         );
@@ -1041,7 +1068,7 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             visible.push(Line::from(spans));
         }
     }
-    frame.render_widget(Paragraph::new(visible), text_area);
+    put(frame, Paragraph::new(visible), text_area);
     if focused {
         frame.set_cursor_position((
             text_area.x + cursor_col,
@@ -1060,7 +1087,7 @@ pub fn composer_index_at(text: &str, width: u16, row: usize, column: u16) -> usi
     let mut used = 0;
     let mut within = 0;
     for c in rows[row].chars() {
-        let w = c.width().unwrap_or(0);
+        let w = crate::inline::cells(c);
         if c == '\n' || used + w > column as usize {
             break;
         }
@@ -1126,13 +1153,13 @@ fn draw_mentions(frame: &mut Frame, app: &mut App, composer: Rect) {
         width,
         height,
     };
-    frame.render_widget(Clear, rect);
+    put(frame, Clear, rect);
     let block = panel(&theme, true).title(Line::from(Span::styled(
         title,
         Style::new().fg(theme.accent),
     )));
     let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    put(frame, block, rect);
 
     for (index, (main, detail)) in rows.iter().enumerate() {
         let row = Rect {
@@ -1157,7 +1184,7 @@ fn draw_mentions(frame: &mut Frame, app: &mut App, composer: Rect) {
                 }),
             ),
         ]);
-        frame.render_widget(Paragraph::new(line).style(style), row);
+        put(frame, Paragraph::new(line).style(style), row);
         app.hits.push(Hit {
             rect: row,
             action: HitAction::MentionPick(index),
@@ -1252,19 +1279,19 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect, state: VerifyState)
         width,
         height,
     };
-    frame.render_widget(Clear, rect);
+    put(frame, Clear, rect);
     let block = panel(&theme, true).title(Line::from(Span::styled(
         " Verify ",
         Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
     )));
     let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    put(frame, block, rect);
     let body = Rect {
         x: inner.x + 2,
         width: inner.width.saturating_sub(4),
         ..inner
     };
-    frame.render_widget(Paragraph::new(lines), body);
+    put(frame, Paragraph::new(lines), body);
 
     let button_row = Rect {
         y: inner.bottom() - 1,
@@ -1291,7 +1318,7 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect, state: VerifyState)
         spans.push(Span::raw("  "));
         column += label_width + 2;
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), button_row);
+    put(frame, Paragraph::new(Line::from(spans)), button_row);
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,7 +1372,7 @@ fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
         ));
     }
     let left_width: usize = left.iter().map(|span| span.content.width()).sum();
-    frame.render_widget(Paragraph::new(Line::from(left)), area);
+    put(frame, Paragraph::new(Line::from(left)), area);
 
     let hints = match app.focus {
         Focus::Sidebar if app.state.accounts.len() > 1 => {
@@ -1378,7 +1405,8 @@ fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
         ..area
     };
     let button = Style::new().fg(theme.accent);
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Line::from(vec![
             Span::styled(hints, dim),
             Span::styled(search_label, button),
@@ -1429,13 +1457,13 @@ fn dialog(
         rect,
         action: HitAction::Blocked,
     });
-    frame.render_widget(Clear, rect);
+    put(frame, Clear, rect);
     let block = panel(&theme, true).title(Line::from(Span::styled(
         format!(" {title} "),
         Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
     )));
     let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    put(frame, block, rect);
     Some(Rect {
         x: inner.x + 1,
         width: inner.width.saturating_sub(2),
@@ -1486,7 +1514,7 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect, settings: &Settin
             Span::styled(format!(" {name:<label_width$}"), style),
             Span::styled(format!("{value:<value_width$}"), value_style),
         ]);
-        frame.render_widget(Paragraph::new(line).style(style), row);
+        put(frame, Paragraph::new(line).style(style), row);
         app.hits.push(Hit {
             rect: row,
             action: HitAction::Setting(setting),
@@ -1500,7 +1528,8 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect, settings: &Settin
             height: 1,
             ..inner
         };
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(note_text, Style::new().fg(theme.mention))),
             note,
         );
@@ -1515,7 +1544,7 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect, settings: &Settin
     } else {
         " ↑↓ choose · Enter or click to change · Esc close"
     };
-    frame.render_widget(Paragraph::new(Span::styled(text, dim)), help);
+    put(frame, Paragraph::new(Span::styled(text, dim)), help);
     // Which mothrix this is, on the free line under the settings.
     let version = Rect {
         y: inner.bottom().saturating_sub(3),
@@ -1523,7 +1552,8 @@ fn draw_settings(frame: &mut Frame, app: &mut App, area: Rect, settings: &Settin
         ..inner
     };
     if version.y > inner.y + rows {
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(
                 format!("mothrix {} · {} ", crate::VERSION, crate::repository()),
                 dim,
@@ -1550,7 +1580,8 @@ fn draw_buttons(frame: &mut Frame, app: &mut App, row: Rect, buttons: &[(&str, H
             width,
             height: 1,
         };
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(
                 text,
                 Style::new().fg(theme.selection_fg).bg(theme.selection_bg),
@@ -1571,11 +1602,6 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
 
     let theme = app.theme;
     let dim = Style::new().fg(theme.dim);
-    let line_at = |inner: Rect, offset: u16| Rect {
-        y: inner.y + offset,
-        height: 1,
-        ..inner
-    };
 
     if let AccountsMode::Add(form) = &state.mode {
         let Some(inner) = dialog(frame, app, area, "Add an account", 76, 16) else {
@@ -1607,7 +1633,7 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
                     Style::new().fg(theme.fg).bg(theme.selection_bg),
                 ),
             ]);
-            frame.render_widget(Paragraph::new(line), row);
+            put(frame, Paragraph::new(line), row);
             app.hits.push(Hit {
                 rect: row,
                 action: HitAction::Accounts(AccountsAction::Field(index)),
@@ -1618,7 +1644,8 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
             1 | 2 => "Empty: sign in through the browser, if the server offers that.",
             _ => "Optional: what the account is called here (school, work …).",
         };
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(format!(" {hint}"), dim)),
             line_at(inner, 6),
         );
@@ -1630,14 +1657,16 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
         });
         let width = (inner.width as usize).saturating_sub(2).max(10);
         for (offset, part) in wrap(&form.status, width).into_iter().take(4).enumerate() {
-            frame.render_widget(
+            put(
+                frame,
                 Paragraph::new(Span::styled(format!(" {part}"), status_style)),
                 line_at(inner, 8 + offset as u16),
             );
         }
         let help = line_at(inner, inner.height.saturating_sub(1));
         if form.busy {
-            frame.render_widget(
+            put(
+                frame,
                 Paragraph::new(Span::styled(
                     " signing in · Esc closes this, the sign-in goes on",
                     dim,
@@ -1721,7 +1750,7 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
             Span::styled(format!("{who:<who_width$} "), style),
             Span::styled(right, style.fg(color)),
         ]);
-        frame.render_widget(Paragraph::new(line).style(style), row);
+        put(frame, Paragraph::new(line).style(style), row);
         app.hits.push(Hit {
             rect: row,
             action: HitAction::Accounts(AccountsAction::Select(index)),
@@ -1737,7 +1766,8 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
                 " Sign out {}? Its data on this computer is deleted, keys included.",
                 account.label
             );
-            frame.render_widget(
+            put(
+                frame,
                 Paragraph::new(Span::styled(text, Style::new().fg(theme.unread))),
                 note,
             );
@@ -1752,7 +1782,8 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
             );
         }
         AccountsMode::Rename(_) => {
-            frame.render_widget(
+            put(
+                frame,
                 Paragraph::new(Span::styled(
                     " The name is only for you. Empty: back to the profile's name.",
                     dim,
@@ -1771,7 +1802,8 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
         }
         _ => {
             if let SyncStatus::Error(error) = &app.state.accounts[state.cursor].sync {
-                frame.render_widget(
+                put(
+                    frame,
                     Paragraph::new(Span::styled(
                         fit(&format!(" {error}"), inner.width as usize),
                         Style::new().fg(theme.error),
@@ -1800,11 +1832,6 @@ fn draw_accounts(frame: &mut Frame, app: &mut App, area: Rect, state: AccountsDi
 fn draw_recovery(frame: &mut Frame, app: &mut App, area: Rect, key: &str) {
     let theme = app.theme;
     let dim = Style::new().fg(theme.dim);
-    let line_at = |inner: Rect, offset: u16| Rect {
-        y: inner.y + offset,
-        height: 1,
-        ..inner
-    };
     let Some(inner) = dialog(frame, app, area, "Your recovery key", 72, 11) else {
         return;
     };
@@ -1819,12 +1846,14 @@ fn draw_recovery(frame: &mut Frame, app: &mut App, area: Rect, key: &str) {
         ),
     ];
     for (offset, (text, style)) in lines.into_iter().enumerate() {
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(text, style)),
             line_at(inner, offset as u16 + 1),
         );
     }
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             format!(" {key}"),
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
@@ -1836,7 +1865,8 @@ fn draw_recovery(frame: &mut Frame, app: &mut App, area: Rect, key: &str) {
             ..inner
         },
     );
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(" c copy · Esc close (when you have it)", dim)),
         line_at(inner, inner.height.saturating_sub(1)),
     );
@@ -1846,11 +1876,6 @@ fn draw_recovery(frame: &mut Frame, app: &mut App, area: Rect, key: &str) {
 fn draw_reset(frame: &mut Frame, app: &mut App, area: Rect, input: &Input) {
     let theme = app.theme;
     let dim = Style::new().fg(theme.dim);
-    let line_at = |inner: Rect, offset: u16| Rect {
-        y: inner.y + offset,
-        height: 1,
-        ..inner
-    };
     let Some(inner) = dialog(frame, app, area, "Reset your identity", 72, 12) else {
         return;
     };
@@ -1872,7 +1897,8 @@ fn draw_reset(frame: &mut Frame, app: &mut App, area: Rect, input: &Input) {
         (" Your account password confirms it:", dim),
     ];
     for (offset, (text, style)) in lines.into_iter().enumerate() {
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(text, style)),
             line_at(inner, offset as u16 + 1),
         );
@@ -1880,7 +1906,8 @@ fn draw_reset(frame: &mut Frame, app: &mut App, area: Rect, input: &Input) {
     let (masked, column) = input
         .masked()
         .view((inner.width as usize).saturating_sub(2));
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             format!(" {masked}"),
             Style::new().fg(theme.fg).bg(theme.selection_bg),
@@ -1888,7 +1915,8 @@ fn draw_reset(frame: &mut Frame, app: &mut App, area: Rect, input: &Input) {
         line_at(inner, 7),
     );
     frame.set_cursor_position((inner.x + 1 + column, inner.y + 7));
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(" Enter reset · Esc cancel", dim)),
         line_at(inner, inner.height.saturating_sub(1)),
     );
@@ -1916,11 +1944,14 @@ fn draw_format_menu(frame: &mut Frame, app: &mut App, area: Rect, menu: crate::a
         return;
     }
     // Above the button (the message box is at the bottom), else below.
+    // (Where the button was when the menu opened: the terminal may have
+    // shrunk since, so both ways stay on the screen.)
     let y = if menu.y >= area.y + height {
         menu.y - height
     } else {
-        (menu.y + 1).min(area.bottom() - height)
-    };
+        menu.y + 1
+    }
+    .min(area.bottom() - height);
     let rect = Rect {
         x: menu.x.min(area.right() - width),
         y,
@@ -1931,10 +1962,10 @@ fn draw_format_menu(frame: &mut Frame, app: &mut App, area: Rect, menu: crate::a
         rect,
         action: HitAction::Blocked,
     });
-    frame.render_widget(Clear, rect);
+    put(frame, Clear, rect);
     let block = panel(&theme, true);
     let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    put(frame, block, rect);
     for (index, (format, label)) in rows.iter().enumerate() {
         let row = Rect {
             y: inner.y + index as u16,
@@ -1952,7 +1983,7 @@ fn draw_format_menu(frame: &mut Frame, app: &mut App, area: Rect, menu: crate::a
                 style.fg(theme.dim),
             ),
         ]);
-        frame.render_widget(Paragraph::new(line).style(style), row);
+        put(frame, Paragraph::new(line).style(style), row);
         app.hits.push(Hit {
             rect: row,
             action: HitAction::FormatPick(*format),
@@ -1968,7 +1999,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect, help: crate::app::Hel
         return;
     };
     let (query, column) = help.filter.view((inner.width as usize).saturating_sub(3));
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Line::from(vec![
             Span::styled(" / ", Style::new().fg(theme.accent)),
             Span::styled(query, Style::new().fg(theme.fg)),
@@ -2004,7 +2036,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect, help: crate::app::Hel
                 Span::styled(fit(what, text_width), Style::new().fg(theme.fg)),
             ]),
         };
-        frame.render_widget(Paragraph::new(line), row);
+        put(frame, Paragraph::new(line), row);
     }
     let more = if lines.len() > rows {
         format!(
@@ -2016,7 +2048,8 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect, help: crate::app::Hel
     } else {
         String::new()
     };
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             format!(" type to narrow · ↑↓ PgUp PgDn scroll · Esc close{more}"),
             Style::new().fg(theme.dim),
@@ -2054,7 +2087,8 @@ fn draw_forward(frame: &mut Frame, app: &mut App, area: Rect, forward: Forward) 
     let (query, column) = forward
         .filter
         .view((inner.width as usize).saturating_sub(3));
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Line::from(vec![
             Span::styled(" / ", Style::new().fg(theme.accent)),
             Span::styled(query, Style::new().fg(theme.fg)),
@@ -2086,14 +2120,19 @@ fn draw_forward(frame: &mut Frame, app: &mut App, area: Rect, forward: Forward) 
             " {icon} {}",
             fit(name, (row.width as usize).saturating_sub(4))
         );
-        frame.render_widget(Paragraph::new(Span::styled(text, style)).style(style), row);
+        put(
+            frame,
+            Paragraph::new(Span::styled(text, style)).style(style),
+            row,
+        );
         app.hits.push(Hit {
             rect: row,
             action: HitAction::ForwardTo(room_id.clone()),
         });
     }
     if targets.is_empty() {
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(
                 " No room by that name",
                 Style::new().fg(theme.dim),
@@ -2105,7 +2144,8 @@ fn draw_forward(frame: &mut Frame, app: &mut App, area: Rect, forward: Forward) 
             },
         );
     }
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             " type to narrow · ↑↓ choose · Enter forward · Esc cancel",
             Style::new().fg(theme.dim),
@@ -2129,13 +2169,13 @@ fn draw_room_info(frame: &mut Frame, app: &mut App, area: Rect, info: RoomInfo) 
     let Some(inner) = dialog(frame, app, area, "Room", 76, height) else {
         return;
     };
-    let line_at = |offset: u16| Rect {
-        y: inner.y + offset,
-        height: 1,
-        ..inner
-    };
+    let line_at = |offset: u16| line_at(inner, offset);
     let Some(details) = &info.details else {
-        frame.render_widget(Paragraph::new(Span::styled(" Loading…", dim)), line_at(1));
+        put(
+            frame,
+            Paragraph::new(Span::styled(" Loading…", dim)),
+            line_at(1),
+        );
         return;
     };
     let width = inner.width as usize;
@@ -2145,7 +2185,8 @@ fn draw_room_info(frame: &mut Frame, app: &mut App, area: Rect, info: RoomInfo) 
     } else {
         Span::styled("  not encrypted", dim)
     };
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!(" {}", fit(&details.name, width.saturating_sub(18))),
@@ -2160,7 +2201,8 @@ fn draw_room_info(frame: &mut Frame, app: &mut App, area: Rect, info: RoomInfo) 
     } else {
         &details.alias
     };
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             format!(
                 " {}",
@@ -2172,14 +2214,16 @@ fn draw_room_info(frame: &mut Frame, app: &mut App, area: Rect, info: RoomInfo) 
     );
     let topic = details.topic.lines().next().unwrap_or_default().trim();
     let topic = if topic.is_empty() { "no topic" } else { topic };
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             format!(" {}", fit(topic, width.saturating_sub(2))),
             Style::new().fg(theme.fg),
         )),
         line_at(2),
     );
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             format!(" People ({})", details.members.len()),
             dim.add_modifier(Modifier::BOLD),
@@ -2228,7 +2272,7 @@ fn draw_room_info(frame: &mut Frame, app: &mut App, area: Rect, info: RoomInfo) 
             ),
             Span::styled(tag.to_owned(), style.fg(theme.accent)),
         ]);
-        frame.render_widget(Paragraph::new(line).style(style), row);
+        put(frame, Paragraph::new(line).style(style), row);
         app.hits.push(Hit {
             rect: row,
             action: HitAction::RoomInfo(InfoAction::Select(index)),
@@ -2250,7 +2294,8 @@ fn draw_room_info(frame: &mut Frame, app: &mut App, area: Rect, info: RoomInfo) 
             };
             let (shown, column) = input.view(width.saturating_sub(label.width() + 1));
             frame.set_cursor_position((note.x + label.width() as u16 + column, note.y));
-            frame.render_widget(
+            put(
+                frame,
                 Paragraph::new(Line::from(vec![
                     Span::styled(label, Style::new().fg(theme.accent)),
                     Span::styled(shown, Style::new().fg(theme.fg)),
@@ -2282,7 +2327,8 @@ fn draw_room_info(frame: &mut Frame, app: &mut App, area: Rect, info: RoomInfo) 
                     "y  leave",
                 ),
             };
-            frame.render_widget(
+            put(
+                frame,
                 Paragraph::new(Span::styled(
                     fit(&question, width),
                     Style::new().fg(theme.unread),
@@ -2375,7 +2421,7 @@ fn draw_sections(frame: &mut Frame, app: &mut App, area: Rect, picker: SectionPi
         } else {
             style
         };
-        frame.render_widget(Paragraph::new(line).style(row_style), row);
+        put(frame, Paragraph::new(line).style(row_style), row);
         if let Some(target) = app.section_picker_row(index) {
             app.hits.push(Hit {
                 rect: row,
@@ -2394,7 +2440,7 @@ fn draw_sections(frame: &mut Frame, app: &mut App, area: Rect, picker: SectionPi
     } else {
         " ↑↓ choose · Enter or click · Esc close"
     };
-    frame.render_widget(Paragraph::new(Span::styled(text, dim)), help);
+    put(frame, Paragraph::new(Span::styled(text, dim)), help);
 }
 
 /// The menu a right-click on a room opens, next to where the click was.
@@ -2425,10 +2471,10 @@ fn draw_room_menu(frame: &mut Frame, app: &mut App, area: Rect, menu: RoomMenu) 
         rect,
         action: HitAction::Blocked,
     });
-    frame.render_widget(Clear, rect);
+    put(frame, Clear, rect);
     let block = panel(&theme, true);
     let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    put(frame, block, rect);
     for (index, (item, label)) in rows.iter().enumerate() {
         let row = Rect {
             y: inner.y + index as u16,
@@ -2439,7 +2485,7 @@ fn draw_room_menu(frame: &mut Frame, app: &mut App, area: Rect, menu: RoomMenu) 
         if index == menu.cursor {
             style = style.bg(theme.selection_bg).fg(theme.selection_fg);
         }
-        frame.render_widget(Paragraph::new(format!(" {label}")).style(style), row);
+        put(frame, Paragraph::new(format!(" {label}")).style(style), row);
         app.hits.push(Hit {
             rect: row,
             action: HitAction::RoomMenuPick(*item),
@@ -2484,7 +2530,7 @@ fn draw_section_manager(frame: &mut Frame, app: &mut App, area: Rect, manager: S
                 Span::styled(" Name: ", Style::new().fg(theme.accent)),
                 Span::styled(shown, Style::new().fg(theme.fg)),
             ]);
-            frame.render_widget(Paragraph::new(line), row);
+            put(frame, Paragraph::new(line), row);
             continue;
         }
         let mut style = Style::new().fg(theme.fg);
@@ -2516,7 +2562,7 @@ fn draw_section_manager(frame: &mut Frame, app: &mut App, area: Rect, manager: S
             });
             x += width;
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(style), row);
+        put(frame, Paragraph::new(Line::from(spans)).style(style), row);
     }
 
     let help = Rect {
@@ -2529,7 +2575,7 @@ fn draw_section_manager(frame: &mut Frame, app: &mut App, area: Rect, manager: S
     } else {
         " ↑↓ choose · J K move · r rename · d delete · Esc close"
     };
-    frame.render_widget(Paragraph::new(Span::styled(text, dim)), help);
+    put(frame, Paragraph::new(Span::styled(text, dim)), help);
 }
 
 /// The emoji picker: a search line, the grid of emoji with their groups'
@@ -2549,7 +2595,8 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, area: Rect, picker: Emoji
 
     // Search line.
     let (query, column) = picker.search.view((inner.width as usize).saturating_sub(3));
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Line::from(vec![
             Span::styled(" / ", Style::new().fg(theme.accent)),
             Span::styled(query, Style::new().fg(theme.fg)),
@@ -2583,7 +2630,8 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, area: Rect, picker: Emoji
     let (cursor, scroll) = (state.cursor, state.scroll);
 
     if grid.emoji.is_empty() {
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(" No emoji by that name", dim)),
             Rect { height: 1, ..list },
         );
@@ -2591,7 +2639,8 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, area: Rect, picker: Emoji
     for (offset, row) in grid.rows.iter().skip(scroll).take(page).enumerate() {
         let y = list.y + offset as u16;
         match row {
-            GridRow::Title(title) => frame.render_widget(
+            GridRow::Title(title) => put(
+                frame,
                 Paragraph::new(Span::styled(
                     format!(" {title}"),
                     Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
@@ -2615,7 +2664,8 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, area: Rect, picker: Emoji
                     } else {
                         Style::new().fg(theme.fg)
                     };
-                    frame.render_widget(
+                    put(
+                        frame,
                         Paragraph::new(format!(" {}", grid.emoji[index].0)).style(style),
                         cell,
                     );
@@ -2642,7 +2692,8 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, area: Rect, picker: Emoji
                 format!("{}  {}", found.name(), codes.join(" "))
             })
             .unwrap_or_default();
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Line::from(vec![
                 Span::raw(format!(" {emoji}  ")),
                 Span::styled(
@@ -2658,7 +2709,8 @@ fn draw_emoji_picker(frame: &mut Frame, app: &mut App, area: Rect, picker: Emoji
         height: 1,
         ..inner
     };
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             fit(
                 " Type to search · arrows move · Enter picks · Esc closes",
@@ -2684,7 +2736,8 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, search: Search) {
     let (query, column) = search
         .input
         .view((query_row.width as usize).saturating_sub(3));
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Line::from(vec![
             Span::styled(" / ", Style::new().fg(theme.accent)),
             Span::styled(query, Style::new().fg(theme.fg)),
@@ -2726,7 +2779,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, search: Search) {
         x += label_width + 1;
     }
     spans.push(Span::styled(" Tab switches", dim));
-    frame.render_widget(Paragraph::new(Line::from(spans)), scope_row);
+    put(frame, Paragraph::new(Line::from(spans)), scope_row);
 
     // Results.
     let list = Rect {
@@ -2744,7 +2797,8 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, search: Search) {
         String::new()
     };
     if !status.is_empty() {
-        frame.render_widget(
+        put(
+            frame,
             Paragraph::new(Span::styled(format!(" {status}"), dim))
                 .wrap(ratatui::widgets::Wrap { trim: true }),
             list,
@@ -2784,7 +2838,7 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, search: Search) {
                 ),
                 Span::styled(fit(&text, room), style),
             ]);
-            frame.render_widget(Paragraph::new(line).style(style), row);
+            put(frame, Paragraph::new(line).style(style), row);
             app.hits.push(Hit {
                 rect: row,
                 action: HitAction::SearchHit {
@@ -2805,7 +2859,8 @@ fn draw_search(frame: &mut Frame, app: &mut App, area: Rect, search: Search) {
     } else {
         format!("{} found · ", search.hits.len())
     };
-    frame.render_widget(
+    put(
+        frame,
         Paragraph::new(Span::styled(
             format!(" {count}Enter search / open · ↑↓ choose · Esc close"),
             dim,
@@ -2907,6 +2962,47 @@ mod tests {
             screen.contains("a b c"),
             "tabs and line ends are space: {screen}"
         );
+    }
+
+    #[test]
+    fn dialogs_on_a_low_or_shrunk_terminal_lose_rows_and_do_not_end_the_program() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let key = |code| Event::Key(KeyEvent::from(code));
+        let sizes = || (1..=16u16).flat_map(|height| [(100, height), (40, height)]);
+
+        // The identity reset's password prompt.
+        let mut app = sample();
+        app.overlays
+            .open(ResetPrompt(crate::input::Input::default()));
+        for (width, height) in sizes() {
+            render_to_text(&mut app, width, height);
+        }
+        assert!(render_to_text(&mut app, 100, 30).contains("Enter reset"));
+
+        // The form for one more account, with a status line.
+        let mut app = sample();
+        app.overlays.open(AccountsDialog {
+            cursor: 0,
+            mode: crate::app::AccountsMode::Add(Box::default()),
+        });
+        assert!(app.overlays.is_open::<AccountsDialog>());
+        for (width, height) in sizes() {
+            render_to_text(&mut app, width, height);
+        }
+
+        // The format menu remembers where it opened; then the terminal
+        // shrinks under it.
+        let mut app = sample();
+        app.state.open_room = Some("!lunch".into());
+        app.focus = Focus::Composer;
+        render_to_text(&mut app, 100, 40);
+        app.on_event(key(KeyCode::F(6)));
+        assert!(app.overlays.is_open::<crate::app::FormatMenu>());
+        assert!(render_to_text(&mut app, 100, 40).contains("Strikethrough"));
+        for height in (1..40).rev() {
+            render_to_text(&mut app, 100, height);
+            render_to_text(&mut app, 40, height);
+        }
     }
 
     #[test]

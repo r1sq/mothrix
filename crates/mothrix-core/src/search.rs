@@ -53,6 +53,10 @@ pub fn snippet(text: &str, terms: &[String], width: usize) -> String {
     if flat.len() <= width {
         return flat.into_iter().collect();
     }
+    // No room for a character between the two marks.
+    if width < 3 {
+        return "…".repeat(width.min(1));
+    }
     let lower: String = flat.iter().flat_map(|c| c.to_lowercase().next()).collect();
     let lower: Vec<char> = lower.chars().collect();
     // Character position of the earliest matching word.
@@ -236,6 +240,15 @@ mod tests {
 
     #[test]
     fn snippets_stay_on_one_line_and_centre_on_the_match() {
+        // No width to speak of (a narrow terminal, a long room name).
+        for width in 0..6 {
+            let cut = snippet(
+                "a long text with the needle at its end",
+                &terms("needle"),
+                width,
+            );
+            assert!(cut.chars().count() <= width, "{width}: {cut}");
+        }
         assert_eq!(snippet("short\ntext", &terms("text"), 40), "short text");
         let long = format!("{} needle {}", "a ".repeat(60), "b ".repeat(60));
         let cut = snippet(&long, &terms("needle"), 40);

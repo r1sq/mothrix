@@ -402,9 +402,15 @@ impl App {
 
     pub(super) fn on_manager_key(&mut self, key: KeyEvent) {
         let count = self.state.sections.len();
+        // Another device can take sections away while this is open.
+        if count == 0 {
+            self.overlays.close::<SectionManager>();
+            return;
+        }
         let Some(manager) = self.overlays.get_mut::<SectionManager>() else {
             return;
         };
+        manager.cursor = manager.cursor.min(count - 1);
         let cursor = manager.cursor;
         if let Some(input) = manager.renaming.as_mut() {
             match key.code {
@@ -1436,6 +1442,24 @@ mod tests {
             ),
             (0, "shown in full")
         );
+    }
+
+    #[test]
+    fn the_section_manager_survives_sections_going_from_elsewhere() {
+        let mut app = chat();
+        app.assign_section("!a", Some("Work"));
+        app.assign_section("!b", Some("Family"));
+        app.open_section_manager(1);
+        // Another device took the second one, then the first.
+        app.assign_section("!b", None);
+        app.on_event(key(KeyCode::Down));
+        app.on_event(key(KeyCode::Up));
+        app.on_event(key(KeyCode::Char('r')));
+        app.on_event(key(KeyCode::Enter));
+        assert!(app.overlays.is_open::<SectionManager>());
+        app.assign_section("!a", None);
+        app.on_event(key(KeyCode::Down));
+        assert!(!app.overlays.is_open::<SectionManager>());
     }
 
     #[test]

@@ -187,6 +187,10 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   bidi overrides out of the finished screen, so no drawing code has to.
   Anything written to the terminal past ratatui (`notify.rs`, pictures)
   has to encode what it sends itself.
+- **Drawing goes through `ui::put`,** never `frame.render_widget`:
+  ratatui panics on a rect outside the screen, and a dialog laid out for
+  more rows than a low or just shrunk terminal has must only lose them.
+  `ui::line_at` gives a dialog's row, or nothing where it has none.
 - **Private files.** What holds tokens, drafts or decrypted attachments
   is written with `folders::write_private` (owner-only, whole or not at
   all) into a `folders::private_dir`. Deleting an account's files is
