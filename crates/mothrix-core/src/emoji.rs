@@ -200,6 +200,11 @@ fn now() -> u64 {
         .unwrap_or_default()
 }
 
+/// Whether `text` is one emoji (as the picker and `:name` offer them).
+pub fn is_emoji(text: &str) -> bool {
+    emojis::get(text).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

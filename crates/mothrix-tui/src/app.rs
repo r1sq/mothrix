@@ -1224,7 +1224,19 @@ impl App {
         self.refresh_spelling();
         self.tell_typing();
         for command in &commands {
-            if let Command::React { key, .. } = command {
+            // A reaction given, not one taken back, and an emoji: others'
+            // reactions can be any text, and joining one of those is no
+            // emoji taken.
+            if let Command::React { event_id, key } = command
+                && crate::emoji::is_emoji(key)
+                && !self.state.items.iter().any(|item| {
+                    item.event_id == *event_id
+                        && item
+                            .reactions
+                            .iter()
+                            .any(|reaction| reaction.key == *key && reaction.mine)
+                })
+            {
                 self.used_emoji(key.clone());
             }
         }
