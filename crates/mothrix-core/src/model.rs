@@ -27,6 +27,10 @@ pub struct RoomEntry {
     pub low_priority: bool,
     pub unread: u64,
     pub mentions: u64,
+    /// Unread only because the user marked it so (here or in another
+    /// client): nothing new came, and nothing is to be told.
+    #[serde(default)]
+    pub marked_unread: bool,
 }
 
 /// What a room notifies about.

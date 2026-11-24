@@ -416,7 +416,12 @@ impl ClientState {
                 .insert(room.id.clone(), room.unread)
                 .unwrap_or(0);
             let watching = self.focused && self.open_room.as_ref() == Some(&room.id);
-            if settled && self.prefs.notifications && room.unread > before && !watching {
+            if settled
+                && self.prefs.notifications
+                && room.unread > before
+                && !room.marked_unread
+                && !watching
+            {
                 news.push(Notification {
                     room: room.id.clone(),
                     title: room.name.clone(),

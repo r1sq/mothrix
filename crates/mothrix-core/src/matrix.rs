@@ -1255,6 +1255,9 @@ async fn room_entry(room: &Room) -> RoomEntry {
         low_priority: room.is_low_priority(),
         unread,
         mentions,
+        marked_unread: room.is_marked_unread()
+            && room.num_unread_notifications() == 0
+            && server.notification_count == 0,
     }
 }
 
