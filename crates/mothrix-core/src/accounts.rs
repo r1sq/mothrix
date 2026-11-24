@@ -549,14 +549,44 @@ impl Accounts {
                 to,
                 content,
                 encrypted_file,
-            } => self.send(
-                &*app,
-                Command::SendForwarded {
-                    room_id: to,
-                    content,
-                    encrypted_file,
-                },
-            ),
+            } => {
+                let (target, room_id) = split(&self.prefixes(), &to);
+                let clients = (
+                    self.slots[account].client.clone(),
+                    self.slots.get(target).and_then(|slot| slot.client.clone()),
+                );
+                match clients {
+                    // Into a room of another account: its homeserver may
+                    // not be able to fetch a file from this one's, so the
+                    // file goes along.
+                    (Some(from), Some(into)) if target != account => {
+                        let commands = self.slots[target].commands.clone();
+                        let (news, room_id) = (self.merged.clone(), room_id.to_owned());
+                        tokio::spawn(async move {
+                            match crate::forward::carry(&from, &into, content).await {
+                                Ok(content) => {
+                                    let _ = commands.send(Command::SendForwarded {
+                                        room_id,
+                                        content,
+                                        encrypted_file,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = news.send((id, Update::Notice(format!("{error:#}"))));
+                                }
+                            }
+                        });
+                    }
+                    _ => self.send(
+                        &*app,
+                        Command::SendForwarded {
+                            room_id: to,
+                            content,
+                            encrypted_file,
+                        },
+                    ),
+                }
+            }
             Update::Sync(status) => app.state_mut().accounts[account].sync = status,
             Update::OwnName(name) => app.state_mut().accounts[account].own_name = Some(name),
             Update::Verified(verified) => {

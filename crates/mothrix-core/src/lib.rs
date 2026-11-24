@@ -14,6 +14,7 @@ pub mod config;
 pub mod convert;
 pub mod emoji;
 pub mod folders;
+pub mod forward;
 pub mod inline;
 pub mod languagetool;
 pub mod matrix;

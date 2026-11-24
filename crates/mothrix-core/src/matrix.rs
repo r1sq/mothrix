@@ -2113,12 +2113,19 @@ impl Session {
                     .content()
                     .as_message()
                     .ok_or_else(|| anyhow!("only messages and files can be forwarded"))?;
-                // The same content (for files: the same upload), without the
-                // reply or thread it belonged to.
+                // The same content (for files: the same upload, unless the
+                // copy goes out through another homeserver), without the
+                // reply or thread it belonged to, and saying who wrote it.
                 let msgtype = message.msgtype();
+                let from = match item.sender_profile() {
+                    TimelineDetails::Ready(profile) => profile.display_name.clone(),
+                    _ => None,
+                }
+                .unwrap_or_else(|| item.sender().to_string());
+                let content = crate::forward::attributed(serde_json::to_value(msgtype)?, &from);
                 let _ = tx.send(Update::ToForward {
                     to: room_id,
-                    content: serde_json::to_string(msgtype)?,
+                    content: content.to_string(),
                     encrypted_file: holds_encrypted_file(msgtype),
                 });
             }
