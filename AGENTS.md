@@ -100,6 +100,7 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `app/updates.rs` | new releases as the app sees them: telling once, `/update`, the settings row (the main loop looks, installs and restarts) |
 | `accounts_tests.rs` | `Accounts` serving `App`, against stand-in backends |
 | `ui.rs` | drawing; records the clickable regions (`app.hits`) while drawing |
+| `ui/conversation.rs` | the conversation's layout: messages as rows at a width, with click targets and picture rows (`Layout::of`, tested without a screen); `can_expand` |
 | `input.rs` | the text field |
 | `format.rs` | Markdown formats for the message box, at the cursor (the format menu) |
 | `keys.rs` | key bindings, built in and from the config |

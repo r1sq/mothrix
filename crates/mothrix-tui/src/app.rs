@@ -338,8 +338,6 @@ pub struct App {
     pub theme: Theme,
     /// Long messages the user unfolded.
     pub expanded: HashSet<String>,
-    /// Messages that are long enough to fold, as of the last draw.
-    pub collapsible: HashSet<String>,
     /// Which emoji the user takes most, for the reaction bar and `:`.
     pub emoji_usage: crate::emoji::Usage,
     /// Key bindings from the config: (key chosen, built-in key).
@@ -441,7 +439,6 @@ impl App {
             effects: Vec::new(),
             theme,
             expanded: HashSet::new(),
-            collapsible: HashSet::new(),
             emoji_usage: crate::emoji::Usage::default(),
             keymap: Vec::new(),
             typing_told: String::new(),

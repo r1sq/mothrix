@@ -40,10 +40,10 @@ impl App {
         offer(can.open_link, A::Open, 'o', "Open link");
         offer(can.copy, A::Copy, 'c', "Copy");
         offer(can.copy_code, A::CopyCode, 'y', "Copy code");
-        // How long a message is shows only when it is laid out.
+        // Whether there is more of it to show is the layout's to say.
         let expanded = self.expanded.contains(&item.event_id);
         offer(
-            self.collapsible.contains(&item.event_id),
+            crate::ui::can_expand(self, item),
             A::Expand,
             'x',
             if expanded { "Less" } else { "More" },

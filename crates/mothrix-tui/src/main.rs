@@ -1288,7 +1288,7 @@ async fn snapshot(
                     Some(Event::FocusGained) => next_key += Duration::from_secs(2),
                     Some(key) => {
                         // Drawn first, as on a terminal: drawing notes
-                        // what can be clicked or unfolded (`x`).
+                        // what can be clicked and how wide things are.
                         ui::render_to_text(&mut app, width, height);
                         let commands = app.on_event(key);
                         snapshot_effects(&mut app, &mut backend, &signin_tx, commands);

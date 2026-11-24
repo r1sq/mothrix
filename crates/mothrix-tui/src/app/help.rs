@@ -310,7 +310,8 @@ mod tests {
             can_delete: true,
             ..Item::default()
         };
-        app.collapsible.insert("$1".into());
+        app.state.prefs.long_messages = 1;
+        assert!(crate::ui::can_expand(&app, &item));
         item.pinned = false;
         let message: Vec<&str> = MESSAGE.iter().map(|(key, _)| *key).collect();
         for action in app.message_actions(&item) {
