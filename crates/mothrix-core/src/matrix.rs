@@ -1147,6 +1147,15 @@ pub fn spawn(client: Client) -> Backend {
     }
 }
 
+/// A task that ends when this is dropped.
+struct EndsWith(JoinHandle<()>);
+
+impl Drop for EndsWith {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct OpenRoom {
     room_id: String,
     room: Room,
@@ -1221,7 +1230,10 @@ async fn run(
 
     // The user's own sections, as the account stores them: at the start
     // from the server, then whenever a sync brings a change.
-    tokio::spawn(watch_sections(client.clone(), tx.clone()));
+    // (Ended with this backend: it holds a sender of the updates, and
+    // whoever forwards them waits for the last sender to go, so a
+    // signed-out account would else keep both tasks for good.)
+    let _watching = EndsWith(tokio::spawn(watch_sections(client.clone(), tx.clone())));
 
     let sync = SyncService::builder(client.clone())
         .with_offline_mode()

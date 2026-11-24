@@ -342,6 +342,25 @@ impl App {
         let Some(argument) = self.path_query() else {
             return Vec::new();
         };
+        // The popup is asked for with every frame and key: the folder is
+        // read once for what is typed, and again after a moment (a slow
+        // network folder would else stall every frame).
+        if let Some((typed, read, matches)) = &*self.path_cache.borrow()
+            && typed == argument
+            && read.elapsed() < std::time::Duration::from_secs(2)
+        {
+            return matches.clone();
+        }
+        let matches = Self::paths_for(argument);
+        *self.path_cache.borrow_mut() = Some((
+            argument.to_owned(),
+            std::time::Instant::now(),
+            matches.clone(),
+        ));
+        matches
+    }
+
+    fn paths_for(argument: &str) -> Vec<(String, String)> {
         let (folder, prefix) = match argument.rfind('/') {
             Some(slash) => (&argument[..=slash], &argument[slash + 1..]),
             None => ("", argument),
@@ -366,7 +385,15 @@ impl App {
                 (!hidden && name.to_lowercase().starts_with(&wanted)).then_some((is_folder, name))
             })
             .collect();
-        found.sort_by_key(|(is_folder, name)| (!is_folder, name.to_lowercase()));
+        // A file called just what is typed comes first: Enter then sends
+        // it, though other names go on from there (report.pdf.sig).
+        found.sort_by_key(|(is_folder, name)| {
+            (
+                *is_folder || name != prefix,
+                !is_folder,
+                name.to_lowercase(),
+            )
+        });
 
         let matches: Vec<(String, String)> = found
             .into_iter()

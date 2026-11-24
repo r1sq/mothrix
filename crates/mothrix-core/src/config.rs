@@ -243,11 +243,21 @@ impl Config {
         Self {
             prefs: shown.prefs.clone(),
             account_order: if several {
-                shown
+                // Those running, in their order; then those that are not
+                // (left out at this start), which keep a place for next
+                // time.
+                let running: Vec<String> = shown
                     .accounts
                     .iter()
                     .map(|account| account.profile.clone())
-                    .collect()
+                    .collect();
+                let others: Vec<String> = self
+                    .account_order
+                    .iter()
+                    .filter(|profile| !running.contains(profile))
+                    .cloned()
+                    .collect();
+                running.into_iter().chain(others).collect()
             } else {
                 self.account_order.clone()
             },

@@ -102,6 +102,30 @@ pub fn keymap(
             ));
             continue;
         }
+        // A key that already does something else would lose that: another
+        // action's own key, one chosen above, or one the text field uses.
+        let taken = ACTIONS
+            .iter()
+            .filter(|(name, _)| name != action)
+            .filter_map(|(name, built_in)| Some((*name, parse_key(built_in)?)))
+            .find(|(_, built_in)| same(built_in, &key))
+            .map(|(name, _)| format!("is the key of {name}"))
+            .or_else(|| {
+                map.iter()
+                    .any(|(chosen, _): &(KeyEvent, KeyEvent)| same(chosen, &key))
+                    .then(|| "is chosen twice".to_owned())
+            })
+            .or_else(|| {
+                ["ctrl+a", "ctrl+e", "ctrl+u", "ctrl+w", "ctrl+v"]
+                    .iter()
+                    .filter_map(|editing| parse_key(editing))
+                    .any(|editing| same(&editing, &key))
+                    .then(|| "edits the text being written".to_owned())
+            });
+        if let Some(taken) = taken {
+            problems.push(format!("[keys] {action}: '{spec}' {taken}"));
+            continue;
+        }
         if let Some(default) = parse_key(default) {
             map.push((key, default));
         }
@@ -120,6 +144,24 @@ pub fn translate(map: &[(KeyEvent, KeyEvent)], key: KeyEvent) -> KeyEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_that_already_does_something_is_not_taken() {
+        let configured = [
+            ("search", "ctrl+k"), // find_room's own
+            ("emoji", "ctrl+u"),  // clears the text field
+            ("accounts", "alt+a"),
+            ("settings", "alt+A"), // the same key as accounts' new one
+            ("format", "alt+f"),
+        ]
+        .into_iter()
+        .map(|(action, key)| (action.to_owned(), key.to_owned()))
+        .collect();
+        let (map, problems) = keymap(&configured);
+        assert_eq!(map.len(), 2, "{problems:?}");
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems.iter().any(|problem| problem.contains("find_room")));
+    }
 
     #[test]
     fn keys_are_read_as_written() {

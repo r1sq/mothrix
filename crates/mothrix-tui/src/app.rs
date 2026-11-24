@@ -337,6 +337,14 @@ pub struct App {
     pub compose: Compose,
     /// Mentions completed in the current composer text.
     composer_mentions: Vec<Member>,
+    /// The files last found for a path being typed: (what was typed,
+    /// when, what was found).
+    #[allow(clippy::type_complexity)]
+    pub(crate) path_cache:
+        std::cell::RefCell<Option<(String, std::time::Instant, Vec<(String, String)>)>>,
+    /// What belongs to a room's draft besides its text: who is mentioned
+    /// in it, and the message it answers.
+    draft_extras: HashMap<String, (Vec<Member>, Option<Compose>)>,
     pub mention_selected: usize,
     /// Esc closed the popup; typing more opens it again.
     mention_hidden: bool,
@@ -413,6 +421,8 @@ impl App {
             composer: Input::default(),
             compose: Compose::Message,
             composer_mentions: Vec::new(),
+            path_cache: std::cell::RefCell::new(None),
+            draft_extras: HashMap::new(),
             mention_selected: 0,
             mention_hidden: false,
             pictures: Pictures::default(),
@@ -513,7 +523,10 @@ impl App {
         self.effects.push(Effect::RoomOpened(room_id.clone()));
         // Pictures of the room we are leaving are no longer needed.
         self.drop_pictures();
-        self.composer_mentions.clear();
+        // Who was mentioned in what is being written, and what it answers,
+        // stay with the draft (until mothrix ends).
+        let mentions = std::mem::take(&mut self.composer_mentions);
+        let answering = matches!(self.compose, Compose::Reply { .. }).then(|| self.compose.clone());
         self.viewport.follow_newest();
         self.notice = None;
         self.clear_selection();
@@ -521,10 +534,22 @@ impl App {
         // What was being written stays with its room.
         if let Some(previous) = previous {
             self.keep_draft(&previous);
+            if self.drafts.contains_key(&previous) {
+                self.draft_extras.insert(previous, (mentions, answering));
+            } else {
+                self.draft_extras.remove(&previous);
+            }
         }
         self.composer.clear();
+        let extras = self.draft_extras.remove(&room_id);
         if let Some(draft) = self.drafts.get(&room_id).cloned() {
             self.composer.set(&draft);
+            if let Some((mentions, answering)) = extras {
+                self.composer_mentions = mentions;
+                if let Some(answering) = answering {
+                    self.compose = answering;
+                }
+            }
             // A draft found there is not being written: no notice for it
             // until it changes.
             if !draft.trim().is_empty() && !draft.starts_with('/') {

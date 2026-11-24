@@ -1396,12 +1396,20 @@ fn draw_status(frame: &mut Frame, app: &mut App, area: Rect) {
         (search_label.width() + settings_label.width() + theme_label.width()) as u16;
     let right_width = hints.width() as u16 + buttons_width;
     // Keep at least the buttons when space is tight.
-    let (hints, right_width) = if left_width as u16 + right_width + 2 > area.width {
+    let (hints, right_width) = if (left_width.min(usize::from(u16::MAX)) as u16)
+        .saturating_add(right_width)
+        .saturating_add(2)
+        > area.width
+    {
         ("", buttons_width)
     } else {
         (hints, right_width)
     };
-    if left_width as u16 + right_width + 2 > area.width {
+    if (left_width.min(usize::from(u16::MAX)) as u16)
+        .saturating_add(right_width)
+        .saturating_add(2)
+        > area.width
+    {
         return;
     }
     let rect = Rect {

@@ -694,12 +694,38 @@ fn load_state(app: &mut App) {
     app.restore_session(Some(state.last_room), state.drafts.into_iter().collect());
 }
 
+/// Whether a room key belongs to one of the accounts with these prefixes
+/// (an id as it is: the account without a prefix).
+fn of_these_accounts(prefixes: &[String], room: &str) -> bool {
+    prefixes.iter().any(|prefix| match prefix.as_str() {
+        "" => room.starts_with('!'),
+        prefix => room.starts_with(prefix),
+    })
+}
+
 fn save_state(app: &mut App) {
     let Some(file) = state_file() else { return };
     let (last_room, drafts) = app.session_state();
+    // Another mothrix, running with other accounts, keeps its drafts in
+    // the same file: those stay as the file has them.
+    let prefixes: Vec<String> = app
+        .state
+        .accounts
+        .iter()
+        .map(|account| mothrix_core::accounts::prefix_for(&account.profile))
+        .collect();
+    let on_disk: SessionState = std::fs::read(&file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
     let state = SessionState {
         last_room: last_room.unwrap_or_default(),
-        drafts: drafts.into_iter().collect(),
+        drafts: on_disk
+            .drafts
+            .into_iter()
+            .filter(|(room, _)| !of_these_accounts(&prefixes, room))
+            .chain(drafts)
+            .collect(),
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&state) {
         // Drafts are private.
