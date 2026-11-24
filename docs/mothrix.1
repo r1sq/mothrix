@@ -17,6 +17,8 @@ mothrix \- a terminal Matrix client with a room sidebar and mouse support
 .br
 .B mothrix accounts
 .br
+.B mothrix update
+.br
 .B mothrix logout
 .RB [ \-\-profile
 .IR NAME ]
@@ -40,6 +42,15 @@ mothrix \- a terminal Matrix client with a room sidebar and mouse support
 .I ID
 .B \-\-pushkey
 .IR KEY ]
+.br
+.B mothrix \-\-snapshot
+.I SECONDS
+.RB [ \-\-room
+.IR NAME ]
+.RB [ \-\-say
+.IR TEXT ]
+.RB [ \-\-size
+.IR WIDTH x HEIGHT ]
 .SH DESCRIPTION
 .B mothrix
 is a Matrix client for the terminal. Rooms and people are listed on the
@@ -97,6 +108,38 @@ Added ones ask for event ids only, never message text.
 .TP
 .BR \-p ", " \-\-profile " \fINAME\fR"
 The account to use. When starting: only this account.
+.TP
+.BI \-\-snapshot " SECONDS"
+For trying mothrix without a person at the keyboard: sync for that many
+seconds, print the screen as text and end. Settings are not saved.
+.TP
+.BI \-\-room " NAME"
+With
+.BR \-\-snapshot :
+the room to open, by a part of its name. Without it the first room of
+the list is opened. Several names with
+.B >
+between them are opened one after the other.
+.TP
+.BI \-\-say " TEXT"
+With
+.BR \-\-snapshot :
+send
+.I TEXT
+into the opened room as a message. It is really sent. A text starting
+with
+.B keys:
+is not sent but pressed as keys: words are typed, names in angle brackets
+such as
+.B <enter>
+are keys, and
+.B <wait>
+pauses for two seconds.
+.TP
+.BI \-\-size " WIDTH" x HEIGHT
+With
+.BR \-\-snapshot :
+the size of the screen that is printed, 110x36 if not given.
 .TP
 .BR \-h ", " \-\-help
 Show a summary of the commands and keys.

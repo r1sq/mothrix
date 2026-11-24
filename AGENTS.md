@@ -347,11 +347,15 @@ could only be tested here.
   with gnome-keyring only), a notification's Reply in a running iPhone
   app, the iPhone's file protection.
 - **Arch package** (`packaging/arch/PKGBUILD`): written, never built.
+- **`just audit`** passes over one advisory, named with its reason in
+  `ACCEPTED` (`dev/audit.py`): RUSTSEC-2026-0459 in `libsqlite3-sys`,
+  until matrix-sdk-sqlite takes rusqlite 0.41. Take the entry out then.
 - Never seen against a real server: link previews, audio through `mpv`,
   the IServ poll-vote fix, the thread part of the unread fix, signing in
   through the browser from the accounts dialog, forwarding a file into a
-  room of an account on another server (the file is not uploaded again:
-  the readers' servers fetch it from the first one), the refusal to
+  room of an account on another server (`forward::carry` reads the file
+  through the account that showed it and uploads it to the other one's
+  server; a file already on that server stays where it is), the refusal to
   forward an encrypted file into an unencrypted room, an update installed
   for real (looking, downloading, the restart; needs a second release on
   GitHub).

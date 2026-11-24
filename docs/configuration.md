@@ -20,7 +20,12 @@ An account's store (its encryption keys and what it has read of its rooms)
 is encrypted with a passphrase that mothrix makes at sign-in and keeps in
 the system's keyring: the desktop's Secret Service on Linux (GNOME Keyring,
 KWallet), the Keychain on macOS, the Credential Manager on Windows. A copy
-of the files alone then gives nothing away. Where no keyring can be
+of the files alone (a backup, a disk taken out) then does not give the
+store away. The passphrase protects the store only. The account's
+`session.json`, which holds the access token that signs it in, the
+drafts, the log and the attachments you opened are plain files, protected
+by their permissions alone: who can read a copy of them can read these.
+Where no keyring can be
 reached when signing in (no desktop session, over SSH), mothrix says so
 and the store is protected by the file permissions only. An account
 signed in that way, or with a version before this, stays as it is until

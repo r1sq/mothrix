@@ -11,7 +11,9 @@ with the same arguments. On Windows it says the new one is installed and
 ends: start it again.
 
 - A **package** (the `.deb`, the PKGBUILD) only says that a release is
-  out; your package manager updates it.
+  out; your package manager updates it. That too takes a build at a
+  release's tag: the PKGBUILD (like `just deb`) builds the checkout it
+  lies in, and off a tag its mothrix is not a release and never looks.
 - A build that is **not a release** (its version names a commit, as
   `0.2.0 (ce613f6)`) never looks.
 - mothrix can only replace itself in a folder you can write to. Elsewhere

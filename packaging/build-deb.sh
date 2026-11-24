@@ -11,8 +11,17 @@ arch=$(dpkg --print-architecture)
 binary=${1:-target/release/mothrix}
 [ -x "$binary" ] || { echo "build first: just deb (MOTHRIX_PACKAGED=1 cargo build --release)" >&2; exit 1; }
 
+# The oldest glibc the binary runs with: the newest version among the
+# symbols it takes from it. Read from the binary itself, so it holds
+# wherever that was built (the release's on Ubuntu 22.04).
+glibc=$(objdump -T "$binary" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+[ -n "$glibc" ] || { echo "$binary: could not read which glibc it needs (objdump, from binutils)" >&2; exit 1; }
+
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
+# mktemp makes it for the owner alone, whatever the umask; it becomes the
+# package's "./", which is unpacked over the system's "/".
+chmod 755 "$root"
 install -Dm755 "$binary" "$root/usr/bin/mothrix"
 install -Dm644 docs/mothrix.1 "$root/usr/share/man/man1/mothrix.1"
 gzip -9n "$root/usr/share/man/man1/mothrix.1"
@@ -32,7 +41,7 @@ Maintainer: mothrix packagers <root@localhost>
 Section: net
 Priority: optional
 Homepage: $homepage
-Depends: libc6, libgcc-s1
+Depends: libc6 (>= $glibc), libgcc-s1
 Recommends: xdg-utils, libnotify-bin, wl-clipboard | xclip, hunspell-en-us
 Suggests: mpv
 Description: terminal Matrix client with a room sidebar and mouse support
