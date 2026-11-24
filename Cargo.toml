@@ -17,8 +17,8 @@ matrix-sdk-ui = "0.19.0"
 matrix-sdk-base = "0.19.0"
 spellbook = "0.4.0"
 emojis = "0.6"
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

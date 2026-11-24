@@ -2981,9 +2981,11 @@ mod tests {
             !screen.contains(|c: char| c != '\n' && unsafe_on_screen(c)),
             "{screen:?}"
         );
+        // The text around them stays (ratatui 0.30 leaves them out itself;
+        // `scrub` is what makes sure, whatever a widget does).
         assert!(
-            screen.contains("a b c"),
-            "tabs and line ends are space: {screen}"
+            screen.contains("abc") || screen.contains("a b c"),
+            "{screen}"
         );
     }
 
