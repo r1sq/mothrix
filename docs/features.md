@@ -129,6 +129,10 @@ Everything the terminal client can do, by topic. Keys and commands are in
 - Key backup from inside mothrix: `/backup` sets it up and shows the
   recovery key once; `/reset-identity` starts over when no device and no
   key is left
+- An account's keys and what it has read are encrypted on disk, with a
+  passphrase kept in the system's keyring (GNOME Keyring or KWallet, the
+  macOS Keychain, the Windows Credential Manager; on the iPhone its
+  Keychain): see [configuration.md](configuration.md)
 
 ## Accounts
 

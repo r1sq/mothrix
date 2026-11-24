@@ -16,6 +16,12 @@ checksums (`SHA256SUMS`). The Linux binary needs glibc 2.35 (Ubuntu
 binary and the `.exe` update themselves; the `.deb` leaves that to your
 package manager ([updates.md](updates.md)).
 
+Nothing else has to be installed. Where a keyring runs in your desktop
+session (GNOME Keyring, KWallet), mothrix keeps the passphrase of an
+account's store there; without one (a bare server, over SSH) it says so
+at sign-in and works as before
+([configuration.md](configuration.md#where-mothrix-keeps-its-files)).
+
 ## Build and run
 
 ```sh

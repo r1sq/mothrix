@@ -23,7 +23,8 @@ Rust core also drives an iPhone app.
 - **Mouse and keyboard**: click rooms, messages, poll answers and
   reactions, or do it all from the keyboard
 - **End-to-end encryption**, verification by emoji, key backup and
-  recovery
+  recovery; the keys on disk are locked with a passphrase in your
+  system's keyring
 - **Several accounts at once**, on one server or many
 - **Your own sections** in the room list, which travel with the account
   to your other devices
