@@ -516,7 +516,10 @@ fn summarize_poll(
         &results.question,
         matches!(results.kind, PollKind::Disclosed),
         results.max_selections,
-        results.end_time.is_some() || own.is_some_and(StablePoll::is_ended),
+        // Ended by its author: the own tally checks who sent the end,
+        // the SDK's takes anyone's. Without an own tally (not loaded yet)
+        // the SDK's word has to do.
+        own.map_or(results.end_time.is_some(), StablePoll::is_ended),
         &answers,
         &votes,
         own_user_id,

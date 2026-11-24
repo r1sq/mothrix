@@ -16,6 +16,47 @@ pub const HEADING: u8 = 16;
 pub const QUOTE: u8 = 32;
 /// A web address, or the text of a `[text](address)` link.
 pub const LINK: u8 = 64;
+/// With `LINK`, on every other link: two links that stand side by side
+/// can be told apart ([`link_of`]).
+pub const LINK_ALT: u8 = 128;
+
+/// Which link a character belongs to, as far as its flags say: none, or
+/// one of two kinds that take turns. A new link starts where this changes
+/// to another `Some`.
+pub fn link_of(flags: u8) -> Option<bool> {
+    (flags & LINK != 0).then_some(flags & LINK_ALT != 0)
+}
+
+/// The site an address leads to (`example.org` of
+/// `https://user@example.org:8443/path`), for showing beside a link whose
+/// text does not say.
+fn site(address: &str) -> &str {
+    let rest = address
+        .split_once("://")
+        .map_or_else(|| address.trim_start_matches("mailto:"), |(_, rest)| rest);
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    if address.starts_with("mailto:") {
+        return address
+            .trim_start_matches("mailto:")
+            .split('?')
+            .next()
+            .unwrap_or_default();
+    }
+    rest.split(':').next().unwrap_or_default()
+}
+
+/// Whether a link's text already names the site it leads to: it is that
+/// address, with or without `https://`.
+fn names_site(text: &str, site: &str) -> bool {
+    let text = text.trim().to_lowercase();
+    let text = text
+        .split_once("://")
+        .map_or(text.as_str(), |(_, rest)| rest);
+    let text = text.trim_start_matches("mailto:");
+    text.strip_prefix(&site.to_lowercase())
+        .is_some_and(|after| after.is_empty() || after.starts_with(['/', ':', '?', '#']))
+}
 
 /// A character and the styles (`BOLD` etc.) that apply to it.
 pub type Styled = (char, u8);
@@ -249,17 +290,27 @@ fn walk(chars: &[char], flags: u8, out: &mut Vec<Styled>, links: &mut Vec<String
         }
         // Addresses are kept as typed (their underscores are not italics).
         if flags & LINK == 0 {
+            // Every other link is marked, to keep neighbours apart.
+            let link = flags | LINK | if links.len() % 2 == 1 { LINK_ALT } else { 0 };
             if let Some(end) = address_at(chars, i) {
-                out.extend(chars[i..end].iter().map(|c| (*c, flags | LINK)));
+                out.extend(chars[i..end].iter().map(|c| (*c, link)));
                 links.push(chars[i..end].iter().collect());
                 i = end;
                 continue;
             }
             if let Some((text, text_end, address, address_end, after)) = link_at(chars, i) {
                 let before = out.len();
-                walk(&chars[text..text_end], flags | LINK, out, &mut Vec::new());
+                walk(&chars[text..text_end], link, out, &mut Vec::new());
                 if out.len() > before {
-                    links.push(chars[address..address_end].iter().collect());
+                    let address: String = chars[address..address_end].iter().collect();
+                    // Where it leads, unless its text says so: a link
+                    // may be called anything, another site's address too.
+                    let shown: String = out[before..].iter().map(|(c, _)| *c).collect();
+                    let site = site(&address);
+                    if !site.is_empty() && !names_site(&shown, site) {
+                        out.extend(format!(" ({site})").chars().map(|c| (c, flags)));
+                    }
+                    links.push(address);
                 }
                 i = after;
                 continue;
@@ -442,10 +493,33 @@ mod tests {
             ["https://example.org/a_b_c", "https://docs.example.org/x"]
         );
         assert_eq!(text(&styled, LINK), "https://example.org/a_b_cthe docs");
-        // The address of the named link is not shown; its text keeps its styles.
+        // Of the named link's address the site is shown, after its text
+        // (which keeps its styles).
         let shown: String = styled.iter().map(|(c, _)| *c).collect();
-        assert_eq!(shown, "see https://example.org/a_b_c. and the docs, ok");
+        assert_eq!(
+            shown,
+            "see https://example.org/a_b_c. and the docs (docs.example.org), ok"
+        );
         assert_eq!(text(&styled, ITALIC), "docs");
+        // Two links side by side are two.
+        assert_eq!(text(&styled, LINK_ALT), "the docs");
+
+        // A link called by another site's address says where it leads; one
+        // called by its own does not say it twice.
+        let shown =
+            |text: &str| -> String { parse_links(text).0.iter().map(|(c, _)| *c).collect() };
+        assert_eq!(
+            shown("[https://bank.example/login](https://user@evil.example:8443/login)"),
+            "https://bank.example/login (evil.example)"
+        );
+        assert_eq!(
+            shown("[bank.example/login](https://bank.example/x)"),
+            "bank.example/login"
+        );
+        assert_eq!(
+            shown("[write](mailto:amy@example.org?subject=x)"),
+            "write (amy@example.org)"
+        );
 
         // A sentence's own brackets stay out; an address's own stay in.
         let (_, links) =

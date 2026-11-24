@@ -68,7 +68,12 @@ Everything the terminal client can do, by topic. Keys and commands are in
   picture right away
 - Voice messages and audio play in the background if `mpv` is installed
 - Link previews (title and summary), off by default: your homeserver
-  fetches the pages and so learns the links
+  fetches the pages and so learns the links; never in encrypted rooms
+- A link with a name shows the site it leads to after it: `the menu
+  (food.example)`
+- Opening an attachment hands pictures, sound, video and documents to the
+  desktop's program for them; anything else (programs, scripts, web
+  pages) is only saved, and mothrix says where
 
 ## Polls
 

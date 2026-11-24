@@ -19,16 +19,27 @@ const HD_MAX_UPSCALE: f64 = 3.0;
 /// Pixels sent per cell column (terminal cells are roughly 10 px wide).
 const HD_CELL_WIDTH_PX: u32 = 12;
 
+/// The longest side of a picture that is decoded for showing, in pixels,
+/// and the memory decoding one may take.
+const MAX_SIDE: u32 = 10_000;
+const MAX_DECODED: u64 = 256 * 1024 * 1024;
+
 /// Decode `bytes`, turned as the camera said it was held (EXIF
 /// orientation: phones store a photo as the sensor saw it and say how to
 /// turn it).
 fn decode_upright(bytes: &[u8]) -> Option<image::DynamicImage> {
     use image::ImageDecoder;
-    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
-        .ok()?
-        .into_decoder()
         .ok()?;
+    // A few kilobytes can claim to be a picture of any size, and decoding
+    // takes the memory it claims: no more than a large photo needs.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(MAX_DECODED);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().ok()?;
     let orientation = decoder.orientation().ok();
     let mut picture = image::DynamicImage::from_decoder(decoder).ok()?;
     if let Some(orientation) = orientation {

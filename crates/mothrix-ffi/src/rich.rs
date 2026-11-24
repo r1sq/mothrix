@@ -48,10 +48,13 @@ pub fn blocks(body: &str) -> Vec<Block> {
 
 fn runs(text: &str) -> Vec<Run> {
     let (chars, links) = inline::parse_links(text);
-    let mut links = links.into_iter();
     let mut out: Vec<Run> = Vec::new();
-    let mut current: Option<(u8, String)> = None;
-    let mut finish = |flags: u8, text: String, out: &mut Vec<Run>| {
+    // The link the text is in: its place among `links`, and which of the
+    // two kinds of link it is (a neighbour is of the other).
+    let mut in_link: Option<(usize, bool)> = None;
+    let mut next_link = 0usize;
+    let mut current: Option<(u8, Option<usize>, String)> = None;
+    let finish = |flags: u8, link: Option<usize>, text: String, out: &mut Vec<Run>| {
         out.push(Run {
             text,
             styles: STYLES
@@ -59,23 +62,33 @@ fn runs(text: &str) -> Vec<Run> {
                 .filter(|(flag, _)| flags & flag != 0)
                 .map(|(_, name)| *name)
                 .collect(),
-            // Each stretch of link text is the next link.
-            link: (flags & inline::LINK != 0).then(|| links.next()).flatten(),
+            // A link's text can be several runs (part of it bold): each
+            // leads where the link does.
+            link: link.and_then(|link| links.get(link).cloned()),
         });
     };
     for (c, flags) in chars {
+        match inline::link_of(flags) {
+            Some(kind) if in_link.is_none_or(|(_, last)| last != kind) => {
+                in_link = Some((next_link, kind));
+                next_link += 1;
+            }
+            Some(_) => {}
+            None => in_link = None,
+        }
+        let link = in_link.map(|(link, _)| link);
         match &mut current {
-            Some((same, text)) if *same == flags => text.push(c),
+            Some((same, at, text)) if *same == flags && *at == link => text.push(c),
             _ => {
-                if let Some((flags, text)) = current.take() {
-                    finish(flags, text, &mut out);
+                if let Some((flags, link, text)) = current.take() {
+                    finish(flags, link, text, &mut out);
                 }
-                current = Some((flags, c.to_string()));
+                current = Some((flags, link, c.to_string()));
             }
         }
     }
-    if let Some((flags, text)) = current {
-        finish(flags, text, &mut out);
+    if let Some((flags, link, text)) = current {
+        finish(flags, link, text, &mut out);
     }
     out
 }

@@ -3086,7 +3086,7 @@ mod tests {
         });
         let screen = render_to_text(&mut app, 110, 24);
         assert!(
-            screen.contains("menu: this week or https://other.example/x"),
+            screen.contains("menu: this week (food.example) or https://other.example/x"),
             "{screen}"
         );
         let commands = click(&mut app, "this week", &screen);

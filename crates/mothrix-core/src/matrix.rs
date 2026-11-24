@@ -1563,14 +1563,20 @@ fn mode_of(notify: Notify) -> Option<RoomNotificationMode> {
 /// Whether a message's attachment is encrypted: its key travels in the
 /// message.
 fn holds_encrypted_file(msgtype: &MessageType) -> bool {
-    let source = match msgtype {
-        MessageType::Image(content) => &content.source,
-        MessageType::File(content) => &content.source,
-        MessageType::Audio(content) => &content.source,
-        MessageType::Video(content) => &content.source,
-        _ => return false,
-    };
-    matches!(source, MediaSource::Encrypted(_))
+    // Wherever it stands: the file itself, its thumbnail, or in a kind of
+    // message this build has no name for.
+    fn has_key(value: &Value) -> bool {
+        match value {
+            Value::Object(fields) => {
+                (fields.contains_key("key") && fields.contains_key("iv"))
+                    || fields.values().any(has_key)
+            }
+            Value::Array(items) => items.iter().any(has_key),
+            _ => false,
+        }
+    }
+    // What cannot be looked at is not passed on as harmless.
+    serde_json::to_value(msgtype).map_or(true, |content| has_key(&content))
 }
 
 fn room_of(client: &Client, room_id: &str) -> Result<Room> {
@@ -2224,6 +2230,14 @@ impl Session {
                 });
             }
             Command::PreviewLink(url) => {
+                // The homeserver makes the preview, and would learn of a
+                // link from a room it cannot read otherwise.
+                if open
+                    .as_ref()
+                    .is_some_and(|current| current.room.encryption_state().is_encrypted())
+                {
+                    return Ok(());
+                }
                 let client = client.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
@@ -2279,8 +2293,17 @@ impl Session {
                                 path: path.display().to_string(),
                             }
                         }
-                        Ok((_, true)) => Update::Notice("Playing; /stop ends it.".to_owned()),
-                        Ok((path, false)) => Update::Notice(format!("Opened {}", path.display())),
+                        Ok((_, Opened::Playing)) => {
+                            Update::Notice("Playing; /stop ends it.".to_owned())
+                        }
+                        Ok((path, Opened::Shown)) => {
+                            Update::Notice(format!("Opened {}", path.display()))
+                        }
+                        Ok((path, Opened::Kept)) => Update::Notice(format!(
+                            "Saved as {} and not opened: mothrix only opens pictures, sound, \
+                             video and documents by itself.",
+                            path.display()
+                        )),
                         Err(error) => Update::Notice(format!("{error:#}")),
                     };
                     let _ = tx.send(update);
@@ -2818,28 +2841,68 @@ impl MessageParts {
             Some(action) => (action, true),
             None => (text, false),
         };
-        let mut plain = text.to_owned();
-        let mut source = text.to_owned();
-        let mut mentioned = Vec::new();
+        let mut plain = String::with_capacity(text.len());
+        let mut source = String::with_capacity(text.len());
+        let mut mentioned: Vec<OwnedUserId> = Vec::new();
 
         // Longest names first, so "@Amy Winter" is not cut short by "@Amy".
-        let mut by_length: Vec<&Member> = mentions.iter().collect();
-        by_length.sort_by_key(|member| std::cmp::Reverse(member.name.len()));
-        for member in by_length {
-            let tag = format!("@{}", member.name);
-            let Ok(user_id) = UserId::parse(&member.user_id) else {
-                continue;
-            };
-            if !source.contains(&tag) || mentioned.contains(&user_id) {
-                continue;
+        let mut by_length: Vec<(String, &Member, OwnedUserId)> = mentions
+            .iter()
+            .filter(|member| !member.name.is_empty())
+            .filter_map(|member| {
+                let user_id = UserId::parse(&member.user_id).ok()?;
+                Some((format!("@{}", member.name), member, user_id))
+            })
+            .collect();
+        by_length.sort_by_key(|(tag, ..)| std::cmp::Reverse(tag.len()));
+        // One pass over the text as typed: each name where it stands as a
+        // word. Replacing name after name in the whole text would also
+        // find a short name inside the link just made for a longer one,
+        // or inside an e-mail address.
+        let mut rest = text;
+        let mut before: Option<char> = None;
+        while let Some(c) = rest.chars().next() {
+            let found = (c == '@' && !before.is_some_and(char::is_alphanumeric))
+                .then(|| {
+                    by_length.iter().find(|(tag, ..)| {
+                        rest.strip_prefix(tag.as_str()).is_some_and(|after| {
+                            !after.chars().next().is_some_and(char::is_alphanumeric)
+                        })
+                    })
+                })
+                .flatten();
+            match found {
+                Some((tag, member, user_id)) => {
+                    // The name is another person's text: as Markdown it
+                    // must stay a name, whatever marks or HTML it holds.
+                    let label: String = member
+                        .name
+                        .chars()
+                        .flat_map(|c| {
+                            c.is_ascii_punctuation()
+                                .then_some('\\')
+                                .into_iter()
+                                .chain([c])
+                        })
+                        .collect();
+                    source.push_str(&format!(
+                        "[{label}](https://matrix.to/#/{})",
+                        member.user_id
+                    ));
+                    plain.push_str(&member.name);
+                    if !mentioned.contains(user_id) {
+                        mentioned.push(user_id.clone());
+                    }
+                    before = tag.chars().last();
+                    rest = &rest[tag.len()..];
+                }
+                None => {
+                    plain.push(c);
+                    source.push(c);
+                    before = Some(c);
+                    rest = &rest[c.len_utf8()..];
+                }
             }
-            let label = member.name.replace('[', "\\[").replace(']', "\\]");
-            source = source.replace(
-                &tag,
-                &format!("[{label}](https://matrix.to/#/{})", member.user_id),
-            );
-            plain = plain.replace(&tag, &member.name);
-            mentioned.push(user_id);
         }
 
         // `None` when the text has no formatting at all: then plain is enough.
@@ -2973,7 +3036,13 @@ fn stop_audio() -> bool {
 fn play_audio(path: &Path) -> bool {
     stop_audio();
     let child = std::process::Command::new("mpv")
-        .args(["--no-video", "--really-quiet", "--no-terminal"])
+        .args([
+            "--no-video",
+            "--really-quiet",
+            "--no-terminal",
+            // Nothing but this file: no fetching through yt-dlp.
+            "--no-ytdl",
+        ])
         .arg(path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -3004,17 +3073,89 @@ fn safe_file_name(name: &str) -> String {
             }
         })
         .collect();
-    match safe.trim_matches(|c| c == '.' || c == ' ') {
+    let safe = match safe.trim_matches(|c| c == '.' || c == ' ') {
         "" => "attachment".to_owned(),
         safe => safe.to_owned(),
+    };
+    // Windows keeps these names for devices, with any ending.
+    let stem = safe.split('.').next().unwrap_or_default().to_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.ends_with(|c: char| c.is_ascii_digit()));
+    if device { format!("_{safe}") } else { safe }
+}
+
+/// What became of a downloaded attachment.
+#[derive(Debug, PartialEq, Eq)]
+enum Opened {
+    /// Handed to the desktop's program for it.
+    Shown,
+    /// Played here, with mpv.
+    Playing,
+    /// Saved only (or handed to the app, on the iPhone).
+    Kept,
+}
+
+/// The kinds of file the desktop is asked to open, by the ending of the
+/// name: pictures, sound, video and documents. The name comes from
+/// whoever sent the file, and "open" would run a program, a script or a
+/// shortcut called `holiday.bat` as readily as it shows a picture.
+const OPENED_BY_ITSELF: [&str; 34] = [
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "mp3", "ogg", "oga", "opus", "m4a",
+    "aac", "flac", "wav", "mp4", "webm", "mkv", "mov", "avi", "pdf", "txt", "md", "csv", "odt",
+    "ods", "odp", "docx", "xlsx", "pptx", "rtf", "epub", "ics",
+];
+
+fn opened_by_itself(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, ending)| OPENED_BY_ITSELF.contains(&ending.to_lowercase().as_str()))
+}
+
+/// The ending a picture's own bytes call for, whatever its name says.
+fn picture_ending(bytes: &[u8]) -> Option<&'static str> {
+    match image::guess_format(bytes).ok()? {
+        image::ImageFormat::Png => Some("png"),
+        image::ImageFormat::Jpeg => Some("jpg"),
+        image::ImageFormat::Gif => Some("gif"),
+        image::ImageFormat::WebP => Some("webp"),
+        image::ImageFormat::Bmp => Some("bmp"),
+        _ => None,
     }
+}
+
+/// Whether `bytes` begin like a sound file. mpv would also take a list of
+/// addresses to play (called `voice.ogg`), and fetch them.
+fn is_sound(bytes: &[u8]) -> bool {
+    let starts = |magic: &[u8]| bytes.starts_with(magic);
+    starts(b"OggS")
+        || starts(b"ID3")
+        || starts(b"fLaC")
+        || starts(b"\x1a\x45\xdf\xa3")
+        || (starts(b"RIFF") && bytes.get(8..12) == Some(b"WAVE"))
+        || bytes.get(4..8) == Some(b"ftyp")
+        || matches!(bytes, [0xff, second, ..] if second & 0xe0 == 0xe0)
+}
+
+/// The name an attachment is saved under: the sender's, made harmless,
+/// with the ending a picture's bytes call for, and a mark of its message
+/// in front so that two files of one name do not overwrite each other.
+fn saved_name(name: &str, event_id: &str, picture: Option<&'static str>) -> String {
+    let mut name = safe_file_name(name);
+    if let Some(ending) = picture
+        && !opened_by_itself(&name)
+    {
+        name = format!("{name}.{ending}");
+    }
+    let mark = hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(event_id.as_bytes())[..3]);
+    format!("{mark}-{name}")
 }
 
 async fn open_media(
     client: &Client,
     timeline: &Timeline,
     event_id: &str,
-) -> Result<(PathBuf, bool)> {
+) -> Result<(PathBuf, Opened)> {
     let event = timeline
         .item_by_event_id(&EventId::parse(event_id)?)
         .await
@@ -3048,18 +3189,24 @@ async fn open_media(
         .join("media");
     // What an encrypted room sent lies here decrypted.
     crate::folders::private_dir(&dir)?;
-    let path = dir.join(safe_file_name(&name));
+    let picture = matches!(message.msgtype(), MessageType::Image(_))
+        .then(|| picture_ending(&bytes))
+        .flatten();
+    let path = dir.join(saved_name(&name, event_id, picture));
     crate::folders::write_private(&path, &bytes)?;
 
     if HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok((path, false));
+        return Ok((path, Opened::Kept));
     }
-    if matches!(message.msgtype(), MessageType::Audio(_)) && play_audio(&path) {
-        return Ok((path, true));
+    if matches!(message.msgtype(), MessageType::Audio(_)) && is_sound(&bytes) && play_audio(&path) {
+        return Ok((path, Opened::Playing));
+    }
+    if !opened_by_itself(&path.to_string_lossy()) {
+        return Ok((path, Opened::Kept));
     }
     open_with_desktop(path.as_os_str())
         .with_context(|| format!("saved to {}, but could not start a viewer", path.display()))?;
-    Ok((path, false))
+    Ok((path, Opened::Shown))
 }
 
 /// What [`Command::OpenThread`] is given to show the pinned messages
@@ -3401,6 +3548,10 @@ async fn fetch_preview(
     let Ok(bytes) = client.media().get_media_content(&request, true).await else {
         return;
     };
+    // What the message said of its size was the sender's word.
+    if bytes.len() as u64 > crate::room_watch::MAX_PREVIEW_BYTES {
+        return;
+    }
     // Decoding and scaling is CPU work; keep it off the async threads.
     let scaled = tokio::task::spawn_blocking(move || preview::make_preview(&bytes)).await;
     if let Ok(Some(preview)) = scaled {
@@ -3690,6 +3841,74 @@ mod tests {
         assert!(html.contains("<strong>bold</strong>"), "{html}");
         assert!(html.contains("<code>code</code>"), "{html}");
         assert_eq!(parts.plain, "this is **bold** and `code`");
+    }
+
+    #[test]
+    fn a_mentioned_name_stays_a_name_and_stands_as_a_word() {
+        let members = [
+            member(
+                "@mal:x.org",
+                "Bob</a><a href=\"https://evil.example\">sign in",
+            ),
+            member("@a:x.org", "a"),
+            member("@amyw:x.org", "Amy Winter"),
+        ];
+        let text =
+            "@Bob</a><a href=\"https://evil.example\">sign in and @Amy Winter, mail me@abc.de, @a";
+        let parts = MessageParts::new(text, &members);
+        let html = parts.html.expect("mentions make html");
+        assert!(!html.contains("<a href=\"https://evil.example\""), "{html}");
+        assert_eq!(
+            html.matches("<a href=").count(),
+            3,
+            "three mentions, no more: {html}"
+        );
+        // The short name is found neither in the address nor in the link
+        // made for the long one.
+        assert!(html.contains("me@abc.de"), "{html}");
+        assert!(
+            html.contains(r#"<a href="https://matrix.to/#/@amyw:x.org">Amy Winter</a>"#),
+            "{html}"
+        );
+        assert_eq!(parts.mentioned.len(), 3);
+    }
+
+    #[test]
+    fn only_harmless_kinds_of_file_are_opened_and_under_a_name_that_fits() {
+        use super::{is_sound, opened_by_itself, picture_ending, saved_name};
+        assert!(opened_by_itself("Holiday.PNG") && opened_by_itself("minutes.pdf"));
+        for name in [
+            "holiday.bat",
+            "setup.exe",
+            "page.html",
+            "x.desktop",
+            "run.sh",
+            "noending",
+        ] {
+            assert!(!opened_by_itself(name), "{name}");
+        }
+        // A picture is called what it is; anything else keeps its name.
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        assert_eq!(picture_ending(&png), Some("png"));
+        assert!(
+            saved_name("holiday.bat", "$1", picture_ending(&png)).ends_with("-holiday.bat.png")
+        );
+        assert!(saved_name("holiday.png", "$1", picture_ending(&png)).ends_with("-holiday.png"));
+        assert_ne!(
+            saved_name("a.png", "$1", None),
+            saved_name("a.png", "$2", None)
+        );
+        assert!(
+            saved_name("../../CON.txt", "$1", None).ends_with("-_.._CON.txt")
+                || saved_name("CON.txt", "$1", None).ends_with("-_CON.txt")
+        );
+        assert_eq!(super::safe_file_name("nul"), "_nul");
+        assert_eq!(super::safe_file_name("com1.txt"), "_com1.txt");
+        // Sound is sound; a list of addresses is not.
+        assert!(
+            is_sound(b"OggS\0\x02") && is_sound(b"ID3\x04") && is_sound(b"RIFF\0\0\0\0WAVEfmt ")
+        );
+        assert!(!is_sound(b"#EXTM3U\nhttps://example.org/a.mp3") && !is_sound(b"https://x"));
     }
 
     #[test]

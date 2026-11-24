@@ -214,13 +214,27 @@ fn spawn_desktop_notification(_room: &str, title: &str, _clicks: &Clicks) {
             || "mail-unread".to_owned(),
             |file| file.display().to_string(),
         );
-        command.args(["--app-name=mothrix", &format!("--icon={icon}"), BODY, title]);
+        // "--": a room's name is someone else's text and may start with
+        // a dash, which would make it an option.
+        command.args([
+            "--app-name=mothrix",
+            &format!("--icon={icon}"),
+            "--",
+            title,
+            BODY,
+        ]);
         command
     };
-    let _ = command
+    if let Ok(mut child) = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        // Waited for, so that it does not stay behind as a zombie.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Terminal input, with kitty's answers to notification clicks taken out.

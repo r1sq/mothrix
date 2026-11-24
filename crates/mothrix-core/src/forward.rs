@@ -20,22 +20,29 @@ pub fn attributed(mut content: Value, from: &str) -> Value {
     let label = format!("Forwarded from {from}");
     let text = |key: &str| content[key].as_str().map(str::to_owned);
     let body = text("body").unwrap_or_default();
-    let formatted = text("formatted_body")
-        .filter(|_| content["format"].as_str() == Some("org.matrix.custom.html"));
+    // The HTML the message came with is not passed on: mothrix shows the
+    // body, so whoever forwards never saw the HTML, and it could say
+    // something else (or close our quote and go on outside it).
+    // Made anew from the body, which is Markdown as it was typed; HTML
+    // written into it stays text.
+    let html_of = |body: &str| {
+        let text_only = body.replace('&', "&amp;").replace('<', "&lt;");
+        matrix_sdk::ruma::events::room::message::FormattedBody::markdown(&text_only).map_or_else(
+            || escape(body).replace('\n', "<br>"),
+            |formatted| formatted.body.trim().to_owned(),
+        )
+    };
     let label_html = format!("Forwarded from <b>{}</b>", escape(from));
     match content["msgtype"].as_str().unwrap_or_default() {
         kind @ ("m.text" | "m.notice" | "m.emote") => {
             // "* Name did something", as an emote reads.
-            let (body, formatted) = if kind == "m.emote" {
-                (
-                    format!("* {from} {body}"),
-                    formatted.map(|html| format!("* {} {html}", escape(from))),
-                )
+            let body = if kind == "m.emote" {
+                format!("* {from} {body}")
             } else {
-                (body, formatted)
+                body
             };
             let quoted: Vec<String> = body.lines().map(|line| format!("> {line}")).collect();
-            let html = formatted.unwrap_or_else(|| escape(&body).replace('\n', "<br>"));
+            let html = html_of(&body);
             content["msgtype"] = "m.text".into();
             content["body"] = format!("{label}:\n{}", quoted.join("\n")).into();
             content["format"] = "org.matrix.custom.html".into();
@@ -48,9 +55,9 @@ pub fn attributed(mut content: Value, from: &str) -> Value {
             let captioned = text("filename").is_some_and(|name| name != body);
             if captioned {
                 content["body"] = format!("{label}:\n{body}").into();
-                if let Some(html) = formatted {
-                    content["formatted_body"] = format!("<p>{label_html}:</p>{html}").into();
-                }
+                content["format"] = "org.matrix.custom.html".into();
+                content["formatted_body"] =
+                    format!("<p>{label_html}:</p><p>{}</p>", html_of(&body)).into();
             } else {
                 content["filename"] = body.into();
                 content["body"] = label.into();
@@ -163,7 +170,7 @@ mod tests {
         assert_eq!(copy["body"], "Forwarded from Amy & Co:\n> one\n> two <3");
         assert_eq!(
             copy["formatted_body"],
-            "<p>Forwarded from <b>Amy &amp; Co</b>:</p><blockquote>one<br>two &lt;3</blockquote>"
+            "<p>Forwarded from <b>Amy &amp; Co</b>:</p><blockquote>one<br />\ntwo &lt;3</blockquote>"
         );
         assert_eq!(copy["format"], "org.matrix.custom.html");
 
@@ -178,6 +185,19 @@ mod tests {
             copy["formatted_body"],
             "<p>Forwarded from <b>Amy</b>:</p><blockquote><em>hi</em></blockquote>"
         );
+
+        // But from the body, which the one who forwards saw: not the
+        // HTML the message came with, nor HTML written into the body.
+        let copy = attributed(
+            json!({"msgtype": "m.text", "body": "at 5 </blockquote><a href=x>pay</a>",
+                   "format": "org.matrix.custom.html",
+                   "formatted_body": "</blockquote><p>pay <a href=\"https://evil.example\">here</a></p>"}),
+            "Amy",
+        );
+        let html = copy["formatted_body"].as_str().unwrap();
+        assert!(!html.contains("evil.example"), "{html}");
+        assert_eq!(html.matches("</blockquote>").count(), 1, "{html}");
+        assert!(!html.contains("<a href"), "{html}");
 
         let copy = attributed(json!({"msgtype": "m.emote", "body": "waves"}), "Amy");
         assert_eq!(copy["body"], "Forwarded from Amy:\n> * Amy waves");

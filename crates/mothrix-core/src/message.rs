@@ -141,9 +141,15 @@ pub fn new_poll(question: &str, answers: &[String]) -> Result<(String, Vec<Strin
 pub fn mentions_kept(text: &str, mentions: Vec<Member>) -> Vec<Member> {
     let mut kept: Vec<Member> = Vec::new();
     for member in mentions {
-        if text.contains(&format!("@{}", member.name))
-            && !kept.iter().any(|known| known.user_id == member.user_id)
-        {
+        // The name as a word: "@Ann" is not in "@Anna".
+        let tag = format!("@{}", member.name);
+        let stands = text.match_indices(&tag).any(|(at, _)| {
+            !text[at + tag.len()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
+        });
+        if stands && !kept.iter().any(|known| known.user_id == member.user_id) {
             kept.push(member);
         }
     }

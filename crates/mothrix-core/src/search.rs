@@ -175,6 +175,15 @@ pub async fn search(client: &Client, query: &str, only_room: Option<&RoomId>) ->
 
     // 2. The server, for history this device never loaded. Best effort:
     // some servers do not offer search at all.
+    // Not for one encrypted room: the server cannot search it, and would
+    // only learn what was looked for in it.
+    if let Some(room_id) = only_room
+        && let Ok(room_id) = matrix_sdk::ruma::RoomId::parse(room_id)
+        && let Some(room) = client.get_room(&room_id)
+        && room.encryption_state().is_encrypted()
+    {
+        return hits;
+    }
     let mut criteria = Criteria::new(query.trim().to_owned());
     if let Some(room_id) = only_room {
         criteria.filter.rooms = Some(vec![room_id.to_owned()]);

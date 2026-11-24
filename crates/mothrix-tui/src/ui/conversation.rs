@@ -303,19 +303,19 @@ fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) ->
                             // Which link the text is in, also across a
                             // line break.
                             let mut next_link = 0usize;
-                            let mut in_link: Option<usize> = None;
+                            let mut in_link: Option<(usize, bool)> = None;
                             for styled in inline::wrap(&parsed, body_width) {
                                 let mut link_spots: Vec<(usize, usize, usize)> = Vec::new();
                                 let mut column = 2usize;
                                 for (c, flags) in &styled {
                                     let cells = crate::inline::cells(*c);
-                                    if flags & inline::LINK == 0 {
-                                        in_link = None;
-                                    } else {
-                                        let link = *in_link.get_or_insert_with(|| {
+                                    if let Some(kind) = inline::link_of(*flags) {
+                                        // Another link, also right after one.
+                                        if in_link.is_none_or(|(_, last)| last != kind) {
+                                            in_link = Some((next_link, kind));
                                             next_link += 1;
-                                            next_link - 1
-                                        });
+                                        }
+                                        let link = in_link.map_or(0, |(link, _)| link);
                                         match link_spots.last_mut() {
                                             Some((last, start, width))
                                                 if *last == link && *start + *width == column =>
@@ -324,6 +324,8 @@ fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) ->
                                             }
                                             _ => link_spots.push((link, column, cells)),
                                         }
+                                    } else {
+                                        in_link = None;
                                     }
                                     column += cells;
                                 }

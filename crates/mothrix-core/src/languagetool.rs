@@ -13,12 +13,34 @@ use crate::model::GrammarMatch;
 
 /// The check address for what the user entered: the server's base address,
 /// its `/v2` address, or the full `/v2/check` address all work.
+fn is_local(address: &str) -> bool {
+    let host = address.split(['/', ':']).next().unwrap_or_default();
+    let octets: Vec<u8> = host
+        .split('.')
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".lan")
+        || host.ends_with(".box")
+        || !host.contains('.')
+        || matches!(
+            octets[..],
+            [10 | 127, _, _, _] | [192, 168, _, _] | [172, 16..=31, _, _]
+        )
+}
+
 pub fn endpoint(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
+    // Without a scheme: encrypted, unless it is this computer or the
+    // local network (a server run at home has no certificate). The text
+    // being written and an API key travel there.
     let url = if url.contains("://") {
         url.to_owned()
-    } else {
+    } else if is_local(url) {
         format!("http://{url}")
+    } else {
+        format!("https://{url}")
     };
     if url.ends_with("/v2/check") {
         url
@@ -154,7 +176,7 @@ pub fn parse(text: &str, response: &Value) -> Vec<GrammarMatch> {
         };
         let (Some(&start), Some(&end)) = (
             char_at.get(offset as usize),
-            char_at.get((offset + length) as usize),
+            char_at.get(offset.saturating_add(length) as usize),
         ) else {
             continue;
         };
