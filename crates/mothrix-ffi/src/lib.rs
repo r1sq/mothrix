@@ -61,6 +61,25 @@ impl From<anyhow::Error> for MothrixError {
     }
 }
 
+/// The running [`Mothrix`] of this process, while there is one: what is
+/// done from outside the app's views (a notification's action) has to go
+/// through its clients.
+static RUNNING: std::sync::Mutex<Option<mpsc::WeakUnboundedSender<Request>>> =
+    std::sync::Mutex::new(None);
+
+/// Held by each short-lived client of this process (a notification being
+/// fetched, something shared, an action answered) from start to end. iOS
+/// can hand one extension process several pushes at once, and they all
+/// take the store's lock under the same name: without this two clients
+/// would use one account's encryption keys at the same time.
+static ONE_CLIENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_client() -> std::sync::MutexGuard<'static, ()> {
+    ONE_CLIENT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The accounts, running. One per app process.
 #[derive(uniffi::Object)]
 pub struct Mothrix {
@@ -78,6 +97,9 @@ impl Mothrix {
     pub fn new(folder: String, listener: Arc<dyn Listener>) -> Result<Arc<Self>, MothrixError> {
         let runtime = start(Path::new(&folder), "app")?;
         let (sender, incoming) = mpsc::unbounded_channel();
+        *RUNNING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sender.downgrade());
         let requests = Requests(sender);
         runtime.spawn(run(listener, requests.clone(), incoming));
         requests.ask(Request::Snapshot);
@@ -140,6 +162,7 @@ pub fn notification(
     room_id: String,
     event_id: String,
 ) -> Result<Option<NotificationContent>, MothrixError> {
+    let _alone = one_client();
     let runtime = start(Path::new(&folder), "nse")?;
     let content: anyhow::Result<_> = runtime.block_on(async {
         let client = signed_in(&profile).await?;
@@ -184,19 +207,52 @@ pub fn mothrix_repository() -> String {
 /// newest message, from the store under `folder`.
 #[uniffi::export]
 pub fn respond(folder: String, room: String, text: Option<String>) -> Result<(), MothrixError> {
+    // The app is running in this process (in the background, say): its
+    // accounts answer. A client of our own on their store would encrypt
+    // with keys the running one has moved on from.
+    let running = RUNNING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(mpsc::WeakUnboundedSender::upgrade);
+    if let Some(running) = running {
+        let (done, answer) = tokio::sync::oneshot::channel();
+        let asked = running.send(Request::Respond {
+            room: room.clone(),
+            text: text.clone(),
+            done,
+        });
+        // Not asked, or gone before it answered: it is no longer running.
+        if asked.is_ok()
+            && let Ok(answer) = answer.blocking_recv()
+        {
+            return Ok(answer?);
+        }
+    }
+    let _alone = one_client();
     let runtime = start(Path::new(&folder), "action")?;
     let done: anyhow::Result<()> = runtime.block_on(async {
         let (profile, room_id) = accounts::split_by_profile(&matrix::signed_in_profiles(), &room);
         let client = signed_in(&profile).await?;
-        if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
-            matrix::send_text(&client, room_id, &text).await?;
-        }
-        if let Some(room) = client.get_room(<&matrix_sdk::ruma::RoomId>::try_from(room_id)?) {
-            matrix::read_newest(&room).await;
-        }
-        Ok(())
+        answer_in(&client, room_id, text).await
     });
     Ok(done?)
+}
+
+/// A notification's action in a room: send `text` (if any), and read the
+/// room up to its newest message.
+async fn answer_in(
+    client: &matrix_sdk::Client,
+    room_id: &str,
+    text: Option<String>,
+) -> anyhow::Result<()> {
+    if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+        matrix::send_text(client, room_id, &text).await?;
+    }
+    if let Some(room) = client.get_room(<&matrix_sdk::ruma::RoomId>::try_from(room_id)?) {
+        matrix::read_newest(&room).await;
+    }
+    Ok(())
 }
 
 /// For the share extension: send `text` (if any) and the files at `files`
@@ -209,6 +265,7 @@ pub fn share(
     text: Option<String>,
     files: Vec<String>,
 ) -> Result<(), MothrixError> {
+    let _alone = one_client();
     let runtime = start(Path::new(&folder), "share")?;
     let done: anyhow::Result<()> = runtime.block_on(async {
         let (profile, room_id) = accounts::split_by_profile(&matrix::signed_in_profiles(), &room);
@@ -274,6 +331,13 @@ enum Request {
     Clicked(String),
     /// News from a sign-in under way.
     SignIn(mothrix_core::accounts::SignInEvent),
+    /// A notification's action in a room (its key), while the app runs;
+    /// `done` hears how it went.
+    Respond {
+        room: String,
+        text: Option<String>,
+        done: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
 }
 
 #[derive(Clone)]
@@ -376,6 +440,22 @@ async fn run(
                         finish_sign_in(event, &mut view, &mut accounts);
                         Vec::new()
                     }
+                    Request::Respond { room, text, done } => {
+                        match accounts.client_of(&room) {
+                            // In a task: the server may take its time.
+                            Some((client, room_id)) => {
+                                tokio::spawn(async move {
+                                    let _ = done.send(answer_in(&client, &room_id, text).await);
+                                });
+                            }
+                            None => {
+                                let _ = done.send(Err(anyhow::anyhow!(
+                                    "the room's account is not signed in"
+                                )));
+                            }
+                        }
+                        Vec::new()
+                    }
                 };
                 send_all(&mut accounts, &view, commands);
             }
@@ -398,10 +478,12 @@ fn carry_out(
 ) {
     match effect {
         Effect::SaveConfig => {
+            // Never over a file that cannot be read as a config.
             if let Some(file) = config_file()
+                && let Ok(config) = Config::read(&file)
                 && let Err(error) = (Config {
                     theme: view.theme_name().to_owned(),
-                    ..Config::load(&file).with_shown(view.shown())
+                    ..config.with_shown(view.shown())
                 })
                 .save(&file)
             {
