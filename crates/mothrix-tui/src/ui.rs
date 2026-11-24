@@ -1228,11 +1228,16 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect, state: VerifyState)
                 text,
             )));
             lines.push(Line::default());
-            for (symbol, name) in emojis {
-                lines.push(Line::from(vec![
-                    Span::raw(format!("   {symbol}  ")),
-                    Span::styled(name.clone(), text),
-                ]));
+            // One to a line; on a low terminal several, so that all seven
+            // are there to compare before "They match" is offered.
+            let per_line = if area.height >= 16 { 1 } else { 4 };
+            for row in emojis.chunks(per_line) {
+                let mut spans = Vec::new();
+                for (symbol, name) in row {
+                    spans.push(Span::raw(format!("   {symbol}  ")));
+                    spans.push(Span::styled(name.clone(), text));
+                }
+                lines.push(Line::from(spans));
             }
             vec![
                 ("Enter They match", VerifyInput::Confirm),
@@ -3002,6 +3007,25 @@ mod tests {
         for height in (1..40).rev() {
             render_to_text(&mut app, 100, height);
             render_to_text(&mut app, 40, height);
+        }
+    }
+
+    #[test]
+    fn all_seven_emoji_are_there_to_compare_on_a_low_terminal_too() {
+        let names = ["Dog", "Cat", "Lion", "Horse", "Unicorn", "Pig", "Elephant"];
+        let mut app = sample();
+        app.on_update(Update::Verify(Some(VerifyState::Emojis(
+            names
+                .iter()
+                .map(|name| ("*".to_owned(), (*name).to_owned()))
+                .collect(),
+        ))));
+        for height in [12, 14, 24] {
+            let screen = render_to_text(&mut app, 100, height);
+            for name in names {
+                assert!(screen.contains(name), "{height} rows, {name}: {screen}");
+            }
+            assert!(screen.contains("They match"), "{screen}");
         }
     }
 

@@ -64,8 +64,13 @@ pub type Styled = (char, u8);
 /// The cells a character takes on the screen. A control character takes
 /// one: the screen shows a blank or a mark in its place (`ui::scrub`),
 /// and counting none would let a full line run one cell over.
+///
+/// U+FE0F ("show as emoji") takes one as well: it makes the narrow sign
+/// before it (❤, ☺, ✔, ⚠) a wide one, which is how the terminal library
+/// counts them together. After a sign that is wide already this counts
+/// one too many, which only wraps a line a little early.
 pub fn cells(c: char) -> usize {
-    if c.is_control() {
+    if c.is_control() || c == '\u{fe0f}' {
         1
     } else {
         c.width().unwrap_or(0)
@@ -559,6 +564,23 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn signs_shown_as_emoji_are_counted_as_wide_as_the_screen_draws_them() {
+        use unicode_width::UnicodeWidthStr;
+        for sign in ["❤️", "☺️", "✔️", "⚠️", "1️⃣", "ä", "漢", "👍", "\t"] {
+            let counted: usize = sign.chars().map(cells).sum();
+            assert_eq!(counted, sign.width(), "{sign}");
+        }
+        // A row of them wraps where the screen ends, not at twice that.
+        let hearts = "❤️".repeat(30);
+        let rows = wrap(&parse(&hearts), 20);
+        assert!(
+            rows.iter()
+                .all(|row| row.iter().map(|(c, _)| cells(*c)).sum::<usize>() <= 20)
+        );
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]

@@ -618,7 +618,7 @@ fn reaction_style(reaction: &Reaction, theme: &Theme) -> Style {
 fn reaction_row(item: &Item, named: bool, width: usize, theme: &Theme) -> Vec<Row> {
     let mut lines = vec![Row::of(item, Line::from(Span::raw("  ")))];
     let mut column = 2;
-    for reaction in &item.reactions {
+    for reaction in item.reactions.iter().take(MAX_REACTIONS) {
         let style = reaction_style(reaction, theme);
         let mut parts: Vec<(String, Style, Option<HitAction>)> = Vec::new();
         let react = (!item.event_id.is_empty()).then(|| HitAction::React {
@@ -629,7 +629,7 @@ fn reaction_row(item: &Item, named: bool, width: usize, theme: &Theme) -> Vec<Ro
         if named && !names.is_empty() {
             let shown = &names[..names.len().min(NAMES_SHOWN)];
             parts.push((
-                format!("{} {}", reaction.key, shown.join(", ")),
+                format!("{} {}", shown_key(&reaction.key), shown.join(", ")),
                 style,
                 react,
             ));
@@ -643,7 +643,11 @@ fn reaction_row(item: &Item, named: bool, width: usize, theme: &Theme) -> Vec<Ro
                 ));
             }
         } else {
-            parts.push((format!("{} {}", reaction.key, reaction.count), style, react));
+            parts.push((
+                format!("{} {}", shown_key(&reaction.key), reaction.count),
+                style,
+                react,
+            ));
         }
         let chip_width: usize = parts.iter().map(|(text, ..)| text.width()).sum();
         if column > 2 && column + chip_width > width {
@@ -662,15 +666,38 @@ fn reaction_row(item: &Item, named: bool, width: usize, theme: &Theme) -> Vec<Ro
         entry.line.spans.push(Span::raw("  "));
         column += 2;
     }
+    let more = item.reactions.len().saturating_sub(MAX_REACTIONS);
+    if more > 0 {
+        let entry = lines.last_mut().expect("a line");
+        entry.line.spans.push(Span::styled(
+            format!("+{more} more"),
+            Style::new().fg(theme.dim),
+        ));
+    }
     lines
+}
+
+/// How many different reactions of one message are shown. A reaction is
+/// any text, and nothing limits how many one person puts on a message:
+/// hundreds of them would bury the conversation.
+const MAX_REACTIONS: usize = 24;
+
+/// A reaction as shown: an emoji, or the start of a longer text.
+fn shown_key(key: &str) -> String {
+    const LONGEST: usize = 20;
+    if key.chars().count() <= LONGEST {
+        key.to_owned()
+    } else {
+        key.chars().take(LONGEST).chain(['…']).collect()
+    }
 }
 
 /// Every reaction on its own lines, with all names.
 fn reaction_lists(item: &Item, width: usize, theme: &Theme) -> Vec<Row> {
     let mut lines = Vec::new();
-    for reaction in &item.reactions {
+    for reaction in item.reactions.iter().take(MAX_REACTIONS) {
         let style = reaction_style(reaction, theme);
-        let head = format!("  {} ", reaction.key);
+        let head = format!("  {} ", shown_key(&reaction.key));
         let indent = head.width();
         let names = reaction_names(reaction).join(", ");
         for (index, piece) in wrap(&names, width.saturating_sub(indent))
@@ -689,7 +716,7 @@ fn reaction_lists(item: &Item, width: usize, theme: &Theme) -> Vec<Row> {
             if index == 0 && !item.event_id.is_empty() {
                 entry.spots.push((
                     2,
-                    reaction.key.width(),
+                    shown_key(&reaction.key).width(),
                     HitAction::React {
                         event_id: item.event_id.clone(),
                         key: reaction.key.clone(),
