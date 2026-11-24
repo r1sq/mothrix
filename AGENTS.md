@@ -337,6 +337,12 @@ could only be tested here.
   Windows Terminal to the front on a click
   (`notify::bring_terminal_to_front`), were never seen. Never run on
   macOS.
+- **Audit of 2026-11-24**: what is left of it is in the Forgejo issues
+  labelled `audit`. Changed then and never seen for real: links and
+  attachments opened on Windows (`rundll32 url.dll,FileProtocolHandler`),
+  the store's passphrase in the Keychain and the Credential Manager (seen
+  with gnome-keyring only), a notification's Reply in a running iPhone
+  app, the iPhone's file protection.
 - **Arch package** (`packaging/arch/PKGBUILD`): written, never built.
 - Never seen against a real server: link previews, audio through `mpv`,
   the IServ poll-vote fix, the thread part of the unread fix, signing in

@@ -214,7 +214,12 @@ impl Pictures {
     /// cells of it. Lines are indented by two cells, as in a message.
     pub fn drawn(&self, key: &str, max_width: usize) -> Option<Drawn> {
         let preview = self.previews.get(key)?;
-        if self.sixel.contains_key(key) && preview.png_columns <= max_width {
+        // (Only while Sixel is what is drawn with: after the setting
+        // changed, a picture made for it earlier is drawn the new way.)
+        if self.graphics == Graphics::Sixel
+            && self.sixel.contains_key(key)
+            && preview.png_columns <= max_width
+        {
             return Some(Drawn::Painted {
                 rows: preview.png_rows,
                 columns: preview.png_columns,
@@ -256,7 +261,8 @@ impl Pictures {
     /// Sixel pictures sit on top of the text: then the screen is to be
     /// wiped, drawn again, and [`Pictures::paint`]ed.
     pub fn stale(&self, visible: &[Placement]) -> bool {
-        self.graphics == Graphics::Sixel && self.painted != visible
+        // Also once after Sixel was switched off, to wipe what it painted.
+        (self.graphics == Graphics::Sixel || !self.painted.is_empty()) && self.painted != visible
     }
 
     /// What to write to the terminal to paint `visible` onto a frame

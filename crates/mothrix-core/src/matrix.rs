@@ -419,7 +419,10 @@ pub async fn restore(paths: &Paths) -> Result<Option<Client>> {
 
 /// Sign a running account out and delete what it kept on this computer.
 pub async fn sign_out(client: Client, paths: Paths) {
-    let _ = client.matrix_auth().logout().await;
+    // Not for as long as an unreachable server lets us wait: quitting
+    // meanwhile would leave the account on the disk, back at the next
+    // start.
+    let _ = tokio::time::timeout(Duration::from_secs(15), client.matrix_auth().logout()).await;
     // The client first: it has the store's files open.
     drop(client);
     let _ = forget(&paths);

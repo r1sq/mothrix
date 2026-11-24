@@ -750,25 +750,33 @@ fn copy_to_clipboard(text: &str) {
     let _ = write!(out, "\x1b]52;c;{encoded}\x07");
     let _ = out.flush();
 
-    for (tool, args) in [
-        ("wl-copy", &[][..]),
-        ("xclip", &["-selection", "clipboard"][..]),
-        // macOS.
-        ("pbcopy", &[][..]),
-    ] {
-        let child = std::process::Command::new(tool)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if let Ok(mut child) = child {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+    // Beside the screen: each tool is waited for, and the next one tried
+    // when it could not do it (wl-copy is installed but this is X11, or a
+    // session over SSH).
+    let text = text.to_owned();
+    std::thread::spawn(move || {
+        for (tool, args) in [
+            ("wl-copy", &[][..]),
+            ("xclip", &["-selection", "clipboard"][..]),
+            // macOS.
+            ("pbcopy", &[][..]),
+        ] {
+            let child = std::process::Command::new(tool)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let Ok(mut child) = child {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                if child.wait().is_ok_and(|status| status.success()) {
+                    break;
+                }
             }
-            break;
         }
-    }
+    });
 }
 
 /// Write escape sequences straight to the terminal, between frames.

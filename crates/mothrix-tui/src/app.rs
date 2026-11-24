@@ -589,12 +589,18 @@ impl App {
             return typed.to_owned();
         }
         let name = typed.trim_start_matches('@').to_lowercase();
-        self.state
+        // Only a name one person has: anyone can take the name of
+        // another, and would get the chat or the verification meant for
+        // them. With two of a name the backend asks for the Matrix id.
+        let mut named = self
+            .state
             .members
             .iter()
-            .find(|member| member.name.to_lowercase() == name)
-            .map(|member| member.user_id.clone())
-            .unwrap_or_else(|| typed.to_owned())
+            .filter(|member| member.name.to_lowercase() == name);
+        match (named.next(), named.next()) {
+            (Some(member), None) => member.user_id.clone(),
+            _ => typed.to_owned(),
+        }
     }
 
     /// The rooms a message can be forwarded to, of every account (the open
