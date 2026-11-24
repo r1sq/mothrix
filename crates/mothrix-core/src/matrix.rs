@@ -1544,10 +1544,24 @@ impl Attachment {
 /// For a short-lived process (the share extension, a notification's
 /// action) that has a signed-in client but no sync running: send `text`
 /// into a room.
-pub async fn send_text(client: &Client, room_id: &str, text: &str) -> Result<()> {
+pub async fn send_text(
+    client: &Client,
+    room_id: &str,
+    text: &str,
+    thread: Option<&str>,
+) -> Result<()> {
+    use matrix_sdk::ruma::events::room::message::Relation;
     let room = room_of(client, room_id)?;
-    let message = MessageParts::new(text, &[]);
-    room.send(message.into_content())
+    let mut content = MessageParts::new(text, &[]).into_content();
+    // Into the thread the message answered is in (its root standing in
+    // for the latest message there, which only the timeline would know).
+    if let Some(root) = thread {
+        let root = EventId::parse(root)?;
+        content.relates_to = Some(Relation::Thread(
+            matrix_sdk::ruma::events::relation::Thread::plain(root.clone(), root),
+        ));
+    }
+    room.send(content)
         .await
         .context("could not send the message")?;
     Ok(())

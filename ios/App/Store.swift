@@ -254,9 +254,18 @@ final class Store: ObservableObject {
 
     // What the user does.
 
+    /// What goes into "the open room": Rust is told which room that was
+    /// here, and does not send into another it opened meanwhile.
+    private static let intoTheOpenRoom: Set<String> = [
+        "send", "reply", "upload", "send_voice", "create_poll",
+    ]
+
     func act(_ type: String, _ fields: [String: Any] = [:]) {
         var action = fields
         action["type"] = type
+        if Self.intoTheOpenRoom.contains(type), let room = openRoom {
+            action["in_room"] = room
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: action),
               let json = String(data: data, encoding: .utf8)
         else { return }

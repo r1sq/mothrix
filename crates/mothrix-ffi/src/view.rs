@@ -647,6 +647,16 @@ impl View {
         effects
     }
 
+    /// The key of the room whose conversation is shown.
+    pub fn open_room(&self) -> Option<&str> {
+        self.state.open_room.as_deref()
+    }
+
+    /// A line for the user, from outside an action.
+    pub fn say(&mut self, text: &str) {
+        self.notice(text);
+    }
+
     fn notice(&mut self, text: impl Into<String>) {
         self.events.push(Event::Notice { text: text.into() });
     }

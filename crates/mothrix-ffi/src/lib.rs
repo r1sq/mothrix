@@ -123,7 +123,12 @@ impl Mothrix {
                 .unwrap_or_default();
             tracing::warn!("action {kind}");
         }
-        self.requests.ask(Request::Act(action));
+        // The room the app showed when this was done, for what is sent
+        // into "the open room": Rust may have opened another meanwhile.
+        let in_room = serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|value| value["in_room"].as_str().map(str::to_owned));
+        self.requests.ask(Request::Act(action, in_room));
         Ok(())
     }
 
@@ -212,7 +217,12 @@ pub fn mothrix_repository() -> String {
 /// (if any) into the room with the key `room` and read it up to the
 /// newest message, from the store under `folder`.
 #[uniffi::export]
-pub fn respond(folder: String, room: String, text: Option<String>) -> Result<(), MothrixError> {
+pub fn respond(
+    folder: String,
+    room: String,
+    text: Option<String>,
+    thread: Option<String>,
+) -> Result<(), MothrixError> {
     // The app is running in this process (in the background, say): its
     // accounts answer. A client of our own on their store would encrypt
     // with keys the running one has moved on from.
@@ -226,6 +236,7 @@ pub fn respond(folder: String, room: String, text: Option<String>) -> Result<(),
         let asked = running.send(Request::Respond {
             room: room.clone(),
             text: text.clone(),
+            thread: thread.clone(),
             done,
         });
         // Not asked, or gone before it answered: it is no longer running.
@@ -240,7 +251,7 @@ pub fn respond(folder: String, room: String, text: Option<String>) -> Result<(),
     let done: anyhow::Result<()> = runtime.block_on(async {
         let (profile, room_id) = accounts::split_by_profile(&matrix::signed_in_profiles(), &room);
         let client = signed_in(&profile).await?;
-        answer_in(&client, room_id, text).await
+        answer_in(&client, room_id, text, thread).await
     });
     Ok(done?)
 }
@@ -251,9 +262,10 @@ async fn answer_in(
     client: &matrix_sdk::Client,
     room_id: &str,
     text: Option<String>,
+    thread: Option<String>,
 ) -> anyhow::Result<()> {
     if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
-        matrix::send_text(client, room_id, &text).await?;
+        matrix::send_text(client, room_id, &text, thread.as_deref()).await?;
     }
     if let Some(room) = client.get_room(<&matrix_sdk::ruma::RoomId>::try_from(room_id)?) {
         matrix::read_newest(&room).await;
@@ -279,7 +291,7 @@ pub fn share(
         let text = text.filter(|text| !text.trim().is_empty());
         if files.is_empty() {
             if let Some(text) = text {
-                matrix::send_text(&client, room_id, &text).await?;
+                matrix::send_text(&client, room_id, &text, None).await?;
             }
         } else {
             matrix::send_files(&client, room_id, &files, text).await?;
@@ -330,7 +342,9 @@ fn init_logging(folder: &Path, holder: &str) {
 /// What reaches the accounts' task.
 enum Request {
     Snapshot,
-    Act(Action),
+    /// An action, and the room it was meant for if it goes into "the
+    /// open room".
+    Act(Action, Option<String>),
     /// The app came to the front or went to the background.
     Focus(bool),
     /// A notification about this room was tapped.
@@ -342,6 +356,8 @@ enum Request {
     Respond {
         room: String,
         text: Option<String>,
+        /// The thread the message answered is in, if any.
+        thread: Option<String>,
         done: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     },
 }
@@ -440,7 +456,16 @@ async fn run(
                         }));
                         Vec::new()
                     }
-                    Request::Act(action) => view.act(action),
+                    Request::Act(action, in_room) => {
+                        match in_room {
+                            // Not into a room the user did not see it go to.
+                            Some(room) if view.open_room() != Some(room.as_str()) => {
+                                view.say("Not sent: another chat was opened meanwhile.");
+                                Vec::new()
+                            }
+                            _ => view.act(action),
+                        }
+                    }
                     Request::Focus(focused) => {
                         view.focus(focused);
                         Vec::new()
@@ -450,12 +475,12 @@ async fn run(
                         finish_sign_in(event, &mut view, &mut accounts);
                         Vec::new()
                     }
-                    Request::Respond { room, text, done } => {
+                    Request::Respond { room, text, thread, done } => {
                         match accounts.client_of(&room) {
                             // In a task: the server may take its time.
                             Some((client, room_id)) => {
                                 tokio::spawn(async move {
-                                    let _ = done.send(answer_in(&client, &room_id, text).await);
+                                    let _ = done.send(answer_in(&client, &room_id, text, thread).await);
                                 });
                             }
                             None => {

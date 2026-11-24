@@ -163,14 +163,16 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     func userNotificationCenter(
         _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
     ) async {
-        guard let room = response.notification.request.content.userInfo["mothrix_room"] as? String
-        else { return }
+        let info = response.notification.request.content.userInfo
+        guard let room = info["mothrix_room"] as? String else { return }
+        // The thread the message is in: an answer goes there too.
+        let thread = info["mothrix_thread"] as? String
         switch response.actionIdentifier {
         case "reply":
             let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
-            await Self.answer(room: room, text: text)
+            await Self.answer(room: room, text: text, thread: thread)
         case "read":
-            await Self.answer(room: room, text: nil)
+            await Self.answer(room: room, text: nil, thread: nil)
         case UNNotificationDefaultActionIdentifier:
             await MainActor.run {
                 if let store = self.store {
@@ -188,13 +190,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     /// through Rust's own short-lived client on the shared store: works
     /// whether the app runs or iOS just woke it for this. iOS is asked for
     /// the time it takes.
-    private static func answer(room: String, text: String?) async {
+    private static func answer(room: String, text: String?, thread: String?) async {
         let folder = sharedFolder().path
         let task = await MainActor.run { UIApplication.shared.beginBackgroundTask() }
         let failed: String? = await withCheckedContinuation { done in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    try respond(folder: folder, room: room, text: text)
+                    try respond(folder: folder, room: room, text: text, thread: thread)
                     done.resume(returning: nil)
                 } catch {
                     done.resume(returning: "\(error)")

@@ -46,6 +46,7 @@ final class NotificationService: UNNotificationServiceExtension {
         content.categoryIdentifier = ""
         content.threadIdentifier = ""
         content.userInfo.removeValue(forKey: "mothrix_room")
+        content.userInfo.removeValue(forKey: "mothrix_thread")
         begin(handler, content)
         // The profile becomes a folder's name: only what mothrix itself
         // makes of one (`clean_profile`), so no path.
@@ -65,6 +66,9 @@ final class NotificationService: UNNotificationServiceExtension {
                 if !found.body.isEmpty { content.body = found.body }
                 content.threadIdentifier = found.room
                 content.userInfo["mothrix_room"] = found.room
+                if let thread = found.threadRoot {
+                    content.userInfo["mothrix_thread"] = thread
+                }
                 // Reply and Mark as read (the app registers them).
                 content.categoryIdentifier = "message"
                 content.sound = found.noisy ? .default : nil
