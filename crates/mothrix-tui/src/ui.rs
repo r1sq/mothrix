@@ -712,6 +712,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         inner
     };
 
+    app.pictures.view_rows = view.height as usize;
     // The layout of last time, while nothing it was made from changed.
     let made = conversation::Made::of(app, view.width as usize);
     let layout = match app.laid_out.take() {

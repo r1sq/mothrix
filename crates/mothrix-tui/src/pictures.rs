@@ -74,6 +74,10 @@ pub struct Pictures {
     pub kitty_supported: bool,
     /// Whether the terminal is known to draw Sixel graphics.
     pub sixel_supported: bool,
+    /// The rows the conversation has on screen (0: not known yet). A
+    /// Sixel picture is painted only when all of it is in view: one
+    /// taller than this never would be, and is drawn with blocks.
+    pub view_rows: usize,
     /// The pictures held, by their message's event id (or the logo's key).
     previews: HashMap<String, Preview>,
     /// Those the terminal has a copy of (kitty), with its id there.
@@ -97,6 +101,7 @@ impl Default for Pictures {
             graphics: Graphics::default(),
             kitty_supported: false,
             sixel_supported: false,
+            view_rows: 0,
             previews: HashMap::new(),
             kitty_ids: HashMap::new(),
             next_kitty_id: 1,
@@ -219,6 +224,7 @@ impl Pictures {
         if self.graphics == Graphics::Sixel
             && self.sixel.contains_key(key)
             && preview.png_columns <= max_width
+            && (self.view_rows == 0 || preview.png_rows <= self.view_rows)
         {
             return Some(Drawn::Painted {
                 rows: preview.png_rows,
@@ -233,14 +239,21 @@ impl Pictures {
 
     /// What a layout with pictures in it depends on, of this: when it
     /// changes, they have to be laid out anew.
-    pub fn made_of(&self) -> (Graphics, usize, usize, usize, (u16, u16)) {
+    pub fn made_of(&self) -> (Graphics, usize, usize, usize, (u16, u16), usize) {
         (
             self.graphics,
             self.previews.len(),
             self.kitty_ids.len(),
             self.sixel.len(),
             self.cell_px,
+            self.view_rows,
         )
+    }
+
+    /// The terminal wiped its screen (it was resized): what was painted
+    /// on it is gone, and is painted again with the next frame.
+    pub fn wiped(&mut self) {
+        self.painted.clear();
     }
 
     /// A new frame is drawn: nothing is placed yet.

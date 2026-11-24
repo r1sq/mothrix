@@ -1216,6 +1216,7 @@ impl App {
                     }
                 }
             }
+            Event::Resize(..) => self.pictures.wiped(),
             Event::FocusGained => self.state.focused = true,
             Event::FocusLost => self.state.focused = false,
             _ => {}

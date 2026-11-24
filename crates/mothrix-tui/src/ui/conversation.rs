@@ -149,7 +149,7 @@ pub(crate) struct Made {
     expanded: Vec<String>,
     settings: (bool, bool, usize),
     theme: &'static str,
-    pictures: (crate::app::Graphics, usize, usize, usize, (u16, u16)),
+    pictures: (crate::app::Graphics, usize, usize, usize, (u16, u16), usize),
     link_previews: usize,
 }
 
