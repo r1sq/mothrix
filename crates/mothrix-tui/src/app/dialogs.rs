@@ -1261,8 +1261,17 @@ mod tests {
         let mut app = chat();
         type_text(&mut app, "hi :");
         assert_eq!(app.emoji_matches().len(), 6);
-        app.on_event(key(KeyCode::Enter));
+        app.on_event(key(KeyCode::Tab));
         assert_eq!(app.composer.text(), "hi 👍");
+        // Enter does not take one: "hi :" and "haha :D" are messages.
+        for text in ["hi :", "haha :D"] {
+            app.composer.set(text);
+            let commands = app.on_event(key(KeyCode::Enter));
+            assert!(
+                matches!(&commands[..], [Command::Send { text: sent, .. }] if sent == text),
+                "{commands:?}"
+            );
+        }
     }
 
     fn grammar(start: usize, end: usize, text: &str, replacement: &str) -> GrammarMatch {
