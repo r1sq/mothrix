@@ -278,31 +278,41 @@ impl OwnSections {
 }
 
 /// What of `sections` belongs to `account`: every section that holds its
-/// rooms, or no rooms at all, in order, with only its rooms (as ids).
+/// rooms, and the parent of each such subsection, in order, with only its
+/// rooms (as ids). Nothing else: a section that would hold nothing on a
+/// device with only this account would be tidied away there and sent back
+/// without, for this device to add again, for ever.
 pub fn share(sections: &[Section], prefixes: &[String], account: usize) -> Vec<Section> {
-    sections
+    let own: Vec<Section> = sections
         .iter()
-        .filter_map(|section| {
-            let rooms: Vec<String> = section
+        .map(|section| Section {
+            name: section.name.clone(),
+            rooms: section
                 .rooms
                 .iter()
                 .filter_map(|key| {
                     let (owner, id) = split(prefixes, key);
                     (owner == account).then(|| id.to_owned())
                 })
-                .collect();
-            (!rooms.is_empty() || section.rooms.is_empty()).then(|| Section {
-                name: section.name.clone(),
-                rooms,
-            })
+                .collect(),
         })
+        .collect();
+    let parents: Vec<&str> = own
+        .iter()
+        .filter(|section| !section.rooms.is_empty())
+        .filter_map(|section| parent_name(&section.name))
+        .collect();
+    own.iter()
+        .filter(|section| !section.rooms.is_empty() || parents.contains(&section.name.as_str()))
+        .cloned()
         .collect()
 }
 
 /// Put `account`'s share into `sections`: its rooms go where the share
-/// says, sections it names appear (after the one before them), and a
-/// section that held its rooms and that it no longer names goes when
-/// nothing else is left in it.
+/// says, sections it names appear (after the one before them) and stand
+/// in the share's order among themselves, and a section that held its
+/// rooms and that it no longer names goes when nothing else is left in
+/// it.
 fn merge(sections: &mut Vec<Section>, prefixes: &[String], account: usize, theirs: &[Section]) {
     let prefix = prefixes.get(account).cloned().unwrap_or_default();
     let mine = |key: &String| split(prefixes, key).0 == account;
@@ -333,6 +343,25 @@ fn merge(sections: &mut Vec<Section>, prefixes: &[String], account: usize, their
         };
         sections[at].rooms.extend(keys);
         after = Some(at);
+    }
+    // Their order, in the places these sections have here: a section moved
+    // on another device moves here too. Keeping this device's order would
+    // have each of the two write its own back whenever it hears the other.
+    let places: Vec<usize> = (0..sections.len())
+        .filter(|&at| theirs.iter().any(|named| named.name == sections[at].name))
+        .collect();
+    let mut ordered: Vec<Section> = Vec::new();
+    for incoming in theirs {
+        if !ordered.iter().any(|section| section.name == incoming.name)
+            && let Some(section) = sections.iter().find(|s| s.name == incoming.name)
+        {
+            ordered.push(section.clone());
+        }
+    }
+    if places.len() == ordered.len() {
+        for (at, section) in places.into_iter().zip(ordered) {
+            sections[at] = section;
+        }
     }
     sections.retain(|section| {
         !section.rooms.is_empty()
@@ -379,9 +408,10 @@ impl Sync {
         }
         let changed = match &stored {
             Some(theirs) if *theirs != share(sections, prefixes, account) => {
+                let before = sections.0.clone();
                 merge(&mut sections.0, prefixes, account, theirs);
                 sections.tidy();
-                true
+                sections.0 != before
             }
             _ => false,
         };
@@ -438,25 +468,120 @@ mod tests {
         let sections = vec![
             section("Team", &["!a", "work/!b"]),
             section("Family", &["!c"]),
-            section("New", &[]),
-            section("Clients", &["work/!d"]),
+            section("Work", &[]),
+            section("Work/Clients", &["work/!d"]),
         ];
         assert_eq!(
             share(&sections, &prefixes(), 0),
-            [
-                section("Team", &["!a"]),
-                section("Family", &["!c"]),
-                section("New", &[])
-            ]
+            [section("Team", &["!a"]), section("Family", &["!c"])]
         );
+        // A subsection comes with its parent; the other account, with no
+        // room under it, does not name the parent.
         assert_eq!(
             share(&sections, &prefixes(), 1),
             [
                 section("Team", &["!b"]),
-                section("New", &[]),
-                section("Clients", &["!d"])
+                section("Work", &[]),
+                section("Work/Clients", &["!d"])
             ]
         );
+    }
+
+    /// Devices of one account and what it stores: each hears every write
+    /// (its own too) in the order the server took them, and sends what it
+    /// then has to say.
+    struct World {
+        devices: Vec<(OwnSections, Sync, Vec<String>)>,
+        stored: Vec<Vec<Section>>,
+        heard: Vec<usize>,
+    }
+
+    impl World {
+        fn new(stored: Vec<Section>, devices: Vec<(OwnSections, Vec<String>)>) -> Self {
+            World {
+                heard: vec![0; devices.len()],
+                devices: devices
+                    .into_iter()
+                    .map(|(sections, prefixes)| (sections, Sync::default(), prefixes))
+                    .collect(),
+                stored: vec![stored],
+            }
+        }
+
+        /// Run until all are silent; the number of writes that took.
+        fn settle(&mut self) -> usize {
+            let before = self.stored.len();
+            for _ in 0..20 {
+                let mut quiet = true;
+                for (index, (sections, sync, prefixes)) in self.devices.iter_mut().enumerate() {
+                    while self.heard[index] < self.stored.len() {
+                        let stored = self.stored[self.heard[index]].clone();
+                        sync.heard(sections, prefixes, 0, Some(stored));
+                        self.heard[index] += 1;
+                    }
+                    if let Some(share) = sync.to_send(sections, prefixes, 0) {
+                        self.stored.push(share);
+                        quiet = false;
+                    }
+                }
+                if quiet {
+                    return self.stored.len() - before;
+                }
+            }
+            panic!("the devices never stop writing: {:#?}", self.stored);
+        }
+    }
+
+    #[test]
+    fn a_section_moved_on_one_device_moves_on_the_other_and_both_fall_silent() {
+        let one = vec![String::new()];
+        let before = vec![section("X", &["!x"]), section("Y", &["!y"])];
+        let device = || (OwnSections::new(before.clone()), one.clone());
+        let mut world = World::new(before.clone(), vec![device(), device()]);
+        assert_eq!(world.settle(), 0);
+        assert!(world.devices[0].0.move_section("Y", false));
+        assert_eq!(world.settle(), 1, "the move, once");
+        let order = [section("Y", &["!y"]), section("X", &["!x"])];
+        assert_eq!(world.devices[0].0[..], order);
+        assert_eq!(world.devices[1].0[..], order);
+        // And back, from the other device.
+        assert!(world.devices[1].0.move_section("Y", true));
+        assert_eq!(world.settle(), 1);
+        assert_eq!(world.devices[0].0[..], before[..]);
+    }
+
+    #[test]
+    fn a_parent_of_another_account_s_subsection_is_not_sent_back_and_forth() {
+        // The terminal runs two accounts, the phone only the first.
+        let both = OwnSections::new(vec![
+            section("Team", &["!a"]),
+            section("Work", &[]),
+            section("Work/Clients", &["work/!d"]),
+        ]);
+        let stored = vec![section("Team", &["!a"]), section("Work", &[])];
+        let mut world = World::new(
+            stored,
+            vec![
+                (both.clone(), prefixes()),
+                (OwnSections::default(), vec![String::new()]),
+            ],
+        );
+        // What an older build stored (the parent, empty) is put right once.
+        assert_eq!(world.settle(), 1);
+        assert_eq!(world.devices[0].0[..], both[..]);
+        assert_eq!(world.devices[1].0[..], [section("Team", &["!a"])]);
+    }
+
+    #[test]
+    fn hearing_what_changes_nothing_here_is_no_change() {
+        // Another account's section stands between: nothing to adopt.
+        let mut sync = Sync::default();
+        let mut sections = OwnSections::new(vec![
+            section("Team", &["work/!b", "!a"]),
+            section("Clients", &["work/!d"]),
+        ]);
+        let theirs = vec![section("Team", &["!a"]), section("Gone", &[])];
+        assert!(!sync.heard(&mut sections, &prefixes(), 0, Some(theirs)));
     }
 
     #[test]
