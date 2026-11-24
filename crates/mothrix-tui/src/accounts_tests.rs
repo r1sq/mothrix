@@ -396,3 +396,35 @@ async fn swapped_accounts_take_their_rooms_commands_and_sections_along() {
     assert!(sent.len() == 1 && sent[0].contains("Mine"), "{sent:?}");
     assert!(work.sent().is_empty());
 }
+
+#[tokio::test]
+async fn one_verification_at_a_time_and_the_other_account_s_is_turned_down() {
+    let (mut accounts, mut app, mut home, mut work) = two_accounts();
+    let asks = |device: &str| {
+        Update::Verify(Some(VerifyState::Incoming {
+            device: device.into(),
+        }))
+    };
+    home.updates.send(asks("Phone")).unwrap();
+    pump(&mut accounts, &mut app).await;
+    work.updates.send(asks("Laptop")).unwrap();
+    pump(&mut accounts, &mut app).await;
+    // The dialog is still the first one's, and the second was told no.
+    assert!(matches!(
+        app.overlays.get::<VerifyState>(),
+        Some(VerifyState::Incoming { device }) if device == "Phone"
+    ));
+    assert!(work.sent().iter().any(|sent| sent.contains("Cancel")));
+    assert!(home.sent().is_empty());
+    // Once the first is done, the other account can verify.
+    home.updates
+        .send(Update::Verify(Some(VerifyState::Done)))
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    work.updates.send(asks("Laptop")).unwrap();
+    pump(&mut accounts, &mut app).await;
+    assert!(matches!(
+        app.overlays.get::<VerifyState>(),
+        Some(VerifyState::Incoming { device }) if device == "Laptop"
+    ));
+}

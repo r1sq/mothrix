@@ -11,6 +11,7 @@ cargo build                 # target/debug/mothrix
 cargo test                  # unit tests, including screen rendering and clicks
 just test                   # the tests of all crates
 just lint                   # cargo fmt --check and clippy (all crates) with warnings as errors
+just audit                  # the crates in Cargo.lock against known advisories (asks osv.dev)
 cargo build --release       # what the user runs: target/release/mothrix
 just deb                    # target/mothrix_<version>_<arch>.deb
 ```

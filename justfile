@@ -17,6 +17,10 @@ lint:
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Check the crates in Cargo.lock against known advisories (asks osv.dev)
+audit:
+    python3 -I dev/audit.py
+
 # Install for the current user: binary, man page, menu entry
 install: build
     install -Dm755 target/release/mothrix ~/.local/bin/mothrix

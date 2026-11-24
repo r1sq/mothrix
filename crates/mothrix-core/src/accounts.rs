@@ -337,6 +337,9 @@ pub struct Accounts {
     open: Option<usize>,
     /// The account a verification is going on with.
     verify: usize,
+    /// Whether one is under way there (asked, emoji shown, not yet done
+    /// or failed): the one dialog is its.
+    verifying: bool,
 }
 
 /// Start a backend per account. Returns what the UI needs to know about
@@ -351,6 +354,7 @@ pub fn spawn(clients: Vec<(String, Client)>) -> (Accounts, Vec<Account>) {
         search: String::new(),
         open: None,
         verify: 0,
+        verifying: false,
     };
     let list = clients
         .into_iter()
@@ -462,6 +466,7 @@ impl Accounts {
         // A verification with it ends with it.
         if self.verify == account {
             app.on_update(Update::Verify(None));
+            self.verifying = false;
         }
         self.verify = match self.verify {
             verify if verify == account => 0,
@@ -599,15 +604,34 @@ impl Accounts {
             Update::Verified(verified) => {
                 app.state_mut().accounts[account].verified = Some(verified)
             }
-            Update::Verify(state) => {
+            Update::Verify(state) => match state {
+                // One at a time: there is one dialog, and a request for
+                // another account would take it, and the keys meant for
+                // the first, away. That request is turned down.
+                Some(_) if self.verifying && self.verify != account => {
+                    let _ = self.slots[account]
+                        .commands
+                        .send(Command::Verify(crate::verify::VerifyInput::Cancel));
+                    let label = app.state().accounts[account].label.clone();
+                    app.on_update(Update::Notice(format!(
+                        "A verification for {label} was turned down: another one is under way."
+                    )));
+                }
                 // Answers go back to the account that asked.
-                if state.is_some() {
+                Some(state) => {
                     self.verify = account;
+                    self.verifying = !matches!(
+                        state,
+                        crate::model::VerifyState::Done | crate::model::VerifyState::Failed(_)
+                    );
+                    app.on_update(Update::Verify(Some(state)));
                 }
-                if state.is_some() || self.verify == account {
-                    app.on_update(Update::Verify(state));
+                None if self.verify == account => {
+                    self.verifying = false;
+                    app.on_update(Update::Verify(None));
                 }
-            }
+                None => {}
+            },
             Update::Notice(text)
                 if app.state().accounts.len() > 1 && app.active_account() != account =>
             {
