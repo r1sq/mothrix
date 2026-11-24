@@ -60,6 +60,7 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `stable_polls.rs` | polls in the event formats the SDK does not tally |
 | `verify.rs` | emoji verification, with own devices and with other people |
 | `model.rs` | the plain data the UI shows |
+| `message.rs` | the rules about one message, alike in both front ends: what can be done to it (`offered`), what copy takes, which answers a vote sends, what a new poll needs, which mentions go out |
 | `prefs.rs` | `Prefs`: the preferences, with their defaults |
 | `config.rs` | the config file; `Shown` is what of the UI it keeps |
 | `theme.rs` | the colour themes, built in and own (`[[themes]]`), as plain `#rrggbb` colours; a sender's colour |

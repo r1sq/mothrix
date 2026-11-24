@@ -215,18 +215,16 @@ final class Store: ObservableObject {
 
     func open(_ room: String) { act("open", ["room": room]) }
     func send(_ text: String, mentions: [Member] = []) {
-        act("send", ["text": text, "mentions": Self.mentionList(mentions, in: text)])
+        act("send", ["text": text, "mentions": Self.mentionList(mentions)])
     }
     func reply(to eventId: String, _ text: String, mentions: [Member] = []) {
-        act("reply", ["event_id": eventId, "text": text, "mentions": Self.mentionList(mentions, in: text)])
+        act("reply", ["event_id": eventId, "text": text, "mentions": Self.mentionList(mentions)])
     }
 
-    /// The people completed with @ whose name is still in the text.
-    private static func mentionList(_ mentions: [Member], in text: String) -> [[String: String]] {
-        var seen = Set<String>()
-        return mentions
-            .filter { text.contains("@" + $0.name) && seen.insert($0.userId).inserted }
-            .map { ["user_id": $0.userId, "name": $0.name] }
+    /// The people completed with @; Rust keeps those whose name is still
+    /// in the text.
+    private static func mentionList(_ mentions: [Member]) -> [[String: String]] {
+        mentions.map { ["user_id": $0.userId, "name": $0.name] }
     }
 
     func createPoll(question: String, answers: [String], multiple: Bool, hidden: Bool) {
@@ -239,7 +237,7 @@ final class Store: ObservableObject {
         act("react", ["event_id": eventId, "key": key])
     }
     func vote(_ eventId: String, _ answer: String) {
-        act("vote", ["event_id": eventId, "answers": [answer]])
+        act("vote", ["event_id": eventId, "answer": answer])
     }
     func loadOlder() { act("load_older") }
     func fold(_ key: String) { act("fold", ["key": key]) }
@@ -310,8 +308,8 @@ final class Store: ObservableObject {
         sendFile(data, name: name, caption: caption)
     }
 
-    func edit(_ eventId: String, _ text: String) {
-        act("edit", ["event_id": eventId, "text": text])
+    func edit(_ eventId: String, _ text: String, mentions: [Member] = []) {
+        act("edit", ["event_id": eventId, "text": text, "mentions": Self.mentionList(mentions)])
     }
     func delete(_ eventId: String) { act("delete", ["event_id": eventId]) }
 

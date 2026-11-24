@@ -411,7 +411,10 @@ struct RoomView: View {
                     showingInfo = true
                 }
             }
-            composer
+            // Nothing is written among the pinned messages.
+            if store.thread != "pinned" {
+                composer
+            }
         }
         .background(store.theme.bg)
         .sheet(isPresented: $searching) { SearchView(everywhere: false).environmentObject(store) }
@@ -664,7 +667,7 @@ struct RoomView: View {
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { return }
         if let edited = editing {
-            store.edit(edited.eventId, message)
+            store.edit(edited.eventId, message, mentions: mentioned)
         } else if let reply = replyTo {
             store.reply(to: reply.eventId, message, mentions: mentioned)
         } else {
@@ -712,21 +715,29 @@ struct MessageRow: View {
                         Button(emoji) { store.react(message.eventId, emoji) }
                     }
                     Button("more emoji …") { reacting = true }
-                    Button("reply") { replyTo = message }
-                    Button("copy") { UIPasteboard.general.string = message.body }
-                    Button("forward …") { forwarding = message }
-                    Button(message.pinned ? "unpin" : "pin for everyone") { store.togglePin(message.eventId) }
-                    if case .poll(let poll) = message.kind, message.isOwn, !poll.isEnded {
+                    if message.can.reply {
+                        Button("reply") { replyTo = message }
+                    }
+                    if message.can.copy {
+                        Button("copy") { UIPasteboard.general.string = message.copy }
+                    }
+                    if message.can.forward {
+                        Button("forward …") { forwarding = message }
+                    }
+                    if message.can.pin {
+                        Button(message.pinned ? "unpin" : "pin for everyone") { store.togglePin(message.eventId) }
+                    }
+                    if message.can.endPoll {
                         Button("end poll") { store.endPoll(message.eventId) }
                     }
-                    if message.canEdit {
+                    if message.can.edit {
                         Button("edit") {
                             editing = message
                             replyTo = nil
                             text = message.body
                         }
                     }
-                    if message.canDelete {
+                    if message.can.delete {
                         Button("delete", role: .destructive) { deleting = true }
                     }
                 } preview: {

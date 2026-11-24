@@ -2669,9 +2669,6 @@ fn item_id(event_id: &str) -> Result<TimelineEventItemId> {
     Ok(TimelineEventItemId::EventId(EventId::parse(event_id)?))
 }
 
-/// MSC3381 allows at most 20 answers.
-const MAX_POLL_ANSWERS: usize = 20;
-
 /// Build a poll in the unstable MSC3381 format (what Element sends and the
 /// SDK timeline aggregates).
 pub fn build_poll_start(
@@ -2692,8 +2689,11 @@ pub fn build_poll_start(
     if texts.len() < 2 {
         bail!("a poll needs at least two answers");
     }
-    if texts.len() > MAX_POLL_ANSWERS {
-        bail!("a poll cannot have more than {MAX_POLL_ANSWERS} answers");
+    if texts.len() > crate::message::MAX_POLL_ANSWERS {
+        bail!(
+            "a poll cannot have more than {} answers",
+            crate::message::MAX_POLL_ANSWERS
+        );
     }
 
     let poll_answers: Vec<UnstablePollAnswer> = texts

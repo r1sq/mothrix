@@ -18,7 +18,7 @@ use crate::{
     client_state::{Opening, Taken},
     input::Input,
     matrix::{Command, SyncStatus, Update},
-    model::{Item, ItemKind, Member, Poll, PollFormat, Preview, RoomEntry, VerifyState},
+    model::{Item, ItemKind, Member, PollFormat, Preview, RoomEntry, VerifyState},
     spell::Speller,
     theme::{self, Theme},
     verify::VerifyInput,
@@ -971,7 +971,8 @@ impl App {
                 });
             }
             BarAction::Copy => {
-                self.effects.push(Effect::Copy(copy_text(&item)));
+                self.effects
+                    .push(Effect::Copy(crate::message::copy_text(&item)));
                 self.notice = Some("Copied to the clipboard.".to_owned());
                 self.clear_selection();
                 self.focus = Focus::Composer;
@@ -1666,10 +1667,8 @@ impl App {
         self.viewport.follow_newest();
         let text = text.to_owned();
         // Only mentions whose text survived the editing count.
-        let mentions: Vec<Member> = std::mem::take(&mut self.composer_mentions)
-            .into_iter()
-            .filter(|member| text.contains(&format!("@{}", member.name)))
-            .collect();
+        let mentions =
+            crate::message::mentions_kept(&text, std::mem::take(&mut self.composer_mentions));
         match std::mem::replace(&mut self.compose, Compose::Message) {
             Compose::Message => commands.push(Command::Send {
                 room_id,
@@ -1873,12 +1872,8 @@ impl App {
                 poll_event_id,
                 answer_id,
             } => {
-                let poll = self.state.items.iter().find_map(|item| match &item.kind {
-                    ItemKind::Poll(poll) if item.event_id == poll_event_id => Some(poll),
-                    _ => None,
-                });
-                if let Some(poll) = poll
-                    && let Some(answers) = next_selection(poll, &answer_id)
+                if let Some(poll) = crate::message::poll_of(&self.state.items, &poll_event_id)
+                    && let Some(answers) = crate::message::vote(poll, &answer_id)
                 {
                     commands.push(Command::Vote {
                         poll_event_id,
@@ -1888,52 +1883,6 @@ impl App {
                 }
             }
         }
-    }
-}
-
-/// The selection to send after clicking `answer_id`, or `None` when the click
-/// changes nothing (poll ended, same single choice, or the limit is reached).
-pub fn next_selection(poll: &Poll, answer_id: &str) -> Option<Vec<String>> {
-    if poll.is_ended {
-        return None;
-    }
-    let mut selection: Vec<String> = poll
-        .answers
-        .iter()
-        .filter(|answer| answer.self_voted)
-        .map(|answer| answer.id.clone())
-        .collect();
-    let position = selection.iter().position(|id| id == answer_id);
-
-    if poll.max_selections <= 1 {
-        if position.is_some() {
-            return None;
-        }
-        return Some(vec![answer_id.to_owned()]);
-    }
-    match position {
-        Some(index) => {
-            selection.remove(index);
-        }
-        None if selection.len() as u64 >= poll.max_selections => return None,
-        None => selection.push(answer_id.to_owned()),
-    }
-    Some(selection)
-}
-
-/// What "copy" puts on the clipboard for a message: its text, and for a
-/// poll the question with its answers.
-pub fn copy_text(item: &Item) -> String {
-    match &item.kind {
-        ItemKind::Poll(poll) => {
-            let mut text = poll.question.clone();
-            for answer in &poll.answers {
-                text.push_str("\n- ");
-                text.push_str(&answer.text);
-            }
-            text
-        }
-        _ => item.body.clone(),
     }
 }
 
@@ -2013,15 +1962,14 @@ pub fn parse_poll(argument: &str) -> Result<(String, Vec<String>, bool, bool), S
     if answers.len() < 2 {
         return Err(usage.to_owned());
     }
-    if answers.len() > 20 {
-        return Err("A poll can have at most 20 answers.".to_owned());
-    }
+    let (question, answers) = crate::message::new_poll(&question, &answers)?;
     Ok((question, answers, multiple, hidden))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Poll;
     use crate::model::PollAnswer;
     use mothrix_core::prefs::SortMode;
 
@@ -3116,35 +3064,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn single_choice_click_moves_the_vote() {
-        assert_eq!(
-            next_selection(&poll(1, &["a"]), "b"),
-            Some(vec!["b".to_owned()])
-        );
-        assert_eq!(next_selection(&poll(1, &["a"]), "a"), None);
-    }
-
-    #[test]
-    fn multiple_choice_click_toggles_within_the_limit() {
-        assert_eq!(
-            next_selection(&poll(2, &["a"]), "b"),
-            Some(vec!["a".to_owned(), "b".to_owned()])
-        );
-        assert_eq!(next_selection(&poll(2, &["a", "b"]), "c"), None);
-        assert_eq!(
-            next_selection(&poll(2, &["a", "b"]), "a"),
-            Some(vec!["b".to_owned()])
-        );
-    }
-
-    #[test]
-    fn ended_polls_ignore_clicks() {
-        let mut ended = poll(1, &[]);
-        ended.is_ended = true;
-        assert_eq!(next_selection(&ended, "a"), None);
-    }
-
     fn with_members(mut app: App) -> App {
         app.on_update(Update::Members {
             room_id: "!a".into(),
@@ -3258,7 +3177,10 @@ mod tests {
             }),
             ..Item::default()
         };
-        assert_eq!(copy_text(&poll_item), "Lunch?\n- Pizza\n- Sushi");
+        assert_eq!(
+            crate::message::copy_text(&poll_item),
+            "Lunch?\n- Pizza\n- Sushi"
+        );
     }
 
     #[test]

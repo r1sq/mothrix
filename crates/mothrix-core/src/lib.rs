@@ -17,6 +17,7 @@ pub mod folders;
 pub mod inline;
 pub mod languagetool;
 pub mod matrix;
+pub mod message;
 pub mod model;
 pub mod prefs;
 pub mod preview;

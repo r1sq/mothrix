@@ -19,7 +19,7 @@ mod ui;
 // What lives in `mothrix-core`, under the same paths as the terminal's own
 // modules.
 use mothrix_core::{
-    accounts, client_state, codeblock, emoji, inline, languagetool, matrix, model, search,
+    accounts, client_state, codeblock, emoji, inline, languagetool, matrix, message, model, search,
     sections, sidebar, spell, update, verify,
 };
 

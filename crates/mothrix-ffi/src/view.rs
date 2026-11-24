@@ -21,6 +21,7 @@ use mothrix_core::{
     config::{Config, Shown},
     emoji,
     matrix::{Command, PINNED_VIEW, Update},
+    message::{self, Offered},
     model::{Item, ItemKind, Member, Notify, RoomDetails, RoomEntry, SearchHit, VerifyState},
     prefs::Prefs,
     sections::OwnSections,
@@ -126,13 +127,20 @@ pub struct Message {
     pub blocks: Vec<rich::Block>,
     /// The colour of the sender's name, as the terminal gives it.
     pub sender_color: String,
+    /// What can be done to it, and what "copy" takes.
+    pub can: Offered,
+    pub copy: String,
 }
 
 impl Message {
-    fn of(items: &[Item], theme: &Palette) -> Vec<Self> {
+    /// `in_thread`: they are a thread's (or the pinned ones), not the
+    /// room's conversation.
+    fn of(items: &[Item], in_thread: bool, theme: &Palette) -> Vec<Self> {
         items
             .iter()
             .map(|item| Self {
+                can: message::offered(item, in_thread),
+                copy: message::copy_text(item),
                 sender_color: theme.sender_color(&item.sender_id).to_string(),
                 blocks: match item.kind {
                     ItemKind::Text | ItemKind::Notice | ItemKind::Emote => rich::blocks(&item.body),
@@ -221,10 +229,10 @@ pub enum Action {
         event_id: String,
         key: String,
     },
-    /// `answers` is the whole new choice.
+    /// `answer` is the one tapped: picked, or no longer.
     Vote {
         event_id: String,
-        answers: Vec<String>,
+        answer: String,
     },
     EndPoll {
         event_id: String,
@@ -532,7 +540,11 @@ impl View {
             lines: self.lines(),
             open_room: self.state.open_room.clone(),
             thread: self.state.open_thread.clone(),
-            items: Message::of(&self.state.items, &self.theme),
+            items: Message::of(
+                &self.state.items,
+                self.state.open_thread.is_some(),
+                &self.theme,
+            ),
             pictures: self.pictures.clone(),
             link_previews: self.state.link_previews.clone(),
             settings: self.settings(),
@@ -709,12 +721,13 @@ impl View {
             Action::Send { text, mentions } => {
                 let text = text.trim();
                 match &self.state.open_room {
-                    Some(room) if !text.is_empty() => {
+                    // Nothing is written among the pinned messages.
+                    Some(room) if !text.is_empty() && !self.state.pinned_view() => {
                         return vec![
                             Command::Send {
                                 room_id: room.clone(),
                                 text: text.to_owned(),
-                                mentions,
+                                mentions: message::mentions_kept(text, mentions),
                             },
                             Command::Typing(false),
                         ];
@@ -722,15 +735,24 @@ impl View {
                     _ => {}
                 }
             }
+            // What is done to a message needs its conversation.
+            Action::Reply { .. }
+            | Action::Edit { .. }
+            | Action::Delete { .. }
+            | Action::React { .. }
+            | Action::TogglePin { .. }
+            | Action::OpenMedia { .. }
+                if self.state.open_room.is_none() => {}
             Action::Reply {
                 event_id,
                 text,
                 mentions,
             } if !text.trim().is_empty() => {
+                let text = text.trim().to_owned();
                 return vec![Command::Reply {
                     event_id,
-                    text: text.trim().to_owned(),
-                    mentions,
+                    mentions: message::mentions_kept(&text, mentions),
+                    text,
                 }];
             }
             Action::Edit {
@@ -738,10 +760,11 @@ impl View {
                 text,
                 mentions,
             } if !text.trim().is_empty() => {
+                let text = text.trim().to_owned();
                 return vec![Command::Edit {
                     event_id,
-                    text: text.trim().to_owned(),
-                    mentions,
+                    mentions: message::mentions_kept(&text, mentions),
+                    text,
                 }];
             }
             Action::Reply { .. } | Action::Edit { .. } => {}
@@ -789,27 +812,22 @@ impl View {
                 answers,
                 multiple,
                 hidden,
-            } => {
-                let answers: Vec<String> = answers
-                    .iter()
-                    .map(|answer| answer.trim().to_owned())
-                    .filter(|answer| !answer.is_empty())
-                    .collect();
-                if self.state.open_room.is_some()
-                    && !question.trim().is_empty()
-                    && answers.len() >= 2
-                {
+            } => match message::new_poll(&question, &answers) {
+                Ok((question, answers)) if self.state.open_room.is_some() => {
                     return vec![Command::CreatePoll {
-                        question: question.trim().to_owned(),
+                        question,
                         answers,
                         multiple,
                         hidden,
                     }];
                 }
-                self.notice("A poll needs a question and at least two answers.");
-            }
-            Action::Vote { event_id, answers } => {
-                if let Some(poll) = self.poll(&event_id) {
+                Ok(_) => self.notice("Open a room first."),
+                Err(problem) => self.notice(problem),
+            },
+            Action::Vote { event_id, answer } => {
+                if let Some(poll) = message::poll_of(&self.state.items, &event_id)
+                    && let Some(answers) = message::vote(poll, &answer)
+                {
                     return vec![Command::Vote {
                         format: poll.format,
                         poll_event_id: event_id,
@@ -818,7 +836,7 @@ impl View {
                 }
             }
             Action::EndPoll { event_id } => {
-                if let Some(poll) = self.poll(&event_id) {
+                if let Some(poll) = message::poll_of(&self.state.items, &event_id) {
                     return vec![Command::EndPoll {
                         format: poll.format,
                         poll_event_id: event_id,
@@ -846,6 +864,15 @@ impl View {
             Action::LoadOlder => {}
             Action::OpenMedia { event_id } => return vec![Command::OpenMedia { event_id }],
             Action::Forward { event_id, room } if self.state.open_room.is_some() => {
+                let item = self
+                    .state
+                    .items
+                    .iter()
+                    .find(|item| item.event_id == event_id);
+                if item.is_some_and(|item| !message::offered(item, false).forward) {
+                    self.notice("Only messages and files can be forwarded.");
+                    return Vec::new();
+                }
                 return vec![Command::Forward {
                     event_id,
                     room_id: room,
@@ -1071,18 +1098,6 @@ impl View {
         Vec::new()
     }
 
-    /// The poll of the conversation shown.
-    fn poll(&self, event_id: &str) -> Option<&mothrix_core::model::Poll> {
-        self.state
-            .items
-            .iter()
-            .find(|item| item.event_id == event_id)
-            .and_then(|item| match &item.kind {
-                ItemKind::Poll(poll) => Some(poll),
-                _ => None,
-            })
-    }
-
     /// Show a room (by its key).
     fn open(&mut self, room: String) -> Vec<Command> {
         // Again: out of a thread, back to the room.
@@ -1116,7 +1131,11 @@ impl View {
             self.events.push(Event::Timeline {
                 room,
                 thread: self.state.open_thread.clone(),
-                items: Message::of(&self.state.items, &self.theme),
+                items: Message::of(
+                    &self.state.items,
+                    self.state.open_thread.is_some(),
+                    &self.theme,
+                ),
             });
         }
     }
@@ -1407,13 +1426,13 @@ mod tests {
                 Event::Timeline {
                     room: "work/!b".into(),
                     thread: None,
-                    items: Message::of(&[item("hi")], &theme::default_palette())
+                    items: Message::of(&[item("hi")], false, &theme::default_palette())
                 },
             ]
         );
         assert_eq!(
             view.snapshot().items,
-            Message::of(&[item("hi")], &theme::default_palette())
+            Message::of(&[item("hi")], false, &theme::default_palette())
         );
         assert_eq!(view.snapshot().items[0].blocks.len(), 1);
         // Commands without a room go to the open room's account.
@@ -1547,16 +1566,124 @@ mod tests {
             }],
         });
         assert!(matches!(
-            &act(&mut view, serde_json::json!({"type": "vote", "event_id": "$poll", "answers": ["x"]}))[..],
+            &act(&mut view, serde_json::json!({"type": "vote", "event_id": "$poll", "answer": "x"}))[..],
             [Command::Vote { format: PollFormat::Mixed, answers, .. }] if answers == &["x"]
         ));
         assert!(
             act(
                 &mut view,
-                serde_json::json!({"type": "vote", "event_id": "$other", "answers": []})
+                serde_json::json!({"type": "vote", "event_id": "$other", "answer": "x"})
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_tap_on_an_answer_toggles_it_within_what_the_poll_allows() {
+        use mothrix_core::model::PollAnswer;
+        let mut view = view();
+        view.act(Action::Open { room: "!a".into() });
+        let answer = |id: &str, self_voted: bool| PollAnswer {
+            id: id.into(),
+            self_voted,
+            ..PollAnswer::default()
+        };
+        view.on_update(Update::Timeline {
+            room_id: "!a".into(),
+            items: vec![Item {
+                event_id: "$poll".into(),
+                kind: ItemKind::Poll(Poll {
+                    max_selections: 2,
+                    answers: vec![answer("a", true), answer("b", false), answer("c", false)],
+                    ..Poll::default()
+                }),
+                ..Item::default()
+            }],
+        });
+        let mut tap = |answer: &str| {
+            act(
+                &mut view,
+                serde_json::json!({"type": "vote", "event_id": "$poll", "answer": answer}),
+            )
+        };
+        // A second answer joins the first; the first tapped again goes.
+        assert!(matches!(
+            &tap("b")[..],
+            [Command::Vote { answers, .. }] if answers == &["a", "b"]
+        ));
+        assert!(matches!(
+            &tap("a")[..],
+            [Command::Vote { answers, .. }] if answers.is_empty()
+        ));
+    }
+
+    #[test]
+    fn messages_say_what_can_be_done_to_them() {
+        let mut view = view();
+        view.act(Action::Open { room: "!a".into() });
+        let poll = Item {
+            event_id: "$poll".into(),
+            is_own: true,
+            kind: ItemKind::Poll(Poll {
+                question: "Lunch?".into(),
+                ..Poll::default()
+            }),
+            ..Item::default()
+        };
+        let mut file = item("a.png");
+        file.event_id = "$file".into();
+        file.kind = ItemKind::Media;
+        file.can_edit = true;
+        view.on_update(Update::Timeline {
+            room_id: "!a".into(),
+            items: vec![poll, file],
+        });
+        let items = view.snapshot().items;
+        assert!(items[0].can.end_poll && !items[0].can.forward && items[0].can.thread);
+        assert_eq!(items[0].copy, "Lunch?");
+        assert!(items[1].can.forward && items[1].can.open_media && !items[1].can.edit);
+        // A poll is not forwarded, even when asked.
+        let forward = |event_id: &str| Action::Forward {
+            event_id: event_id.into(),
+            room: "work/!b".into(),
+        };
+        assert!(view.act(forward("$poll")).is_empty());
+        assert_eq!(view.act(forward("$file")).len(), 1);
+
+        // Among the pinned messages nothing is written, and no thread opens.
+        view.act(Action::OpenPinned);
+        view.on_update(Update::Thread {
+            room_id: "!a".into(),
+            root: PINNED_VIEW.into(),
+            items: vec![item("pinned")],
+        });
+        assert!(!view.snapshot().items[0].can.thread);
+        assert!(view.act(send("hello")).is_empty());
+    }
+
+    #[test]
+    fn what_is_done_to_a_message_needs_an_open_room() {
+        let mut view = view();
+        for action in [
+            serde_json::json!({"type": "reply", "event_id": "$1", "text": "hi"}),
+            serde_json::json!({"type": "edit", "event_id": "$1", "text": "hi"}),
+            serde_json::json!({"type": "delete", "event_id": "$1"}),
+            serde_json::json!({"type": "react", "event_id": "$1", "key": "👍"}),
+            serde_json::json!({"type": "toggle_pin", "event_id": "$1"}),
+            serde_json::json!({"type": "open_media", "event_id": "$1"}),
+        ] {
+            assert!(act(&mut view, action.clone()).is_empty(), "{action}");
+        }
+        view.act(Action::Open { room: "!a".into() });
+        // Only people still named in the text are mentioned.
+        let amy = serde_json::json!({"user_id": "@amy:x", "name": "Amy"});
+        let ben = serde_json::json!({"user_id": "@ben:x", "name": "Ben"});
+        assert!(matches!(
+            &act(&mut view, serde_json::json!({
+                "type": "edit", "event_id": "$1", "text": "hi @Amy", "mentions": [amy, ben]
+            }))[..],
+            [Command::Edit { mentions, .. }] if mentions.len() == 1 && mentions[0].name == "Amy"
+        ));
     }
 
     #[test]

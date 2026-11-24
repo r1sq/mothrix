@@ -247,8 +247,28 @@ struct Message: Decodable, Hashable, Identifiable {
     var thread: ThreadSummary?
     var blocks: [Block]
     var senderColor: String
+    /// What can be done to it, and what "copy" takes (Rust decides both,
+    /// as for the terminal).
+    var can: Offered
+    var copy: String
 
     var id: String { eventId.isEmpty ? key + body : eventId }
+}
+
+/// What can be done to a message.
+struct Offered: Decodable, Hashable {
+    var reply: Bool
+    var react: Bool
+    var edit: Bool
+    var delete: Bool
+    var openMedia: Bool
+    var openLink: Bool
+    var copy: Bool
+    var copyCode: Bool
+    var pin: Bool
+    var forward: Bool
+    var thread: Bool
+    var endPoll: Bool
 }
 
 /// `[replies, [name, text] or null]`.

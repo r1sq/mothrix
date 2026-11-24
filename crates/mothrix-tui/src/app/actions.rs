@@ -25,54 +25,37 @@ impl App {
     /// What can be done to `item` right now, in the order the strip shows.
     pub fn message_actions(&self, item: &Item) -> Vec<MessageAction> {
         use BarAction as A;
-        let redacted = matches!(item.kind, ItemKind::Redacted);
-        let readable = !matches!(item.kind, ItemKind::Redacted | ItemKind::Undecryptable);
-        let has_code = matches!(item.kind, ItemKind::Text | ItemKind::Notice)
-            && !crate::codeblock::code_blocks(&item.body).is_empty();
-        let has_link = !crate::inline::parse_links(&item.body).1.is_empty();
+        let can = crate::message::offered(item, self.state.open_thread.is_some());
         let mut actions = Vec::new();
-        if !redacted {
-            actions.push(MessageAction::new(A::Reply, 'r', "Reply"));
-            actions.push(MessageAction::new(A::React, 'a', "React"));
-        }
-        if item.can_edit && matches!(item.kind, ItemKind::Text | ItemKind::Emote) {
-            actions.push(MessageAction::new(A::Edit, 'e', "Edit"));
-        }
-        if item.can_delete && !redacted {
-            actions.push(MessageAction::new(A::Delete, 'd', "Delete"));
-        }
-        if matches!(item.kind, ItemKind::Media) {
-            actions.push(MessageAction::new(A::Open, 'o', "Open"));
-        } else if readable && has_link {
-            actions.push(MessageAction::new(A::Open, 'o', "Open link"));
-        }
-        if readable {
-            actions.push(MessageAction::new(A::Copy, 'c', "Copy"));
-        }
-        if has_code {
-            actions.push(MessageAction::new(A::CopyCode, 'y', "Copy code"));
-        }
-        if self.collapsible.contains(&item.event_id) {
-            let label = if self.expanded.contains(&item.event_id) {
-                "Less"
-            } else {
-                "More"
-            };
-            actions.push(MessageAction::new(A::Expand, 'x', label));
-        }
-        if !redacted {
-            let label = if item.pinned { "Unpin" } else { "Pin" };
-            actions.push(MessageAction::new(A::Pin, 'p', label));
-        }
-        if matches!(
-            item.kind,
-            ItemKind::Text | ItemKind::Notice | ItemKind::Emote | ItemKind::Media
-        ) {
-            actions.push(MessageAction::new(A::Forward, 'f', "Forward"));
-        }
-        if self.state.open_thread.is_none() && !redacted {
-            actions.push(MessageAction::new(A::Thread, 't', "Thread"));
-        }
+        let mut offer = |wanted: bool, action: BarAction, key: char, label: &'static str| {
+            if wanted {
+                actions.push(MessageAction::new(action, key, label));
+            }
+        };
+        offer(can.reply, A::Reply, 'r', "Reply");
+        offer(can.react, A::React, 'a', "React");
+        offer(can.edit, A::Edit, 'e', "Edit");
+        offer(can.delete, A::Delete, 'd', "Delete");
+        offer(can.open_media, A::Open, 'o', "Open");
+        offer(can.open_link, A::Open, 'o', "Open link");
+        offer(can.copy, A::Copy, 'c', "Copy");
+        offer(can.copy_code, A::CopyCode, 'y', "Copy code");
+        // How long a message is shows only when it is laid out.
+        let expanded = self.expanded.contains(&item.event_id);
+        offer(
+            self.collapsible.contains(&item.event_id),
+            A::Expand,
+            'x',
+            if expanded { "Less" } else { "More" },
+        );
+        offer(
+            can.pin,
+            A::Pin,
+            'p',
+            if item.pinned { "Unpin" } else { "Pin" },
+        );
+        offer(can.forward, A::Forward, 'f', "Forward");
+        offer(can.thread, A::Thread, 't', "Thread");
         actions
     }
 
@@ -104,6 +87,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Poll;
 
     fn item(kind: ItemKind, body: &str) -> Item {
         Item {
