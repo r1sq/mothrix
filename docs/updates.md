@@ -16,6 +16,10 @@ ends: start it again.
   `0.2.0 (ce613f6)`) never looks.
 - mothrix can only replace itself in a folder you can write to. Elsewhere
   it says so and leaves things as they are.
+- The new program is started once (`--version`) before it takes the old
+  one's place: one that does not start on this system is not installed.
+- A build without git at hand (from a source archive) counts as not a
+  release.
 
 Looking means asking GitHub about the latest release, so GitHub sees the
 address mothrix runs from, once a day.

@@ -283,11 +283,51 @@ impl Installed {
 /// moves aside (`.old`, removed at the next start by [`cleanup`]) and the
 /// new one takes its name.
 pub fn install(exe: &Path, data: &[u8]) -> Result<Installed> {
+    install_if(exe, data, |_| Ok(()))
+}
+
+/// [`install`], after the new program was started once and said it is
+/// mothrix `version`. One built for another system (another C library,
+/// say) would take the old one's place and then not start: there would be
+/// no mothrix left to put it right with.
+pub fn install_tried(exe: &Path, data: &[u8], version: &str) -> Result<Installed> {
+    install_if(exe, data, |new| {
+        let said = std::process::Command::new(new)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        if said
+            .trim()
+            .strip_prefix("mothrix ")
+            .is_some_and(|rest| rest.starts_with(version))
+        {
+            Ok(())
+        } else {
+            bail!("the new mothrix does not start on this system; the old one stays")
+        }
+    })
+}
+
+fn install_if(
+    exe: &Path,
+    data: &[u8],
+    good: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Installed> {
     let new = with_suffix(exe, "new");
     let old = with_suffix(exe, "old");
     if let Err(error) = write_program(&new, data) {
         let _ = std::fs::remove_file(&new);
         return Err(describe(error, exe));
+    }
+    // Who may start the old one may start the new one, no more.
+    if let Ok(now) = std::fs::metadata(exe) {
+        let _ = std::fs::set_permissions(&new, now.permissions());
+    }
+    if let Err(error) = good(&new) {
+        let _ = std::fs::remove_file(&new);
+        return Err(error);
     }
     let _ = std::fs::remove_file(&old);
     if let Err(error) = std::fs::rename(exe, &old) {
@@ -507,6 +547,25 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), b"old");
 
         install(&exe, b"newer").unwrap();
+        // What does not start and say it is that version is not put in
+        // the old one's place.
+        assert!(install_tried(&exe, b"not a program", "9.0.0").is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"newer");
+        #[cfg(unix)]
+        {
+            let script = b"#!/bin/sh\necho mothrix 9.0.0\n";
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            install_tried(&exe, script, "9.0.0").unwrap();
+            assert_eq!(std::fs::read(&exe).unwrap(), script);
+            // With the old one's mode.
+            assert_eq!(
+                std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert!(install_tried(&exe, script, "9.1.0").is_err());
+        }
+        std::fs::write(&exe, b"newer").unwrap();
         cleanup(&exe);
         assert!(!with_suffix(&exe, "old").exists());
         assert_eq!(std::fs::read(&exe).unwrap(), b"newer");

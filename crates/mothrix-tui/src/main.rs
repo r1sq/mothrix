@@ -872,7 +872,7 @@ async fn install_release(
     available: &update::Available,
 ) -> Result<update::Installed> {
     let data = update::download(fetch, available).await?;
-    update::install(&std::env::current_exe()?, &data)
+    update::install_tried(&std::env::current_exe()?, &data, &available.version)
 }
 
 /// `mothrix update`: install a newer release, if this build may.
@@ -904,7 +904,7 @@ async fn update_command(paths: &Paths) -> Result<()> {
     }
     println!("Downloading mothrix {}…", available.version);
     let data = update::download(&fetch, &available).await?;
-    update::install(&std::env::current_exe()?, &data)?;
+    update::install_tried(&std::env::current_exe()?, &data, &available.version)?;
     println!(
         "mothrix {} is installed; start it again.",
         available.version

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MPL-2.0
 # Build a Debian package from the release binary: target/mothrix_<version>_<arch>.deb
 set -eu
+# Folders everyone can enter, whatever the builder's own umask is.
+umask 022
 cd "$(dirname "$0")/.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 homepage=$(sed -n 's/^repository = "\(.*\)"/\1/p' Cargo.toml | head -1)

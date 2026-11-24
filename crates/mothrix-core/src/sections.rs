@@ -76,7 +76,16 @@ impl Deref for OwnSections {
 impl OwnSections {
     /// These sections, tidied.
     pub fn new(sections: Vec<Section>) -> Self {
-        let mut own = Self(sections);
+        // One section of a name (a config written by hand can have two):
+        // the later one's rooms join the first.
+        let mut once: Vec<Section> = Vec::with_capacity(sections.len());
+        for section in sections {
+            match once.iter_mut().find(|known| known.name == section.name) {
+                Some(known) => known.rooms.extend(section.rooms),
+                None => once.push(section),
+            }
+        }
+        let mut own = Self(once);
         own.tidy();
         own
     }

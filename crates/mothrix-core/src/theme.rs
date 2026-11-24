@@ -25,7 +25,7 @@ impl Rgb {
     /// A colour as written in the config: `#rrggbb`.
     pub fn parse(text: &str) -> Option<Self> {
         let hex = text.trim().strip_prefix('#')?;
-        (hex.len() == 6).then_some(())?;
+        (hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(())?;
         Some(Self::hex(u32::from_str_radix(hex, 16).ok()?))
     }
 }
