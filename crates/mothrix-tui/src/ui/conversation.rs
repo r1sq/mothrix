@@ -17,7 +17,7 @@ use crate::{app::Pictures, model::Reaction};
 const GROUP_WINDOW_MS: u64 = 5 * 60 * 1000;
 
 /// One rendered line of the conversation, plus what clicking it does.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Row {
     pub line: Line<'static>,
     /// Event id of the message this line belongs to, when it can be selected.
@@ -130,6 +130,52 @@ impl<'a> Options<'a> {
             selected: app.selected.as_deref(),
             width,
             theme: &app.theme,
+        }
+    }
+}
+
+/// What a [`Layout`] was made from, as far as it can change between two
+/// frames: while this stays the same, the layout does. Laying out reads
+/// every message loaded (Markdown, wrapping, pictures), which a key typed
+/// into the message box or a move of the mouse is no reason to do again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Made {
+    /// Counts what the backend sent: any of it may have changed a message.
+    updates: u64,
+    /// The messages, in case they were changed otherwise (a room opened).
+    items: (usize, Option<String>, Option<String>),
+    width: usize,
+    selected: Option<String>,
+    expanded: Vec<String>,
+    settings: (bool, bool, usize),
+    theme: &'static str,
+    pictures: (crate::app::Graphics, usize, usize, usize, (u16, u16)),
+    link_previews: usize,
+}
+
+impl Made {
+    pub(crate) fn of(app: &App, width: usize) -> Self {
+        let items = &app.state.items;
+        let mut expanded: Vec<String> = app.expanded.iter().cloned().collect();
+        expanded.sort();
+        Self {
+            updates: app.updates_taken,
+            items: (
+                items.len(),
+                items.first().map(|item| item.key.clone()),
+                items.last().map(|item| item.key.clone()),
+            ),
+            width,
+            selected: app.selected.clone(),
+            expanded,
+            settings: (
+                app.state.prefs.room_events,
+                app.state.prefs.read_receipts,
+                app.state.prefs.long_messages,
+            ),
+            theme: app.theme.name,
+            pictures: app.pictures.made_of(),
+            link_previews: app.state.link_previews.len(),
         }
     }
 }

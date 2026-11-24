@@ -231,6 +231,18 @@ impl Pictures {
         }))
     }
 
+    /// What a layout with pictures in it depends on, of this: when it
+    /// changes, they have to be laid out anew.
+    pub fn made_of(&self) -> (Graphics, usize, usize, usize, (u16, u16)) {
+        (
+            self.graphics,
+            self.previews.len(),
+            self.kitty_ids.len(),
+            self.sixel.len(),
+            self.cell_px,
+        )
+    }
+
     /// A new frame is drawn: nothing is placed yet.
     pub fn start_frame(&mut self) {
         self.placements.clear();

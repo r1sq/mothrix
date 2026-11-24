@@ -337,6 +337,16 @@ pub struct App {
     pub compose: Compose,
     /// Mentions completed in the current composer text.
     composer_mentions: Vec<Member>,
+    /// How many updates were taken (see `ui::conversation::Made`).
+    pub(crate) updates_taken: u64,
+    /// The conversation as laid out last, and from what.
+    pub(crate) laid_out: Option<(
+        crate::ui::conversation::Made,
+        std::rc::Rc<crate::ui::conversation::Layout>,
+    )>,
+    /// Whether that is used again while nothing it was made from changed.
+    /// Not in tests, which also change messages in place.
+    pub(crate) keeps_layout: bool,
     /// The files last found for a path being typed: (what was typed,
     /// when, what was found).
     #[allow(clippy::type_complexity)]
@@ -421,6 +431,9 @@ impl App {
             composer: Input::default(),
             compose: Compose::Message,
             composer_mentions: Vec::new(),
+            updates_taken: 0,
+            laid_out: None,
+            keeps_layout: !cfg!(test),
             path_cache: std::cell::RefCell::new(None),
             draft_extras: HashMap::new(),
             mention_selected: 0,
@@ -1052,6 +1065,7 @@ impl App {
     }
 
     pub fn on_update(&mut self, update: Update) {
+        self.updates_taken += 1;
         let update = match self.state.take(update) {
             Taken::Rooms { news, show } => {
                 for news in news {

@@ -14,7 +14,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-mod conversation;
+pub(crate) mod conversation;
 
 pub(crate) use conversation::can_expand;
 use conversation::{Options, wrap};
@@ -712,12 +712,21 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         inner
     };
 
-    let layout = conversation::Layout::of(&app.state.items, &Options::of(app, view.width as usize));
+    // The layout of last time, while nothing it was made from changed.
+    let made = conversation::Made::of(app, view.width as usize);
+    let layout = match app.laid_out.take() {
+        Some((from, layout)) if app.keeps_layout && from == made => layout,
+        _ => std::rc::Rc::new(conversation::Layout::of(
+            &app.state.items,
+            &Options::of(app, view.width as usize),
+        )),
+    };
+    app.laid_out = Some((made, std::rc::Rc::clone(&layout)));
     let selected = app
         .selected
         .as_deref()
         .and_then(|selected| layout.rows_of(selected));
-    let lines = layout.rows;
+    let lines = &layout.rows;
     let total = lines.len();
     let height = view.height as usize;
     let newest = app
@@ -742,7 +751,7 @@ fn draw_timeline(frame: &mut Frame, app: &mut App, area: Rect) {
         // Short timelines sit at the bottom of the panel, next to the composer.
         let top_padding = height - (end - start);
         let mut text = vec![Line::default(); top_padding];
-        for (offset, mut entry) in lines.into_iter().skip(start).take(end - start).enumerate() {
+        for (offset, mut entry) in lines[start..end].iter().cloned().enumerate() {
             let rect = Rect {
                 x: view.x,
                 y: view.y + (top_padding + offset) as u16,
@@ -3035,6 +3044,52 @@ mod tests {
             }
             assert!(screen.contains("They match"), "{screen}");
         }
+    }
+
+    #[test]
+    fn the_conversation_is_laid_out_again_only_when_something_it_shows_changed() {
+        let mut app = sample();
+        app.keeps_layout = true;
+        app.state.open_room = Some("!lunch".into());
+        let timeline = |texts: &[&str]| Update::Timeline {
+            room_id: "!lunch".into(),
+            items: texts
+                .iter()
+                .enumerate()
+                .map(|(index, text)| message(&format!("m{index}"), "Amy", text, 1_000))
+                .collect(),
+        };
+        app.on_update(timeline(&["first words"]));
+        assert!(render_to_text(&mut app, 100, 24).contains("first words"));
+        let laid_out = |app: &App| std::rc::Rc::as_ptr(&app.laid_out.as_ref().unwrap().1);
+        let before = laid_out(&app);
+        // Typing and the mouse are no reason.
+        app.focus = Focus::Composer;
+        for c in "hello".chars() {
+            app.on_event(Event::Key(crossterm::event::KeyEvent::from(
+                crossterm::event::KeyCode::Char(c),
+            )));
+        }
+        let screen = render_to_text(&mut app, 100, 24);
+        assert!(
+            screen.contains("hello") && screen.contains("first words"),
+            "{screen}"
+        );
+        assert_eq!(laid_out(&app), before);
+        // A change of the messages, the width or the selection is.
+        app.on_update(timeline(&["other words"]));
+        let screen = render_to_text(&mut app, 100, 24);
+        assert!(
+            screen.contains("other words") && !screen.contains("first words"),
+            "{screen}"
+        );
+        let before = laid_out(&app);
+        render_to_text(&mut app, 80, 24);
+        assert_ne!(laid_out(&app), before);
+        let before = laid_out(&app);
+        app.selected = Some("m0".into());
+        render_to_text(&mut app, 80, 24);
+        assert_ne!(laid_out(&app), before);
     }
 
     #[test]
