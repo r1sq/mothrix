@@ -321,8 +321,11 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 
 fn write_program(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    // A file of our own making, not one (or a link) someone put there
+    // under this name for us to fill.
+    let _ = std::fs::remove_file(path);
     let mut options = std::fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
+    options.create_new(true).write(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o755);
     let mut file = options.open(path)?;

@@ -1857,8 +1857,13 @@ impl Session {
             }
             Command::Typing(typing) => {
                 if let Some(current) = open.as_ref() {
+                    // Beside the loop: a server that is slow to take the
+                    // notice must not hold up the message sent after it.
                     // Not worth a message in the status bar if it fails.
-                    let _ = current.room.typing_notice(typing).await;
+                    let room = current.room.clone();
+                    tokio::spawn(async move {
+                        let _ = room.typing_notice(typing).await;
+                    });
                 }
             }
             Command::OpenThread { event_id } => {
@@ -2087,11 +2092,7 @@ impl Session {
                     PollFormat::Standard | PollFormat::Mixed => {
                         let (event_type, content) =
                             stable_polls::response_event(format, &poll_event_id, &answers);
-                        timeline
-                            .room()
-                            .send_raw(event_type, content)
-                            .await
-                            .context("could not send the vote")?;
+                        send_beside(timeline.room().clone(), event_type, content, "the vote", tx);
                     }
                 }
             }
@@ -2161,11 +2162,13 @@ impl Session {
                     PollFormat::Standard | PollFormat::Mixed => {
                         let (event_type, content) =
                             stable_polls::end_event(format, &poll_event_id, text);
-                        timeline
-                            .room()
-                            .send_raw(event_type, content)
-                            .await
-                            .context("could not end the poll")?;
+                        send_beside(
+                            timeline.room().clone(),
+                            event_type,
+                            content,
+                            "the poll's end",
+                            tx,
+                        );
                     }
                 }
             }
@@ -2571,9 +2574,13 @@ async fn account_command(
                         let _ = tx.send(Update::Notice(format!(
                             "Approve the reset in your browser: {url}"
                         )));
-                        handle
-                            .reset(None)
+                        // Not for ever: everything else that changes
+                        // the account waits behind this.
+                        tokio::time::timeout(Duration::from_secs(10 * 60), handle.reset(None))
                             .await
+                            .context(
+                                "the reset was not approved in ten minutes; nothing was changed",
+                            )?
                             .context("the reset was not approved")?;
                     }
                 }
@@ -2948,6 +2955,24 @@ impl MessageParts {
     }
 }
 
+/// Send an event that does not go through the timeline's queue, beside
+/// the backend's loop: the server may take its time (or ask to wait and
+/// try again), and what the user does next must not wait for it.
+fn send_beside(
+    room: Room,
+    event_type: impl Into<String>,
+    content: Value,
+    what: &'static str,
+    tx: &mpsc::UnboundedSender<Update>,
+) {
+    let (event_type, tx) = (event_type.into(), tx.clone());
+    tokio::spawn(async move {
+        if let Err(error) = room.send_raw(&event_type, content).await {
+            let _ = tx.send(Update::Notice(format!("Could not send {what}: {error}")));
+        }
+    });
+}
+
 fn timeline_of(open: &Option<OpenRoom>) -> Result<&Arc<Timeline>> {
     open.as_ref()
         .map(|current| &current.timeline)
@@ -3282,7 +3307,9 @@ async fn timeline_loop(
 ) {
     let room_id = room.room_id().to_string();
     let mut watch = RoomWatch::new(thread.is_none());
-    let (poll_loaded_tx, mut poll_loaded) = mpsc::unbounded_channel::<(String, Vec<Value>)>();
+    let (poll_loaded_tx, mut poll_loaded) = mpsc::unbounded_channel::<PollLoaded>();
+    let mut polls_as_of: HashMap<String, std::time::Instant> = HashMap::new();
+    let (receipt_failed_tx, mut receipt_failed) = mpsc::unbounded_channel::<bool>();
     let (mut items, stream) = timeline.subscribe().await;
     let mut stream = Box::pin(stream);
     let mut names = Names::new();
@@ -3319,6 +3346,13 @@ async fn timeline_loop(
     let (_typing_guard, mut typing) = room.subscribe_to_typing_notifications();
 
     loop {
+        while let Ok(with_threads) = receipt_failed.try_recv() {
+            if with_threads {
+                watch.read_with_threads_failed();
+            } else {
+                watch.read_failed();
+            }
+        }
         let (seen, pictures) = seen_in(&items, &watch);
         let todo = watch.see(seen);
         for poll in todo.load_polls {
@@ -3348,23 +3382,36 @@ async fn timeline_loop(
                 ));
             }
         }
-        // A receipt that did not go out is sent again with the next
-        // snapshot (the loop comes round with every change in the room).
-        if todo.mark_read && timeline.mark_as_read(ReceiptType::Read).await.is_err() {
-            watch.read_failed();
-        }
-        if let Some(newest) = todo
+        // Receipts go out beside the loop: a slow or rate-limiting server
+        // must not hold up showing what arrives. One that did not go out
+        // is sent again with the next snapshot (the loop comes round with
+        // every change in the room).
+        let newest = todo
             .read_with_threads
-            .and_then(|id| OwnedEventId::try_from(id).ok())
-            && room
-                .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, newest)
-                .await
-                .is_err()
-        {
-            watch.read_with_threads_failed();
-        }
-        if todo.clear_unread_flag && room.is_marked_unread() {
-            let _ = room.set_unread_flag(false).await;
+            .and_then(|id| OwnedEventId::try_from(id).ok());
+        if todo.mark_read || newest.is_some() || todo.clear_unread_flag {
+            let (timeline, room, failed) = (
+                Arc::clone(&timeline),
+                room.clone(),
+                receipt_failed_tx.clone(),
+            );
+            let (mark_read, clear_flag) = (todo.mark_read, todo.clear_unread_flag);
+            tokio::spawn(async move {
+                if mark_read && timeline.mark_as_read(ReceiptType::Read).await.is_err() {
+                    let _ = failed.send(false);
+                }
+                if let Some(newest) = newest
+                    && room
+                        .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, newest)
+                        .await
+                        .is_err()
+                {
+                    let _ = failed.send(true);
+                }
+                if clear_flag && room.is_marked_unread() {
+                    let _ = room.set_unread_flag(false).await;
+                }
+            });
         }
 
         tokio::select! {
@@ -3374,7 +3421,13 @@ async fn timeline_loop(
                     apply(diff, &mut items);
                 }
             }
-            Some((poll_id, events)) = poll_loaded.recv() => {
+            Some((poll_id, started, events)) = poll_loaded.recv() => {
+                // An older reading that took longer must not put its
+                // tally back over a newer one's.
+                if polls_as_of.get(&poll_id).is_some_and(|as_of| *as_of > started) {
+                    continue;
+                }
+                polls_as_of.insert(poll_id.clone(), started);
                 tracing::info!(poll_id, related_events = events.len(), "poll answers read");
                 watch.poll_loaded(&poll_id, &events);
             }
@@ -3498,14 +3551,11 @@ fn is_standard_poll_start(event: &AnySyncTimelineEvent) -> bool {
 
 /// Read every event that refers to a poll (its responses and end) from the
 /// server and hand them to the timeline task as raw JSON.
-async fn load_poll_events(
-    room: Room,
-    poll_id: String,
-    done: mpsc::UnboundedSender<(String, Vec<Value>)>,
-) {
+async fn load_poll_events(room: Room, poll_id: String, done: mpsc::UnboundedSender<PollLoaded>) {
     let Ok(event_id) = EventId::parse(&poll_id) else {
         return;
     };
+    let started = std::time::Instant::now();
     let mut events = Vec::new();
     let mut from = None;
     // Polls with thousands of votes are not a thing; cap the paging anyway.
@@ -3513,10 +3563,14 @@ async fn load_poll_events(
         let options = RelationsOptions {
             from: from.clone(),
             include_relations: IncludeRelations::RelationsOfType(RelationType::Reference),
+            // Not the server's own page size, which can be a handful.
+            limit: Some(100u32.into()),
             ..Default::default()
         };
+        // Half an answer is none: counting only what came before the
+        // network failed would show a poll with votes missing or none.
         let Ok(page) = room.relations(event_id.clone(), options).await else {
-            break;
+            return;
         };
         for event in &page.chunk {
             if let Ok(value) = serde_json::from_str::<Value>(event.raw().json().get()) {
@@ -3528,8 +3582,12 @@ async fn load_poll_events(
             None => break,
         }
     }
-    let _ = done.send((poll_id, events));
+    let _ = done.send((poll_id, started, events));
 }
+
+/// A poll's answers as read from the server, and when the reading began:
+/// of two readings under way, the later begun counts.
+type PollLoaded = (String, std::time::Instant, Vec<Value>);
 
 async fn fetch_preview(
     client: Client,

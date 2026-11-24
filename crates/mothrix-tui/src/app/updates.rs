@@ -84,6 +84,10 @@ impl App {
     }
 
     fn install_update(&mut self, available: Available) {
+        // Once: two installs would write and move the same files.
+        if self.updates.installing {
+            return;
+        }
         self.updates.installing = true;
         self.notice = Some(format!("Downloading mothrix {}…", available.version));
         self.effects.push(Effect::InstallUpdate(available));

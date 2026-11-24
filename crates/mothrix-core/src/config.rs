@@ -164,7 +164,11 @@ impl Config {
     /// An HTTP client for what is not Matrix (LanguageTool, downloads),
     /// through the proxy if there is one.
     pub fn http_client(&self) -> matrix_sdk::reqwest::Client {
-        let builder = matrix_sdk::reqwest::Client::builder();
+        // A server that stops answering must not keep a download or a
+        // grammar check waiting for ever.
+        let builder = matrix_sdk::reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(60));
         let builder = match self
             .proxy()
             .map(|proxy| matrix_sdk::reqwest::Proxy::all(&proxy))

@@ -469,7 +469,11 @@ async fn run() -> Result<()> {
             }
             init_logging(&paths);
             keep_private();
-            if let Ok(exe) = std::env::current_exe() {
+            // Only a build that installs updates has left such files;
+            // any other would delete a file of the user's by that name.
+            if build() == update::Build::Release
+                && let Ok(exe) = std::env::current_exe()
+            {
                 update::cleanup(&exe);
             }
             run_tui(clients, &paths).await
@@ -924,6 +928,41 @@ fn restart(version: &str, installed: update::Installed) {
     }
 }
 
+/// The signals that ask a program to end: SIGTERM and SIGHUP.
+struct EndSignals {
+    #[cfg(unix)]
+    signals: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+}
+
+impl EndSignals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                signals: signal(SignalKind::terminate())
+                    .and_then(|terminate| Ok((terminate, signal(SignalKind::hangup())?)))
+                    .ok(),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Comes back when one arrived; never, where there are none.
+    async fn next(&mut self) {
+        #[cfg(unix)]
+        if let Some((terminate, hangup)) = &mut self.signals {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = hangup.recv() => {}
+            }
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -1003,10 +1042,28 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
     )?;
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        default_panic(info);
+        // The screen's own thread: the program ends, on a terminal put
+        // right first. A task in the background that panics is caught by
+        // the runtime and the screen goes on: its terminal has to stay as
+        // it is, and the message goes to the log instead of over it.
+        if std::thread::current().name() == Some("main") {
+            restore_terminal();
+            default_panic(info);
+        } else {
+            tracing::error!("a background task panicked: {info}");
+        }
     }));
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut terminal = match Terminal::new(CrosstermBackend::new(stdout())) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            restore_terminal();
+            return Err(error.into());
+        }
+    };
+    // Asked to end from outside (the terminal's window closed, `kill`):
+    // as with a quit, drafts are saved and the terminal is put right.
+    let mut asked_to_end = EndSignals::new();
+    let mut ended = false;
 
     let mut events = EventStream::new();
     let mut clicks = notify::ClickReader::default();
@@ -1041,6 +1098,10 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
             }
 
             let commands = tokio::select! {
+                () = asked_to_end.next() => {
+                    ended = true;
+                    Vec::new()
+                }
                 event = events.next() => match event {
                     Some(Ok(event)) => {
                         let mut commands = Vec::new();
@@ -1119,7 +1180,7 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
                 }
             };
             // Carry out what the app asks for, in order.
-            let mut quit = false;
+            let mut quit = ended;
             let effects = commands.into_iter().map(Effect::Command).chain(app.take_effects());
             for effect in effects.collect::<Vec<_>>() {
                 match effect {

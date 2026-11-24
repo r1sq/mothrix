@@ -30,7 +30,12 @@ fn emit_version() {
 
 /// The commit to name, if this is not a clean build of the release's tag.
 fn commit(version: &str) -> Option<String> {
-    let hash = git(&["rev-parse", "--short", "HEAD"])?;
+    // Without git (a source archive, a checkout git refuses to read)
+    // nothing says this is the release's commit: not a build that may
+    // replace itself with one.
+    let Some(hash) = git(&["rev-parse", "--short", "HEAD"]) else {
+        return Some("no git".to_owned());
+    };
     let dirty = git(&["status", "--porcelain", "--untracked-files=no"])
         .is_some_and(|changes| !changes.is_empty());
     let tag = format!("v{version}");

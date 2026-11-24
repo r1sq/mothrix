@@ -112,7 +112,8 @@ pub async fn run(
 }
 
 fn show(tx: &mpsc::UnboundedSender<Update>, state: VerifyState) {
-    tracing::info!(?state, "verification progress");
+    // Not at a level the log keeps by default: the emoji are in it.
+    tracing::debug!(?state, "verification progress");
     let _ = tx.send(Update::Verify(Some(state)));
 }
 
