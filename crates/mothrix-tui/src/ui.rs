@@ -6,6 +6,7 @@
 use chrono::{Local, TimeZone};
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
@@ -78,6 +79,37 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_mentions(frame, app, composer);
     draw_status(frame, app, status);
     draw_overlays(frame, app, area);
+    scrub(frame.buffer_mut());
+}
+
+/// Take out of the finished screen what would not be shown but obeyed.
+/// Names, messages, topics and link previews are other people's text, and
+/// ratatui hands a control character in them to the terminal as it is: an
+/// escape sequence in a room's name could then write the clipboard or
+/// answer as if typed. Bidi overrides go too, since they let a text show
+/// in another order than it has. This is the one place every text passes,
+/// whoever drew it.
+fn scrub(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        let symbol = cell.symbol();
+        if !symbol.contains(unsafe_on_screen) {
+            continue;
+        }
+        let kept: String = symbol.chars().filter(|c| !unsafe_on_screen(*c)).collect();
+        let shown = match (kept.is_empty(), symbol) {
+            (false, _) => kept,
+            // A tab or a line end is just space; the rest shows as unknown.
+            (true, "\t" | "\r" | "\n" | "\r\n") => " ".to_owned(),
+            (true, _) => "\u{fffd}".to_owned(),
+        };
+        cell.set_symbol(&shown);
+    }
+}
+
+/// Control characters (C0, C1, DEL) and the bidi embeddings, overrides and
+/// isolates.
+fn unsafe_on_screen(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// The dialogs and menus over the main screen, the one on top last. Each
@@ -2852,6 +2884,29 @@ mod tests {
         ]));
         app.state.accounts[0].sync = SyncStatus::Online;
         app
+    }
+
+    #[test]
+    fn control_characters_in_other_people_s_text_never_reach_the_terminal() {
+        let mut app = sample();
+        app.on_update(Update::Rooms(vec![RoomEntry {
+            id: "!evil".into(),
+            name: "Evil\u{1b}]52;c;aGk=\u{7}room\u{202e}".into(),
+            topic: "a\tb\rc\u{9b}31m".into(),
+            ..RoomEntry::default()
+        }]));
+        app.state.open_room = Some("!evil".into());
+        app.notice = Some("oops\u{1b}[2J".into());
+        let screen = render_to_text(&mut app, 100, 30);
+        assert!(screen.contains("Evil"), "{screen}");
+        assert!(
+            !screen.contains(|c: char| c != '\n' && unsafe_on_screen(c)),
+            "{screen:?}"
+        );
+        assert!(
+            screen.contains("a b c"),
+            "tabs and line ends are space: {screen}"
+        );
     }
 
     #[test]
