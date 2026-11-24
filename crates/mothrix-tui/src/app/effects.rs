@@ -70,13 +70,7 @@ impl App {
 
     /// Open a room because its notification was clicked.
     pub fn open_from_notification(&mut self, room: String) {
-        if !self.state.rooms.iter().any(|known| known.id == room) {
-            return;
-        }
-        let mut commands = Vec::new();
-        self.open(room, &mut commands);
-        self.effects
-            .extend(commands.into_iter().map(Effect::Command));
+        self.open_later(room);
     }
 }
 

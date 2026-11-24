@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use base64::Engine;
 use mothrix_core::{
     accounts::{self, Account, Frontend},
-    client_state::{ClientState, Opening},
+    client_state::{ClientState, Opening, Taken},
     config::{Config, Shown},
     emoji,
     matrix::{Command, PINNED_VIEW, Update},
@@ -756,13 +756,7 @@ impl View {
                     self.theme = found.clone();
                     self.state.config_dirty = true;
                     // Names take the new theme's colours.
-                    if let Some(room) = self.state.open_room.clone() {
-                        self.events.push(Event::Timeline {
-                            room,
-                            thread: self.state.open_thread.clone(),
-                            items: Message::of(&self.state.items, &self.theme),
-                        });
-                    }
+                    self.tell_items();
                 }
             }
             Action::Search { text, everywhere } => {
@@ -783,11 +777,8 @@ impl View {
             }
             Action::Reveal { .. } => {}
             Action::ShowHit { room, event_id } => {
-                let mut commands = if self.state.open_room.as_ref() == Some(&room) {
-                    self.act(Action::CloseThread)
-                } else {
-                    self.open(room)
-                };
+                // The open room again: out of its thread.
+                let mut commands = self.open(room);
                 if self.state.open_room.is_some() {
                     commands.push(Command::Reveal { event_id });
                 }
@@ -1108,26 +1099,30 @@ impl View {
     }
 
     fn close(&mut self) {
-        self.state.open_room = None;
-        self.state.open_thread = None;
-        self.state.items.clear();
+        self.state.close();
         self.pictures.clear();
     }
 
     fn open_thread(&mut self, root: String) -> Vec<Command> {
-        if self.state.open_room.is_none() || self.state.open_thread.as_ref() == Some(&root) {
+        if !self.state.enter_thread(&root) {
             return Vec::new();
         }
-        self.state.open_thread = Some(root.clone());
-        self.state.items.clear();
         vec![Command::OpenThread { event_id: root }]
+    }
+
+    /// The conversation shown, to the app.
+    fn tell_items(&mut self) {
+        if let Some(room) = self.state.open_room.clone() {
+            self.events.push(Event::Timeline {
+                room,
+                thread: self.state.open_thread.clone(),
+                items: Message::of(&self.state.items, &self.theme),
+            });
+        }
     }
 
     /// A click on a notification about this room.
     pub fn notification_clicked(&mut self, room: String) -> Vec<Command> {
-        if self.state.open_room.as_ref() == Some(&room) {
-            return self.act(Action::CloseThread);
-        }
         self.open(room)
     }
 
@@ -1196,9 +1191,9 @@ impl Frontend for View {
     }
 
     fn on_update(&mut self, update: Update) {
-        match update {
-            Update::Rooms(rooms) => {
-                for news in self.state.set_rooms(rooms) {
+        let update = match self.state.take(update) {
+            Taken::Rooms { news, show } => {
+                for news in news {
                     self.effects.push(Effect::Notify {
                         room: news.room,
                         title: news.title,
@@ -1207,44 +1202,60 @@ impl Frontend for View {
                 self.events.push(Event::Rooms {
                     rooms: self.state.rooms.clone(),
                 });
-                if let Some(room) = self.state.take_goto() {
+                if let Some(room) = show {
                     let commands = self.open(room);
                     self.later.extend(commands);
                 }
+                return;
             }
-            Update::Timeline { room_id, items }
-                if self.state.open_room.as_ref() == Some(&room_id)
-                    && self.state.open_thread.is_none() =>
-            {
-                self.state.items = items;
-                self.events.push(Event::Timeline {
-                    room: room_id,
-                    thread: None,
-                    items: Message::of(&self.state.items, &self.theme),
-                });
+            Taken::Show(room) => {
+                let commands = self.open(room);
+                self.later.extend(commands);
+                return;
             }
-            Update::Thread {
-                room_id,
-                root,
-                items,
-            } if self.state.open_room.as_ref() == Some(&room_id)
-                && self.state.open_thread.as_ref() == Some(&root) =>
-            {
-                self.state.items = items;
-                self.events.push(Event::Timeline {
-                    room: room_id,
-                    thread: Some(root),
-                    items: Message::of(&self.state.items, &self.theme),
-                });
+            // `take_events` says that the thread is left.
+            Taken::Items | Taken::LeftThread => return self.tell_items(),
+            Taken::Typing => {
+                if let Some(room) = self.state.open_room.clone() {
+                    self.events.push(Event::Typing {
+                        room,
+                        names: self.state.typing.clone(),
+                    });
+                }
+                return;
             }
-            Update::Typing { room_id, names }
-                if self.state.open_room.as_ref() == Some(&room_id) =>
-            {
-                self.events.push(Event::Typing {
-                    room: room_id,
-                    names,
-                });
+            Taken::Members => {
+                if let Some(room) = self.state.open_room.clone() {
+                    self.events.push(Event::Members {
+                        room,
+                        members: self.state.members.clone(),
+                    });
+                }
+                return;
             }
+            Taken::LinkPreview(url) => {
+                if let Some((title, description)) = self.state.link_previews.get(&url).cloned() {
+                    self.events.push(Event::LinkPreview {
+                        url,
+                        title,
+                        description,
+                    });
+                }
+                return;
+            }
+            Taken::Nothing => return,
+            Taken::Other(update) => update,
+        };
+        match update {
+            // Taken by the client state, above.
+            Update::Rooms(_)
+            | Update::GoTo(_)
+            | Update::Timeline { .. }
+            | Update::Thread { .. }
+            | Update::ThreadFailed { .. }
+            | Update::Typing { .. }
+            | Update::Members { .. }
+            | Update::LinkPreview { .. } => {}
             Update::Preview { event_id, preview } => {
                 if self.state.prefs.images != "off" && !preview.png.is_empty() {
                     let url = format!(
@@ -1255,43 +1266,13 @@ impl Frontend for View {
                     self.events.push(Event::Picture { event_id, url });
                 }
             }
-            Update::LinkPreview {
-                url,
-                title,
-                description,
-            } => {
-                self.state
-                    .link_previews
-                    .insert(url.clone(), (title.clone(), description.clone()));
-                self.events.push(Event::LinkPreview {
-                    url,
-                    title,
-                    description,
-                });
-            }
             Update::Verify(state) => {
                 self.verify = state.clone();
                 self.events.push(Event::Verify { state });
             }
             Update::RecoveryKey(key) => self.events.push(Event::RecoveryKey { key }),
             Update::RoomDetails(details) => self.events.push(Event::RoomDetails { details }),
-            Update::GoTo(room) => {
-                self.state.goto = Some(room);
-                if let Some(room) = self.state.take_goto() {
-                    let commands = self.open(room);
-                    self.later.extend(commands);
-                }
-            }
             Update::Notice(text) => self.notice(text),
-            Update::Members { room_id, members }
-                if self.state.open_room.as_ref() == Some(&room_id) =>
-            {
-                self.state.members = members.clone();
-                self.events.push(Event::Members {
-                    room: room_id,
-                    members,
-                });
-            }
             Update::SearchResults { query, hits } => {
                 self.events.push(Event::SearchResults { query, hits });
             }
@@ -1302,12 +1283,8 @@ impl Frontend for View {
             // Taken by `Accounts::deliver`: into the sections, on to the
             // account of the room a message is forwarded to.
             Update::Sections(_) | Update::ToForward { .. } => {}
+            // Not for the app: what the terminal pastes.
             Update::PastedImage(_) | Update::PastedText(_) => {}
-            // Not for the app: what the terminal pastes, other rooms' news.
-            Update::Timeline { .. }
-            | Update::Thread { .. }
-            | Update::Typing { .. }
-            | Update::Members { .. } => {}
             // `Accounts::deliver` takes these into the accounts.
             Update::OwnName(_) | Update::Sync(_) | Update::Verified(_) => {}
         }
@@ -1483,6 +1460,51 @@ mod tests {
             &view.act(Action::OpenPinned)[..],
             [Command::OpenThread { event_id }] if event_id == PINNED_VIEW
         ));
+    }
+
+    #[test]
+    fn a_thread_that_cannot_be_opened_leads_back_to_the_room() {
+        let mut view = view();
+        view.act(Action::Open { room: "!a".into() });
+        view.act(Action::OpenThread {
+            event_id: "$root".into(),
+        });
+        view.take_events();
+        view.on_update(Update::ThreadFailed {
+            room_id: "!a".into(),
+            root: "$root".into(),
+        });
+        assert!(view.take_events().contains(&Event::Opened {
+            room: Some("!a".into()),
+            thread: None
+        }));
+        // The room's conversation, which the account follows again.
+        view.on_update(Update::Timeline {
+            room_id: "!a".into(),
+            items: vec![item("room")],
+        });
+        assert_eq!(view.snapshot().items[0].item, item("room"));
+    }
+
+    #[test]
+    fn a_closed_room_leaves_no_members_or_writers_behind() {
+        let mut view = view();
+        view.act(Action::Open { room: "!a".into() });
+        view.on_update(Update::Typing {
+            room_id: "!a".into(),
+            names: vec!["Amy".into()],
+        });
+        view.on_update(Update::Members {
+            room_id: "!a".into(),
+            members: vec![mothrix_core::model::Member::default()],
+        });
+        assert_eq!(view.state.typing, ["Amy"]);
+        assert!(view.take_events().contains(&Event::Typing {
+            room: "!a".into(),
+            names: vec!["Amy".into()]
+        }));
+        view.act(Action::Close);
+        assert!(view.state.typing.is_empty() && view.state.members.is_empty());
     }
 
     #[test]

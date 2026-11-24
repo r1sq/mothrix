@@ -13,7 +13,7 @@ use std::{
 use crate::{
     accounts::Account,
     config::Shown,
-    matrix::Command,
+    matrix::{Command, Update},
     model::{Item, Member, RoomEntry},
     prefs::Prefs,
     sections::OwnSections,
@@ -55,6 +55,36 @@ impl Opening {
             Self::Opened { room, .. } => vec![Command::Open(room.clone())],
         }
     }
+}
+
+/// What an update did to the client state ([`ClientState::take`]).
+#[derive(Debug)]
+pub enum Taken {
+    /// The rooms are listed anew. `news`: the rooms to notify about;
+    /// `show`: a room that waited to be shown ([`ClientState::goto`]) and
+    /// is listed now.
+    Rooms {
+        news: Vec<Notification>,
+        show: Option<String>,
+    },
+    /// A room to show now: the account says to go there, and it is listed.
+    Show(String),
+    /// The conversation shown has other messages now.
+    Items,
+    /// Other people are writing in the open room.
+    Typing,
+    /// The open room's members are known (anew).
+    Members,
+    /// A link preview came in, for this address.
+    LinkPreview(String),
+    /// The thread shown could not be opened: the room's conversation is
+    /// shown again (the account went back to it by itself).
+    LeftThread,
+    /// It was about a room or thread that is not shown (any more), or a
+    /// room to go to that is not listed yet: nothing to show.
+    Nothing,
+    /// Not about the rooms and the conversation: for the front end.
+    Other(Update),
 }
 
 #[derive(Debug)]
@@ -195,14 +225,7 @@ impl ClientState {
             .open_room
             .as_ref()
             .and_then(|key| self.rooms.iter().find(|room| room.id == *key));
-        let closed = open.is_some_and(|room| room.account == account);
-        if closed {
-            self.open_room = None;
-            self.open_thread = None;
-            self.items.clear();
-            self.members.clear();
-            self.typing.clear();
-        }
+        let closed = open.is_some_and(|room| room.account == account) && self.close();
         self.accounts.remove(account);
         self.rooms.retain(|room| room.account != account);
         for room in &mut self.rooms {
@@ -239,6 +262,103 @@ impl ClientState {
         Opening::Opened {
             room: room.to_owned(),
             previous,
+        }
+    }
+
+    /// Show no room. Returns whether one was shown.
+    pub fn close(&mut self) -> bool {
+        self.open_thread = None;
+        self.items.clear();
+        self.members.clear();
+        self.typing.clear();
+        self.open_room.take().is_some()
+    }
+
+    /// Show the thread that starts at this message of the open room (or
+    /// [`crate::matrix::PINNED_VIEW`]), also from another thread. Returns
+    /// whether it is shown now and was not before
+    /// ([`Command::OpenThread`] then tells the account).
+    pub fn enter_thread(&mut self, root: &str) -> bool {
+        if self.open_room.is_none() || root.is_empty() || self.open_thread.as_deref() == Some(root)
+        {
+            return false;
+        }
+        self.open_thread = Some(root.to_owned());
+        self.items.clear();
+        true
+    }
+
+    /// Whether the open room's pinned messages are shown: nothing can be
+    /// written there.
+    pub fn pinned_view(&self) -> bool {
+        self.open_thread.as_deref() == Some(crate::matrix::PINNED_VIEW)
+    }
+
+    /// Take in what an account says about the rooms and the conversation
+    /// shown; news of rooms and threads that are not shown is dropped.
+    /// Everything else comes back as [`Taken::Other`].
+    pub fn take(&mut self, update: Update) -> Taken {
+        let shown = |state: &Self, room: &str| state.open_room.as_deref() == Some(room);
+        match update {
+            Update::Rooms(rooms) => {
+                let news = self.set_rooms(rooms);
+                Taken::Rooms {
+                    news,
+                    show: self.take_goto(),
+                }
+            }
+            Update::GoTo(room) => {
+                self.goto = Some(room);
+                self.take_goto().map_or(Taken::Nothing, Taken::Show)
+            }
+            Update::Timeline { room_id, items } => {
+                if !shown(self, &room_id) || self.open_thread.is_some() {
+                    return Taken::Nothing;
+                }
+                self.items = items;
+                Taken::Items
+            }
+            Update::Thread {
+                room_id,
+                root,
+                items,
+            } => {
+                if !shown(self, &room_id) || self.open_thread.as_deref() != Some(root.as_str()) {
+                    return Taken::Nothing;
+                }
+                self.items = items;
+                Taken::Items
+            }
+            Update::ThreadFailed { room_id, root } => {
+                if !shown(self, &room_id) || self.open_thread.as_deref() != Some(root.as_str()) {
+                    return Taken::Nothing;
+                }
+                self.leave_thread();
+                Taken::LeftThread
+            }
+            Update::Typing { room_id, names } => {
+                if !shown(self, &room_id) {
+                    return Taken::Nothing;
+                }
+                self.typing = names;
+                Taken::Typing
+            }
+            Update::Members { room_id, members } => {
+                if !shown(self, &room_id) {
+                    return Taken::Nothing;
+                }
+                self.members = members;
+                Taken::Members
+            }
+            Update::LinkPreview {
+                url,
+                title,
+                description,
+            } => {
+                self.link_previews.insert(url.clone(), (title, description));
+                Taken::LinkPreview(url)
+            }
+            other => Taken::Other(other),
         }
     }
 
@@ -434,5 +554,151 @@ mod tests {
         // Switched off.
         state.prefs.notifications = false;
         assert!(rooms(&mut state, &[("!a", 6), ("!b", 9)]).is_empty());
+    }
+
+    fn item(event_id: &str) -> Item {
+        Item {
+            event_id: event_id.into(),
+            ..Item::default()
+        }
+    }
+
+    fn timeline(room: &str, event_id: &str) -> Update {
+        Update::Timeline {
+            room_id: room.into(),
+            items: vec![item(event_id)],
+        }
+    }
+
+    fn thread(room: &str, root: &str, event_id: &str) -> Update {
+        Update::Thread {
+            room_id: room.into(),
+            root: root.into(),
+            items: vec![item(event_id)],
+        }
+    }
+
+    fn shown(state: &ClientState) -> Vec<&str> {
+        state
+            .items
+            .iter()
+            .map(|item| item.event_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn only_news_of_the_conversation_shown_is_taken() {
+        let mut state = two_accounts();
+        state.open("!a");
+        assert!(matches!(
+            state.take(timeline("!b", "$other")),
+            Taken::Nothing
+        ));
+        assert!(matches!(state.take(timeline("!a", "$one")), Taken::Items));
+        assert_eq!(shown(&state), ["$one"]);
+        // A thread that is not shown says nothing.
+        assert!(matches!(
+            state.take(thread("!a", "$root", "$reply")),
+            Taken::Nothing
+        ));
+
+        assert!(state.enter_thread("$root"));
+        assert!(shown(&state).is_empty());
+        // The room's own conversation waits while its thread is shown.
+        assert!(matches!(state.take(timeline("!a", "$two")), Taken::Nothing));
+        assert!(matches!(
+            state.take(thread("!a", "$else", "$reply")),
+            Taken::Nothing
+        ));
+        assert!(matches!(
+            state.take(thread("!a", "$root", "$reply")),
+            Taken::Items
+        ));
+        assert_eq!(shown(&state), ["$reply"]);
+
+        let typing = |room: &str| Update::Typing {
+            room_id: room.into(),
+            names: vec!["Amy".into()],
+        };
+        assert!(matches!(state.take(typing("!b")), Taken::Nothing));
+        assert!(matches!(state.take(typing("!a")), Taken::Typing));
+        assert_eq!(state.typing, ["Amy"]);
+        let members = |room: &str| Update::Members {
+            room_id: room.into(),
+            members: vec![Member::default()],
+        };
+        assert!(matches!(state.take(members("!b")), Taken::Nothing));
+        assert!(matches!(state.take(members("!a")), Taken::Members));
+        assert_eq!(state.members.len(), 1);
+    }
+
+    #[test]
+    fn closing_leaves_nothing_of_the_room() {
+        let mut state = two_accounts();
+        assert!(!state.close());
+        state.open("!a");
+        state.enter_thread("$root");
+        state.take(thread("!a", "$root", "$reply"));
+        state.typing = vec!["Amy".into()];
+        state.members = vec![Member::default()];
+        assert!(state.close());
+        assert_eq!((&state.open_room, &state.open_thread), (&None, &None));
+        assert!(state.items.is_empty() && state.members.is_empty() && state.typing.is_empty());
+    }
+
+    #[test]
+    fn a_thread_is_entered_from_the_room_or_another_thread() {
+        let mut state = two_accounts();
+        assert!(!state.enter_thread("$root"), "no room is open");
+        state.open("!a");
+        assert!(!state.enter_thread(""));
+        assert!(state.enter_thread("$root"));
+        assert!(!state.enter_thread("$root"), "it is shown already");
+        assert!(state.enter_thread(crate::matrix::PINNED_VIEW));
+        assert!(state.pinned_view());
+    }
+
+    #[test]
+    fn a_thread_that_could_not_be_opened_leads_back_to_the_room() {
+        let mut state = two_accounts();
+        state.open("!a");
+        state.enter_thread("$root");
+        let failed = |room: &str, root: &str| Update::ThreadFailed {
+            room_id: room.into(),
+            root: root.into(),
+        };
+        // About a thread left meanwhile: nothing.
+        assert!(matches!(state.take(failed("!a", "$else")), Taken::Nothing));
+        assert!(matches!(state.take(failed("!b", "$root")), Taken::Nothing));
+        assert!(matches!(
+            state.take(failed("!a", "$root")),
+            Taken::LeftThread
+        ));
+        assert_eq!(state.open_thread, None);
+        // The room's conversation, which the account went back to, shows.
+        assert!(matches!(state.take(timeline("!a", "$one")), Taken::Items));
+    }
+
+    #[test]
+    fn a_room_to_go_to_is_shown_once_it_is_listed() {
+        let mut state = two_accounts();
+        assert!(matches!(
+            state.take(Update::GoTo("!new".into())),
+            Taken::Nothing
+        ));
+        let listed = Update::Rooms(vec![room("!a", 0), room("!new", 0)]);
+        let Taken::Rooms { show, .. } = state.take(listed) else {
+            panic!("rooms");
+        };
+        assert_eq!(show.as_deref(), Some("!new"));
+        assert!(matches!(
+            state.take(Update::GoTo("!a".into())),
+            Taken::Show(room) if room == "!a"
+        ));
+        // What is not about rooms goes on to the front end.
+        assert!(matches!(
+            state.take(Update::Notice("hello".into())),
+            Taken::Other(Update::Notice(_))
+        ));
     }
 }

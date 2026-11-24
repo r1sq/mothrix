@@ -537,9 +537,8 @@ impl App {
         if self.overlays.take::<Search>().is_none() {
             return;
         }
-        if self.state.open_room.as_deref() != Some(room_id.as_str()) {
-            self.open(room_id, commands);
-        }
+        // The open room again: out of its thread, where the message is not.
+        self.open(room_id, commands);
         self.pending_reveal = Some(event_id.clone());
         self.notice = Some("Loading that message…".to_owned());
         commands.push(Command::Reveal { event_id });
@@ -1023,6 +1022,55 @@ mod tests {
             (app.state.prefs.images.as_str(), app.graphics),
             ("auto", Graphics::Kitty)
         );
+    }
+
+    #[test]
+    fn a_hit_in_the_open_room_leads_out_of_its_thread() {
+        let mut app = chat();
+        let mut commands = Vec::new();
+        app.enter_thread("$1".into(), &mut commands);
+        app.on_update(Update::Thread {
+            room_id: "!a".into(),
+            root: "$1".into(),
+            items: Vec::new(),
+        });
+        app.overlays.open(Search::default());
+        let mut commands = Vec::new();
+        app.open_hit("!a".into(), "$2".into(), &mut commands);
+        assert!(matches!(
+            &commands[..],
+            [Command::CloseThread, Command::Reveal { event_id }] if event_id == "$2"
+        ));
+        assert_eq!(app.state.open_thread, None);
+        // The room's conversation comes back, and the message is selected.
+        app.on_update(Update::Timeline {
+            room_id: "!a".into(),
+            items: vec![Item {
+                key: "$2".into(),
+                event_id: "$2".into(),
+                body: "second".into(),
+                ..Item::default()
+            }],
+        });
+        assert_eq!(app.selected.as_deref(), Some("$2"));
+        assert_eq!(app.notice, None);
+    }
+
+    #[test]
+    fn a_thread_that_cannot_be_opened_shows_the_room_again() {
+        let mut app = chat();
+        let mut commands = Vec::new();
+        app.enter_thread("$1".into(), &mut commands);
+        app.on_update(Update::ThreadFailed {
+            room_id: "!a".into(),
+            root: "$1".into(),
+        });
+        assert_eq!(app.state.open_thread, None);
+        app.on_update(Update::Timeline {
+            room_id: "!a".into(),
+            items: vec![Item::default()],
+        });
+        assert_eq!(app.state.items.len(), 1);
     }
 
     #[test]

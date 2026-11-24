@@ -15,7 +15,7 @@ use crossterm::event::{
 use ratatui::layout::{Position, Rect};
 
 use crate::{
-    client_state::Opening,
+    client_state::{Opening, Taken},
     input::Input,
     matrix::{Command, SyncStatus, Update},
     model::{Item, ItemKind, Member, Poll, PollFormat, Preview, RoomEntry, VerifyState},
@@ -615,14 +615,12 @@ impl App {
         self.reopen = last_room.filter(|id| !id.is_empty());
     }
 
-    /// Open the room we were told to go to, once it is in the list.
-    fn follow_goto(&mut self) {
-        if let Some(id) = self.state.take_goto() {
-            let mut commands = Vec::new();
-            self.open(id, &mut commands);
-            self.effects
-                .extend(commands.into_iter().map(Effect::Command));
-        }
+    /// Open a room outside a key press or click.
+    pub(crate) fn open_later(&mut self, room: String) {
+        let mut commands = Vec::new();
+        self.open(room, &mut commands);
+        self.effects
+            .extend(commands.into_iter().map(Effect::Command));
     }
 
     /// The Matrix id meant by what was typed after `/dm` or `/invite`: an
@@ -761,13 +759,10 @@ impl App {
 
     /// Read (and write in) the thread that starts at this message.
     pub(crate) fn enter_thread(&mut self, event_id: String, commands: &mut Vec<Command>) {
-        if self.state.open_room.is_none() || event_id.is_empty() || self.state.open_thread.is_some()
-        {
-            return;
+        if self.state.enter_thread(&event_id) {
+            self.reset_conversation();
+            commands.push(Command::OpenThread { event_id });
         }
-        self.reset_conversation();
-        self.state.open_thread = Some(event_id.clone());
-        commands.push(Command::OpenThread { event_id });
     }
 
     /// Back from a thread to the room's conversation.
@@ -1061,9 +1056,9 @@ impl App {
     }
 
     pub fn on_update(&mut self, update: Update) {
-        match update {
-            Update::Rooms(rooms) => {
-                for news in self.state.set_rooms(rooms) {
+        let update = match self.state.take(update) {
+            Taken::Rooms { news, show } => {
+                for news in news {
                     self.effects.push(Effect::Notify {
                         room: news.room,
                         title: news.title,
@@ -1074,53 +1069,41 @@ impl App {
                 if self.room_menu_rows().is_empty() {
                     self.overlays.close::<RoomMenu>();
                 }
-                self.follow_goto();
-                // Back into the room that was open last time.
-                if let Some(id) = self.reopen.clone()
-                    && self.state.open_room.is_none()
-                    && self.state.rooms.iter().any(|room| room.id == id)
-                {
-                    let mut commands = Vec::new();
-                    self.open(id, &mut commands);
-                    self.effects
-                        .extend(commands.into_iter().map(Effect::Command));
+                // A room we were told to go to; else back into the one
+                // that was open last time.
+                let reopen = self.reopen.clone().filter(|id| {
+                    self.state.open_room.is_none()
+                        && self.state.rooms.iter().any(|room| room.id == *id)
+                });
+                if let Some(room) = show.or(reopen) {
+                    self.open_later(room);
                 }
+                return;
             }
-            Update::Thread {
-                room_id,
-                root,
-                items,
-            } => {
-                if self.state.open_room.as_deref() == Some(room_id.as_str())
-                    && self.state.open_thread.as_deref() == Some(root.as_str())
-                {
-                    self.state.items = items;
-                    if self.selected.is_some() && self.selected_item().is_none() {
-                        self.clear_selection();
-                    }
-                    self.ask_link_previews();
+            Taken::Show(room) => return self.open_later(room),
+            Taken::Items => {
+                // The selected message may have been deleted meanwhile.
+                if self.selected.is_some() && self.selected_item().is_none() {
+                    self.clear_selection();
                 }
+                self.try_reveal();
+                self.ask_link_previews();
+                return;
             }
-            Update::LinkPreview {
-                url,
-                title,
-                description,
-            } => {
-                self.state.link_previews.insert(url, (title, description));
-            }
-            Update::Timeline { room_id, items } => {
-                if self.state.open_room.as_deref() == Some(room_id.as_str())
-                    && self.state.open_thread.is_none()
-                {
-                    self.state.items = items;
-                    // The selected message may have been deleted meanwhile.
-                    if self.selected.is_some() && self.selected_item().is_none() {
-                        self.clear_selection();
-                    }
-                    self.try_reveal();
-                    self.ask_link_previews();
-                }
-            }
+            Taken::LeftThread => return self.reset_conversation(),
+            Taken::Typing | Taken::Members | Taken::LinkPreview(_) | Taken::Nothing => return,
+            Taken::Other(update) => update,
+        };
+        match update {
+            // Taken by the client state, above.
+            Update::Rooms(_)
+            | Update::GoTo(_)
+            | Update::Timeline { .. }
+            | Update::Thread { .. }
+            | Update::ThreadFailed { .. }
+            | Update::Typing { .. }
+            | Update::Members { .. }
+            | Update::LinkPreview { .. } => {}
             Update::SearchResults { query, hits } => self.on_search_results(query, hits),
             Update::Reveal(event_id) => {
                 self.pending_reveal = Some(event_id);
@@ -1136,20 +1119,6 @@ impl App {
             Update::RecoveryKey(key) => {
                 self.notice = None;
                 self.overlays.open(RecoveryKey(key));
-            }
-            Update::GoTo(room_id) => {
-                self.state.goto = Some(room_id);
-                self.follow_goto();
-            }
-            Update::Typing { room_id, names } => {
-                if self.state.open_room.as_deref() == Some(room_id.as_str()) {
-                    self.state.typing = names;
-                }
-            }
-            Update::Members { room_id, members } => {
-                if self.state.open_room.as_deref() == Some(room_id.as_str()) {
-                    self.state.members = members;
-                }
             }
             Update::Preview {
                 event_id,
@@ -1541,7 +1510,7 @@ impl App {
     fn submit(&mut self, commands: &mut Vec<Command>) {
         // The pinned messages are for reading; a message typed there
         // would not land where it seems to.
-        let pinned_view = self.state.open_thread.as_deref() == Some(crate::matrix::PINNED_VIEW);
+        let pinned_view = self.state.pinned_view();
         if pinned_view && !self.composer.text().trim_start().starts_with('/') {
             self.notice = Some("Esc goes back to the room, where you can write.".to_owned());
             return;
@@ -1567,7 +1536,6 @@ impl App {
                     self.notice = Some("Open a room first.".to_owned());
                 }
                 "pins" => {
-                    self.leave_thread(commands);
                     self.enter_thread(crate::matrix::PINNED_VIEW.to_owned(), commands);
                 }
                 "info" | "invite" | "leave" if self.state.open_room.is_none() => {

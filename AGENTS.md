@@ -53,7 +53,7 @@ the TUI they are `crate::matrix` and so on, like its own.
 | File | What is in it |
 |------|---------------|
 | `accounts.rs` | several accounts at once: merges their updates, routes commands; `Frontend` is what it needs of a UI (its `ClientState`, `on_update`, two small hooks) |
-| `client_state.rs` | `ClientState`: what both front ends know about the accounts and rooms (each holds one as `state`), and what is decided on it alike: when to notify, which account a command goes to, swapping and signing out accounts, opening rooms and threads (`Opening`), goto, what the config file keeps (`shown`, `config_dirty`) |
+| `client_state.rs` | `ClientState`: what both front ends know about the accounts and rooms (each holds one as `state`), and what is decided on it alike: when to notify, which account a command goes to, swapping and signing out accounts, opening rooms and threads (`Opening`), closing, what an update changes of the conversation shown (`take`, `Taken`), goto, what the config file keeps (`shown`, `config_dirty`) |
 | `matrix.rs` | the backend of one account: login, sync, timelines, every `Command` |
 | `convert.rs` | timeline items of the SDK to `model::Item` |
 | `room_watch.rs` | decisions about the open room: read receipts, polls to read, pictures to fetch |

@@ -664,6 +664,12 @@ pub enum Update {
         root: String,
         items: Vec<Item>,
     },
+    /// The thread (or the pinned messages) asked for could not be opened:
+    /// the room's conversation is followed again.
+    ThreadFailed {
+        room_id: String,
+        root: String,
+    },
     /// What the homeserver found behind a web address; empty when it
     /// found nothing.
     LinkPreview {
@@ -793,6 +799,7 @@ impl Update {
             Self::Rooms(rooms) => rooms.iter_mut().map(|room| &mut room.id).collect(),
             Self::Timeline { room_id, .. }
             | Self::Thread { room_id, .. }
+            | Self::ThreadFailed { room_id, .. }
             | Self::GoTo(room_id)
             | Self::Typing { room_id, .. }
             | Self::Members { room_id, .. } => vec![room_id],
@@ -1723,6 +1730,10 @@ async fn handle(
                 Ok(thread) => thread,
                 // Back to the room rather than to nothing.
                 Err(error) => {
+                    let _ = tx.send(Update::ThreadFailed {
+                        room_id: current.room_id.clone(),
+                        root: event_id,
+                    });
                     *open = Some(open_timeline(current.room, View::Live, own_user_id, tx).await?);
                     return Err(error.context("could not open the thread"));
                 }

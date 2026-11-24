@@ -210,11 +210,7 @@ impl App {
     /// A room we left: nothing of it stays on screen.
     pub(crate) fn forget_room(&mut self, room_id: &str) {
         if self.state.open_room.as_deref() == Some(room_id) {
-            self.state.open_room = None;
-            self.state.open_thread = None;
-            self.state.items.clear();
-            self.state.members.clear();
-            self.state.typing.clear();
+            self.state.close();
             self.clear_selection();
             self.focus = super::Focus::Sidebar;
         }
