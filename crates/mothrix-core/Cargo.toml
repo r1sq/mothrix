@@ -31,8 +31,12 @@ ed25519-dalek.workspace = true
 sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
-keyring.workspace = true
 getrandom.workspace = true
+
+# Not on the iPhone: its store is shared with the app's extensions, which
+# could not read the passphrase.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+keyring.workspace = true
 
 [target."cfg(windows)".dependencies]
 tauri-winrt-notification = "0.8.1"

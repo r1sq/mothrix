@@ -21,13 +21,38 @@ use anyhow::{Context, Result, anyhow};
 pub const IN_KEYRING: &str = "keyring";
 
 /// The name all of mothrix's entries are kept under.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 const SERVICE: &str = "mothrix";
 
 /// The entry of the account kept in `data_dir`: one computer can hold
 /// several sets of accounts (another user's folders, a test's), so the
 /// folder names the entry, not the profile.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn entry(data_dir: &Path) -> Result<keyring::Entry> {
     keyring::Entry::new(SERVICE, &data_dir.to_string_lossy()).map_err(|error| anyhow!("{error}"))
+}
+
+/// Where mothrix uses no keyring (the iPhone: the app's extensions share
+/// the store and could not read the passphrase): there is no entry.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+fn entry(_data_dir: &Path) -> Result<NoEntry> {
+    Err(anyhow!("no keyring is used on this system"))
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+struct NoEntry;
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+impl NoEntry {
+    fn set_password(&self, _: &str) -> Result<(), String> {
+        Err(String::new())
+    }
+    fn get_password(&self) -> Result<String, String> {
+        Err(String::new())
+    }
+    fn delete_credential(&self) -> Result<(), String> {
+        Err(String::new())
+    }
 }
 
 /// A new passphrase: 32 random bytes, as text.

@@ -277,6 +277,18 @@ impl OwnSections {
     }
 }
 
+/// The running account a room key belongs to, and the room's id there;
+/// none for a room of an account that is not running (signed out, left
+/// out at this start): its keys wait in the sections, and are neither
+/// another account's to store on its server nor to take out.
+fn owner<'a>(prefixes: &[String], key: &'a str) -> Option<(usize, &'a str)> {
+    let (account, id) = split(prefixes, key);
+    let prefix = prefixes.get(account)?;
+    // `split` hands what fits no prefix to some account; a room id as it
+    // is belongs to the account without a prefix only.
+    (key.strip_prefix(prefix.as_str()) == Some(id) && id.starts_with('!')).then_some((account, id))
+}
+
 /// What of `sections` belongs to `account`: every section that holds its
 /// rooms, and the parent of each such subsection, in order, with only its
 /// rooms (as ids). Nothing else: a section that would hold nothing on a
@@ -291,7 +303,7 @@ pub fn share(sections: &[Section], prefixes: &[String], account: usize) -> Vec<S
                 .rooms
                 .iter()
                 .filter_map(|key| {
-                    let (owner, id) = split(prefixes, key);
+                    let (owner, id) = owner(prefixes, key)?;
                     (owner == account).then(|| id.to_owned())
                 })
                 .collect(),
@@ -315,7 +327,7 @@ pub fn share(sections: &[Section], prefixes: &[String], account: usize) -> Vec<S
 /// it.
 fn merge(sections: &mut Vec<Section>, prefixes: &[String], account: usize, theirs: &[Section]) {
     let prefix = prefixes.get(account).cloned().unwrap_or_default();
-    let mine = |key: &String| split(prefixes, key).0 == account;
+    let mine = |key: &String| owner(prefixes, key).is_some_and(|(owner, _)| owner == account);
     let had: Vec<String> = sections
         .iter()
         .filter(|section| section.rooms.iter().any(mine))
@@ -399,13 +411,29 @@ impl Sync {
         account: usize,
         stored: Option<Vec<Section>>,
     ) -> bool {
-        // An older write of ours coming back: the newer one stands.
+        // An older write of ours coming back: the newer one stands. Once
+        // back it is forgotten, with those before it: the same content
+        // coming later is another device's write, not an echo.
         if let Some(theirs) = &stored
-            && self.sent.last() != Some(theirs)
-            && self.sent.contains(theirs)
+            && let Some(at) = self.sent.iter().position(|sent| sent == theirs)
         {
-            return false;
+            let newest = at + 1 == self.sent.len();
+            self.sent.drain(..=at);
+            if !newest {
+                return false;
+            }
         }
+        // Only room ids: what an account stores is its server's word, and
+        // anything else could name another account's room here.
+        let stored = stored.map(|theirs| {
+            theirs
+                .into_iter()
+                .map(|mut section| {
+                    section.rooms.retain(|id| id.starts_with('!'));
+                    section
+                })
+                .collect::<Vec<_>>()
+        });
         let changed = match &stored {
             Some(theirs) if *theirs != share(sections, prefixes, account) => {
                 let before = sections.0.clone();
@@ -573,6 +601,40 @@ mod tests {
     }
 
     #[test]
+    fn rooms_of_an_account_that_is_not_running_are_nobody_else_s() {
+        // "work" signed out, or was left out at this start.
+        let only_default = vec![String::new()];
+        let sections = vec![
+            section("Team", &["!a", "work/!b"]),
+            section("Clients", &["work/!d"]),
+        ];
+        assert_eq!(
+            share(&sections, &only_default, 0),
+            [section("Team", &["!a"])]
+        );
+        // Nor are the default account's rooms the work account's, when
+        // only that one runs.
+        let only_work = vec!["work/".to_owned()];
+        assert_eq!(
+            share(&sections, &only_work, 0),
+            [section("Team", &["!b"]), section("Clients", &["!d"])]
+        );
+        // What the running account stores leaves the other's rooms alone,
+        // and names no room of another account.
+        let mut sync = Sync::default();
+        let mut own = OwnSections::new(sections);
+        let theirs = vec![section("Team", &["!a", "work/!x", "!new"])];
+        sync.heard(&mut own, &only_default, 0, Some(theirs));
+        assert_eq!(
+            own[..],
+            [
+                section("Team", &["work/!b", "!a", "!new"]),
+                section("Clients", &["work/!d"])
+            ]
+        );
+    }
+
+    #[test]
     fn hearing_what_changes_nothing_here_is_no_change() {
         // Another account's section stands between: nothing to adopt.
         let mut sync = Sync::default();
@@ -639,6 +701,22 @@ mod tests {
         // The sync brings the first write back after the second was sent.
         assert!(!sync.heard(&mut sections, &prefixes(), 0, Some(first)));
         assert_eq!(sections[..], [section("Team", &["!a", "!b"])]);
+    }
+
+    #[test]
+    fn what_another_device_writes_is_no_echo_though_we_wrote_the_same_once() {
+        let mut sync = Sync::default();
+        let mut sections = OwnSections::new(vec![section("Team", &["!a"])]);
+        sync.heard(&mut sections, &prefixes(), 0, None);
+        let first = sync.to_send(&sections, &prefixes(), 0).unwrap();
+        sections.assign("!b", Some("Team")).unwrap();
+        let second = sync.to_send(&sections, &prefixes(), 0).unwrap();
+        // Both come back, in order.
+        assert!(!sync.heard(&mut sections, &prefixes(), 0, Some(first.clone())));
+        assert!(!sync.heard(&mut sections, &prefixes(), 0, Some(second)));
+        // Later the phone takes !b out again: the same as our first write.
+        assert!(sync.heard(&mut sections, &prefixes(), 0, Some(first.clone())));
+        assert_eq!(sections[..], first[..]);
     }
 
     #[test]
