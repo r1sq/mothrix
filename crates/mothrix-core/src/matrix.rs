@@ -1142,7 +1142,6 @@ async fn run(
     let own_user_id: Option<OwnedUserId> = client.user_id().map(ToOwned::to_owned);
     let notifications = client.notification_settings().await;
     let mut rooms = Vector::new();
-    let mut open: Option<OpenRoom> = None;
     // Unread counters can change without the list itself changing order.
     let mut refresh = tokio::time::interval(Duration::from_secs(4));
 
@@ -1199,7 +1198,6 @@ async fn run(
             }
         });
     }
-    let mut verifying: Option<Verifying> = None;
     let mut verified: Option<bool> = None;
 
     // Responses to standard-format polls are not aggregated by the SDK;
@@ -1224,6 +1222,18 @@ async fn run(
             }
         }
     });
+
+    let (account, account_commands) = mpsc::unbounded_channel();
+    tokio::spawn(account_lane(client.clone(), account_commands, tx.clone()));
+    let mut session = Session {
+        client: client.clone(),
+        sync,
+        own_user_id,
+        open: None,
+        verifying: None,
+        tx: tx.clone(),
+        account,
+    };
 
     let mut gate = EmptyListGate::default();
     loop {
@@ -1254,21 +1264,22 @@ async fn run(
                 }
             }
             Some((room_id, poll_id)) = poll_events.recv() => {
-                if let Some(current) = open.as_ref().filter(|current| current.room_id == room_id) {
+                if let Some(current) = session.open.as_ref().filter(|current| current.room_id == room_id) {
                     let _ = current.nudge.send(Nudge::PollChanged(poll_id));
                 }
             }
             request = incoming.recv() => {
                 // A request nobody answered yet makes way for a newer one
                 // (what is left over from an earlier run comes first).
-                let busy = verifying
+                let busy = session
+                    .verifying
                     .as_ref()
                     .is_some_and(|running| !running.is_closed() && !running.is_unanswered());
                 // From another of our devices, or from another person.
                 if let Some(request) = request
                     && !busy
                 {
-                    verifying = Some(spawn_verification(&client, request, true, &tx));
+                    session.verifying = Some(spawn_verification(&client, request, true, &tx));
                 }
             }
             state = sync_state.next() => {
@@ -1284,17 +1295,17 @@ async fn run(
             command = rx.recv() => {
                 // The UI is gone: shut down.
                 let Some(command) = command else { break };
-                if let Err(error) = handle(command, &client, &sync, own_user_id.as_deref(), &mut open, &mut verifying, &tx).await {
+                if let Err(error) = session.handle(command).await {
                     let _ = tx.send(Update::Notice(format!("{error:#}")));
                 }
             }
         }
     }
 
-    if let Some(open) = open {
+    if let Some(open) = session.open {
         open.task.abort();
     }
-    sync.stop().await;
+    session.sync.stop().await;
     Ok(())
 }
 
@@ -1670,409 +1681,588 @@ async fn publish_rooms<R>(
     let _ = tx.send(Update::Rooms(out));
 }
 
-async fn handle(
-    command: Command,
+/// What the backend of one account keeps while it runs.
+struct Session {
+    client: Client,
+    sync: SyncService,
+    own_user_id: Option<OwnedUserId>,
+    /// The conversation followed: a room, and its timeline, a thread's or
+    /// its pinned messages'.
+    open: Option<OpenRoom>,
+    verifying: Option<Verifying>,
+    tx: mpsc::UnboundedSender<Update>,
+    /// Commands for [`account_lane`].
+    account: mpsc::UnboundedSender<Command>,
+}
+
+impl Session {
+    /// Carry out a command, or pass it on. Three kinds, by what they wait
+    /// for:
+    ///
+    /// - What uses or changes the conversation followed (open, send,
+    ///   react, …) is done here, in the order it was asked for. Messages
+    ///   go through the SDK's send queue, so this does not wait for the
+    ///   server, except to open a room (and to accept its invitation).
+    /// - What changes something on the server for a room by its id or for
+    ///   the account (invite, rename, join, key backup, …) goes to
+    ///   [`account_lane`]: in order among themselves, and however long the
+    ///   server takes, the room list and the conversation go on.
+    /// - What only looks something up (search, room details, a link's
+    ///   preview, a file, older messages) gets a task of its own.
+    ///
+    /// An error becomes a notice, whichever way.
+    async fn handle(&mut self, command: Command) -> Result<()> {
+        let Self {
+            client,
+            sync,
+            own_user_id,
+            open,
+            verifying,
+            tx,
+            account,
+        } = self;
+        let (client, sync, tx) = (&*client, &*sync, &*tx);
+        let own_user_id = own_user_id.as_deref();
+        match command {
+            Command::Close => {
+                if let Some(previous) = open.take() {
+                    previous.task.abort();
+                }
+            }
+            Command::Open(room_id) => {
+                if open
+                    .as_ref()
+                    .is_some_and(|current| current.room_id == room_id)
+                {
+                    return Ok(());
+                }
+                if let Some(previous) = open.take() {
+                    previous.task.abort();
+                }
+                let parsed = RoomId::parse(&room_id)?;
+                let room = client
+                    .get_room(&parsed)
+                    .ok_or_else(|| anyhow!("unknown room"))?;
+                if room.state() == RoomState::Invited {
+                    room.join()
+                        .await
+                        .context("could not accept the invitation")?;
+                }
+                // Ask the server for this room's full timeline, not just the
+                // latest event the room list needs.
+                sync.room_list_service()
+                    .set_room_subscriptions(&[&parsed])
+                    .await;
+                *open = Some(open_timeline(room, View::Live, own_user_id, tx).await?);
+            }
+            Command::Typing(typing) => {
+                if let Some(current) = open.as_ref() {
+                    // Not worth a message in the status bar if it fails.
+                    let _ = current.room.typing_notice(typing).await;
+                }
+            }
+            Command::OpenThread { event_id } => {
+                let current = open.take().ok_or_else(|| anyhow!("open a room first"))?;
+                current.task.abort();
+                let view = if event_id == PINNED_VIEW {
+                    View::Pinned
+                } else {
+                    View::Thread(EventId::parse(&event_id)?)
+                };
+                let room = current.room.clone();
+                *open = Some(match open_timeline(room, view, own_user_id, tx).await {
+                    Ok(thread) => thread,
+                    // Back to the room rather than to nothing.
+                    Err(error) => {
+                        let _ = tx.send(Update::ThreadFailed {
+                            room_id: current.room_id.clone(),
+                            root: event_id,
+                        });
+                        *open =
+                            Some(open_timeline(current.room, View::Live, own_user_id, tx).await?);
+                        return Err(error.context("could not open the thread"));
+                    }
+                });
+            }
+            Command::CloseThread => {
+                if let Some(current) = open.take() {
+                    current.task.abort();
+                    *open = Some(open_timeline(current.room, View::Live, own_user_id, tx).await?);
+                }
+            }
+            Command::Send {
+                room_id,
+                text,
+                mentions,
+            } => {
+                let current = open.as_ref().filter(|current| current.room_id == room_id);
+                let current = current.ok_or_else(|| anyhow!("that room is no longer open"))?;
+                let message = MessageParts::new(&text, &mentions);
+                current
+                    .timeline
+                    .send(message.into_content().into())
+                    .await
+                    .context("could not send the message")?;
+            }
+            Command::SendFile { path, caption } => {
+                let timeline = timeline_of(open)?;
+                let file = Attachment::prepare(&path, caption).await?;
+                let _ = tx.send(Update::Notice(format!("Sending {}…", file.name)));
+                timeline
+                    .send_attachment(AttachmentSource::File(file.path), file.mime, file.config)
+                    .use_send_queue()
+                    .await
+                    .with_context(|| format!("could not send {}", file.name))?;
+            }
+            Command::SendVoice {
+                path,
+                duration_ms,
+                waveform,
+            } => {
+                let timeline = timeline_of(open)?;
+                let mut file = Attachment::prepare(&path, None).await?;
+                file.make_voice(duration_ms, waveform);
+                timeline
+                    .send_attachment(AttachmentSource::File(file.path), file.mime, file.config)
+                    .use_send_queue()
+                    .await
+                    .context("could not send the voice message")?;
+            }
+            Command::Search { query, room_id } => {
+                let client = client.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let room = room_id.as_deref().and_then(|id| RoomId::parse(id).ok());
+                    let hits = crate::search::search(&client, &query, room.as_deref()).await;
+                    let _ = tx.send(Update::SearchResults { query, hits });
+                });
+            }
+            Command::Reveal { event_id } => {
+                let timeline = Arc::clone(timeline_of(open)?);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let Ok(id) = EventId::parse(&event_id) else {
+                        return;
+                    };
+                    // Page back through history until the message turns up.
+                    for _ in 0..60 {
+                        if timeline.item_by_event_id(&id).await.is_some() {
+                            let _ = tx.send(Update::Reveal(event_id));
+                            return;
+                        }
+                        match timeline.paginate_backwards(100).await {
+                            Ok(false) => {}
+                            Ok(true) | Err(_) => break,
+                        }
+                    }
+                    let update = if timeline.item_by_event_id(&id).await.is_some() {
+                        Update::Reveal(event_id)
+                    } else {
+                        Update::Notice("That message could not be loaded here.".to_owned())
+                    };
+                    let _ = tx.send(update);
+                });
+            }
+            Command::PasteImage => {
+                let timeline = timeline_of(open)?;
+                let (bytes, mime_type) = tokio::task::spawn_blocking(read_clipboard_image)
+                    .await
+                    .context("could not read the clipboard")??;
+                let extension = mime_type.rsplit('/').next().unwrap_or("png");
+                let seconds = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or_default();
+                let filename = format!("pasted-{seconds}.{extension}");
+                let mime: mime::Mime = mime_type.parse().unwrap_or(mime::IMAGE_PNG);
+                timeline
+                    .send_attachment(
+                        AttachmentSource::Data { bytes, filename },
+                        mime,
+                        AttachmentConfig::default(),
+                    )
+                    .use_send_queue()
+                    .await
+                    .context("could not send the picture")?;
+            }
+            Command::ClipboardPaste => {
+                let clip = tokio::task::spawn_blocking(|| match read_clipboard_image() {
+                    Ok(image) => Ok(Ok(image)),
+                    Err(no_image) => read_clipboard_text().map(Err).ok_or(no_image),
+                })
+                .await
+                .context("could not read the clipboard")??;
+                match clip {
+                    Ok((bytes, mime_type)) => {
+                        let extension = mime_type.rsplit('/').next().unwrap_or("png");
+                        let seconds = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|elapsed| elapsed.as_secs())
+                            .unwrap_or_default();
+                        let dir = crate::folders::cache()
+                            .context("no cache directory on this system")?
+                            .join("pasted");
+                        std::fs::create_dir_all(&dir)?;
+                        let file = dir.join(format!("pasted-{seconds}.{extension}"));
+                        std::fs::write(&file, bytes)?;
+                        let _ = tx.send(Update::PastedImage(file.display().to_string()));
+                    }
+                    Err(text) => {
+                        let _ = tx.send(Update::PastedText(text));
+                    }
+                }
+            }
+            Command::VerifyStart => {
+                if verifying.as_ref().is_some_and(|inputs| !inputs.is_closed()) {
+                    bail!("a verification is already running");
+                }
+                let _ = tx.send(Update::Verify(Some(VerifyState::Waiting)));
+                match verify::request(client).await {
+                    Ok(request) => {
+                        *verifying = Some(spawn_verification(client, request, false, tx))
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Update::Verify(Some(VerifyState::Failed(format!(
+                            "{error:#}"
+                        )))));
+                    }
+                }
+            }
+            Command::VerifyUser { user_id } => {
+                if verifying.as_ref().is_some_and(|inputs| !inputs.is_closed()) {
+                    bail!("a verification is already running");
+                }
+                let user = parse_user(&user_id)?;
+                let _ = tx.send(Update::Verify(Some(VerifyState::Waiting)));
+                match verify::request_user(client, &user).await {
+                    Ok(request) => {
+                        *verifying = Some(spawn_verification(client, request, false, tx))
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Update::Verify(Some(VerifyState::Failed(format!(
+                            "{error:#}"
+                        )))));
+                    }
+                }
+            }
+            Command::Verify(input) => {
+                let delivered = verifying
+                    .as_ref()
+                    .is_some_and(|inputs| inputs.send(input).is_ok());
+                // Nothing is running any more (finished or failed): this just
+                // dismisses the dialog.
+                if !delivered {
+                    *verifying = None;
+                    let _ = tx.send(Update::Verify(None));
+                }
+            }
+            Command::Paginate => {
+                if let Some(current) = open.as_ref() {
+                    let timeline = Arc::clone(&current.timeline);
+                    tokio::spawn(async move {
+                        let _ = timeline.paginate_backwards(40).await;
+                    });
+                }
+            }
+            Command::Vote {
+                poll_event_id,
+                answers,
+                format,
+            } => {
+                let timeline = timeline_of(open)?;
+                // Answer in the format the poll was asked in.
+                match format {
+                    PollFormat::Unstable => {
+                        let content = UnstablePollResponseEventContent::new(
+                            answers,
+                            EventId::parse(&poll_event_id)?,
+                        );
+                        timeline
+                            .send(AnyMessageLikeEventContent::UnstablePollResponse(content))
+                            .await
+                            .context("could not send the vote")?;
+                    }
+                    // These go out as raw JSON: the SDK's types cannot express
+                    // the layouts other clients use.
+                    PollFormat::Standard | PollFormat::Mixed => {
+                        let (event_type, content) =
+                            stable_polls::response_event(format, &poll_event_id, &answers);
+                        timeline
+                            .room()
+                            .send_raw(event_type, content)
+                            .await
+                            .context("could not send the vote")?;
+                    }
+                }
+            }
+            Command::Reply {
+                event_id,
+                text,
+                mentions,
+            } => {
+                let content = MessageParts::new(&text, &mentions).into_content_without_relation();
+                timeline_of(open)?
+                    .send_reply(content, EventId::parse(&event_id)?)
+                    .await
+                    .context("could not send the reply")?;
+            }
+            Command::Edit {
+                event_id,
+                text,
+                mentions,
+            } => {
+                let content = MessageParts::new(&text, &mentions).into_content_without_relation();
+                timeline_of(open)?
+                    .edit(&item_id(&event_id)?, EditedContent::RoomMessage(content))
+                    .await
+                    .context("could not edit the message")?;
+            }
+            Command::Delete { event_id } => {
+                timeline_of(open)?
+                    .redact(&item_id(&event_id)?, None)
+                    .await
+                    .context("could not delete the message")?;
+            }
+            Command::React { event_id, key } => {
+                timeline_of(open)?
+                    .toggle_reaction(&item_id(&event_id)?, &key)
+                    .await
+                    .context("could not send the reaction")?;
+            }
+            Command::CreatePoll {
+                question,
+                answers,
+                multiple,
+                hidden,
+            } => {
+                let content = build_poll_start(&question, &answers, multiple, hidden)?;
+                timeline_of(open)?
+                    .send(AnyMessageLikeEventContent::UnstablePollStart(
+                        UnstablePollStartEventContent::New(content),
+                    ))
+                    .await
+                    .context("could not create the poll")?;
+            }
+            Command::EndPoll {
+                poll_event_id,
+                format,
+            } => {
+                let timeline = timeline_of(open)?;
+                let text = "The poll has ended.";
+                match format {
+                    PollFormat::Unstable => {
+                        let content =
+                            UnstablePollEndEventContent::new(text, EventId::parse(&poll_event_id)?);
+                        timeline
+                            .send(AnyMessageLikeEventContent::UnstablePollEnd(content))
+                            .await
+                            .context("could not end the poll")?;
+                    }
+                    PollFormat::Standard | PollFormat::Mixed => {
+                        let (event_type, content) =
+                            stable_polls::end_event(format, &poll_event_id, text);
+                        timeline
+                            .room()
+                            .send_raw(event_type, content)
+                            .await
+                            .context("could not end the poll")?;
+                    }
+                }
+            }
+            Command::TogglePin { event_id } => {
+                let current = open.as_ref().ok_or_else(|| anyhow!("open a room first"))?;
+                let id = EventId::parse(&event_id)?;
+                let pinned = current
+                    .room
+                    .pinned_event_ids()
+                    .is_some_and(|ids| ids.contains(&id));
+                let (room, tx, nudge) = (current.room.clone(), tx.clone(), current.nudge.clone());
+                // On its own, with a time limit: a server that never answers
+                // (seen with IServ) must not hold up the account's other commands.
+                tokio::spawn(async move {
+                    let change = async {
+                        if pinned {
+                            room.unpin_event(&id).await
+                        } else {
+                            room.pin_event(&id).await
+                        }
+                    };
+                    let notice = match tokio::time::timeout(Duration::from_secs(20), change).await {
+                        Ok(Ok(_)) if pinned => "Unpinned.".to_owned(),
+                        Ok(Ok(_)) => "Pinned for everyone in the room.".to_owned(),
+                        Ok(Err(error)) => {
+                            format!(
+                                "Could not change the pin (you may not be allowed to here): {error}"
+                            )
+                        }
+                        Err(_) => "The server did not answer the pin in 20 seconds.".to_owned(),
+                    };
+                    let _ = tx.send(Update::Notice(notice));
+                    // Show it once the server has confirmed.
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    let _ = nudge.send(Nudge::Republish);
+                });
+            }
+            Command::Forward { event_id, room_id } => {
+                let timeline = timeline_of(open)?;
+                let item = timeline
+                    .item_by_event_id(&EventId::parse(&event_id)?)
+                    .await
+                    .ok_or_else(|| anyhow!("that message is no longer loaded"))?;
+                let message = item
+                    .content()
+                    .as_message()
+                    .ok_or_else(|| anyhow!("only messages and files can be forwarded"))?;
+                // The same content (for files: the same upload), without the
+                // reply or thread it belonged to.
+                let msgtype = message.msgtype();
+                let _ = tx.send(Update::ToForward {
+                    to: room_id,
+                    content: serde_json::to_string(msgtype)?,
+                    encrypted_file: holds_encrypted_file(msgtype),
+                });
+            }
+            Command::PreviewLink(url) => {
+                let client = client.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let data = client
+                        .media()
+                        .get_media_preview(&url, None)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok())
+                        .unwrap_or_default();
+                    let text = |key: &str| {
+                        data[key]
+                            .as_str()
+                            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                            .unwrap_or_default()
+                    };
+                    let _ = tx.send(Update::LinkPreview {
+                        title: text("og:title"),
+                        description: text("og:description"),
+                        url,
+                    });
+                });
+            }
+            Command::StopAudio => {
+                let notice = if stop_audio() {
+                    "Stopped."
+                } else {
+                    "Nothing is playing."
+                };
+                let _ = tx.send(Update::Notice(notice.to_owned()));
+            }
+            Command::OpenLink(address) => {
+                // Only what a browser or mail program is meant to get.
+                if !desktop_opens(&address) {
+                    bail!("mothrix does not open this kind of address");
+                }
+                open_with_desktop(address.as_ref()).context("could not start the browser")?;
+                let _ = tx.send(Update::Notice(format!("Opened {address}")));
+            }
+            Command::OpenMedia { event_id } => {
+                let timeline = Arc::clone(timeline_of(open)?);
+                let client = client.clone();
+                let tx = tx.clone();
+                // Downloads can take a while; do not hold up other commands.
+                tokio::spawn(async move {
+                    let update = match open_media(&client, &timeline, &event_id).await {
+                        Ok((path, _))
+                            if HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed) =>
+                        {
+                            Update::MediaFile {
+                                event_id,
+                                path: path.display().to_string(),
+                            }
+                        }
+                        Ok((_, true)) => Update::Notice("Playing; /stop ends it.".to_owned()),
+                        Ok((path, false)) => Update::Notice(format!("Opened {}", path.display())),
+                        Err(error) => Update::Notice(format!("{error:#}")),
+                    };
+                    let _ = tx.send(update);
+                });
+            }
+            Command::RoomDetails { room_id } => {
+                let room = room_of(client, &room_id)?;
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Update::RoomDetails(room_details(&room).await));
+                });
+            }
+            Command::MarkRead { room_id } => {
+                let room = room_of(client, &room_id)?;
+                tokio::spawn(async move { read_newest(&room).await });
+            }
+            Command::SetSections(sections) => {
+                let client = client.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = store_sections(&client, sections).await {
+                        let _ = tx.send(Update::Notice(format!(
+                            "Your sections could not be kept in the account: {error:#}"
+                        )));
+                    }
+                });
+            }
+            Command::Leave { room_id } => {
+                if open
+                    .as_ref()
+                    .is_some_and(|current| current.room_id == room_id)
+                    && let Some(current) = open.take()
+                {
+                    current.task.abort();
+                }
+                let _ = account.send(Command::Leave { room_id });
+            }
+            command @ (Command::SendForwarded { .. }
+            | Command::SetFavourite { .. }
+            | Command::SetLowPriority { .. }
+            | Command::SetNotify { .. }
+            | Command::Invite { .. }
+            | Command::Kick { .. }
+            | Command::Ban { .. }
+            | Command::SetRoomName { .. }
+            | Command::SetTopic { .. }
+            | Command::StartDm { .. }
+            | Command::CreateRoom { .. }
+            | Command::Join { .. }
+            | Command::Backup { .. }
+            | Command::ResetIdentity { .. }
+            | Command::SetPusher(_)
+            | Command::RemovePusher { .. }
+            | Command::Recover(_)) => {
+                let _ = account.send(command);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Carries out, one after the other, the commands that change something
+/// on the server for a room by its id or for the account
+/// ([`Session::handle`] says which). A server that takes its time (or a
+/// reset waiting to be approved in the browser) holds up only these.
+async fn account_lane(
+    client: Client,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    tx: mpsc::UnboundedSender<Update>,
+) {
+    while let Some(command) = commands.recv().await {
+        if let Err(error) = account_command(&client, command, &tx).await {
+            let _ = tx.send(Update::Notice(format!("{error:#}")));
+        }
+    }
+}
+
+async fn account_command(
     client: &Client,
-    sync: &SyncService,
-    own_user_id: Option<&UserId>,
-    open: &mut Option<OpenRoom>,
-    verifying: &mut Option<Verifying>,
+    command: Command,
     tx: &mpsc::UnboundedSender<Update>,
 ) -> Result<()> {
     match command {
-        Command::Close => {
-            if let Some(previous) = open.take() {
-                previous.task.abort();
-            }
-        }
-        Command::Open(room_id) => {
-            if open
-                .as_ref()
-                .is_some_and(|current| current.room_id == room_id)
-            {
-                return Ok(());
-            }
-            if let Some(previous) = open.take() {
-                previous.task.abort();
-            }
-            let parsed = RoomId::parse(&room_id)?;
-            let room = client
-                .get_room(&parsed)
-                .ok_or_else(|| anyhow!("unknown room"))?;
-            if room.state() == RoomState::Invited {
-                room.join()
-                    .await
-                    .context("could not accept the invitation")?;
-            }
-            // Ask the server for this room's full timeline, not just the
-            // latest event the room list needs.
-            sync.room_list_service()
-                .set_room_subscriptions(&[&parsed])
-                .await;
-            *open = Some(open_timeline(room, View::Live, own_user_id, tx).await?);
-        }
-        Command::Typing(typing) => {
-            if let Some(current) = open.as_ref() {
-                // Not worth a message in the status bar if it fails.
-                let _ = current.room.typing_notice(typing).await;
-            }
-        }
-        Command::OpenThread { event_id } => {
-            let current = open.take().ok_or_else(|| anyhow!("open a room first"))?;
-            current.task.abort();
-            let view = if event_id == PINNED_VIEW {
-                View::Pinned
-            } else {
-                View::Thread(EventId::parse(&event_id)?)
-            };
-            let room = current.room.clone();
-            *open = Some(match open_timeline(room, view, own_user_id, tx).await {
-                Ok(thread) => thread,
-                // Back to the room rather than to nothing.
-                Err(error) => {
-                    let _ = tx.send(Update::ThreadFailed {
-                        room_id: current.room_id.clone(),
-                        root: event_id,
-                    });
-                    *open = Some(open_timeline(current.room, View::Live, own_user_id, tx).await?);
-                    return Err(error.context("could not open the thread"));
-                }
-            });
-        }
-        Command::CloseThread => {
-            if let Some(current) = open.take() {
-                current.task.abort();
-                *open = Some(open_timeline(current.room, View::Live, own_user_id, tx).await?);
-            }
-        }
-        Command::Send {
-            room_id,
-            text,
-            mentions,
-        } => {
-            let current = open.as_ref().filter(|current| current.room_id == room_id);
-            let current = current.ok_or_else(|| anyhow!("that room is no longer open"))?;
-            let message = MessageParts::new(&text, &mentions);
-            current
-                .timeline
-                .send(message.into_content().into())
-                .await
-                .context("could not send the message")?;
-        }
-        Command::SendFile { path, caption } => {
-            let timeline = timeline_of(open)?;
-            let file = Attachment::prepare(&path, caption).await?;
-            let _ = tx.send(Update::Notice(format!("Sending {}…", file.name)));
-            timeline
-                .send_attachment(AttachmentSource::File(file.path), file.mime, file.config)
-                .use_send_queue()
-                .await
-                .with_context(|| format!("could not send {}", file.name))?;
-        }
-        Command::SendVoice {
-            path,
-            duration_ms,
-            waveform,
-        } => {
-            let timeline = timeline_of(open)?;
-            let mut file = Attachment::prepare(&path, None).await?;
-            file.make_voice(duration_ms, waveform);
-            timeline
-                .send_attachment(AttachmentSource::File(file.path), file.mime, file.config)
-                .use_send_queue()
-                .await
-                .context("could not send the voice message")?;
-        }
-        Command::Search { query, room_id } => {
-            let client = client.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let room = room_id.as_deref().and_then(|id| RoomId::parse(id).ok());
-                let hits = crate::search::search(&client, &query, room.as_deref()).await;
-                let _ = tx.send(Update::SearchResults { query, hits });
-            });
-        }
-        Command::Reveal { event_id } => {
-            let timeline = Arc::clone(timeline_of(open)?);
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let Ok(id) = EventId::parse(&event_id) else {
-                    return;
-                };
-                // Page back through history until the message turns up.
-                for _ in 0..60 {
-                    if timeline.item_by_event_id(&id).await.is_some() {
-                        let _ = tx.send(Update::Reveal(event_id));
-                        return;
-                    }
-                    match timeline.paginate_backwards(100).await {
-                        Ok(false) => {}
-                        Ok(true) | Err(_) => break,
-                    }
-                }
-                let update = if timeline.item_by_event_id(&id).await.is_some() {
-                    Update::Reveal(event_id)
-                } else {
-                    Update::Notice("That message could not be loaded here.".to_owned())
-                };
-                let _ = tx.send(update);
-            });
-        }
-        Command::PasteImage => {
-            let timeline = timeline_of(open)?;
-            let (bytes, mime_type) = tokio::task::spawn_blocking(read_clipboard_image)
-                .await
-                .context("could not read the clipboard")??;
-            let extension = mime_type.rsplit('/').next().unwrap_or("png");
-            let seconds = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or_default();
-            let filename = format!("pasted-{seconds}.{extension}");
-            let mime: mime::Mime = mime_type.parse().unwrap_or(mime::IMAGE_PNG);
-            timeline
-                .send_attachment(
-                    AttachmentSource::Data { bytes, filename },
-                    mime,
-                    AttachmentConfig::default(),
-                )
-                .use_send_queue()
-                .await
-                .context("could not send the picture")?;
-        }
-        Command::ClipboardPaste => {
-            let clip = tokio::task::spawn_blocking(|| match read_clipboard_image() {
-                Ok(image) => Ok(Ok(image)),
-                Err(no_image) => read_clipboard_text().map(Err).ok_or(no_image),
-            })
-            .await
-            .context("could not read the clipboard")??;
-            match clip {
-                Ok((bytes, mime_type)) => {
-                    let extension = mime_type.rsplit('/').next().unwrap_or("png");
-                    let seconds = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|elapsed| elapsed.as_secs())
-                        .unwrap_or_default();
-                    let dir = crate::folders::cache()
-                        .context("no cache directory on this system")?
-                        .join("pasted");
-                    std::fs::create_dir_all(&dir)?;
-                    let file = dir.join(format!("pasted-{seconds}.{extension}"));
-                    std::fs::write(&file, bytes)?;
-                    let _ = tx.send(Update::PastedImage(file.display().to_string()));
-                }
-                Err(text) => {
-                    let _ = tx.send(Update::PastedText(text));
-                }
-            }
-        }
-        Command::VerifyStart => {
-            if verifying.as_ref().is_some_and(|inputs| !inputs.is_closed()) {
-                bail!("a verification is already running");
-            }
-            let _ = tx.send(Update::Verify(Some(VerifyState::Waiting)));
-            match verify::request(client).await {
-                Ok(request) => *verifying = Some(spawn_verification(client, request, false, tx)),
-                Err(error) => {
-                    let _ = tx.send(Update::Verify(Some(VerifyState::Failed(format!(
-                        "{error:#}"
-                    )))));
-                }
-            }
-        }
-        Command::VerifyUser { user_id } => {
-            if verifying.as_ref().is_some_and(|inputs| !inputs.is_closed()) {
-                bail!("a verification is already running");
-            }
-            let user = parse_user(&user_id)?;
-            let _ = tx.send(Update::Verify(Some(VerifyState::Waiting)));
-            match verify::request_user(client, &user).await {
-                Ok(request) => *verifying = Some(spawn_verification(client, request, false, tx)),
-                Err(error) => {
-                    let _ = tx.send(Update::Verify(Some(VerifyState::Failed(format!(
-                        "{error:#}"
-                    )))));
-                }
-            }
-        }
-        Command::Verify(input) => {
-            let delivered = verifying
-                .as_ref()
-                .is_some_and(|inputs| inputs.send(input).is_ok());
-            // Nothing is running any more (finished or failed): this just
-            // dismisses the dialog.
-            if !delivered {
-                *verifying = None;
-                let _ = tx.send(Update::Verify(None));
-            }
-        }
-        Command::Paginate => {
-            if let Some(current) = open.as_ref() {
-                let timeline = Arc::clone(&current.timeline);
-                tokio::spawn(async move {
-                    let _ = timeline.paginate_backwards(40).await;
-                });
-            }
-        }
-        Command::Vote {
-            poll_event_id,
-            answers,
-            format,
-        } => {
-            let timeline = timeline_of(open)?;
-            // Answer in the format the poll was asked in.
-            match format {
-                PollFormat::Unstable => {
-                    let content = UnstablePollResponseEventContent::new(
-                        answers,
-                        EventId::parse(&poll_event_id)?,
-                    );
-                    timeline
-                        .send(AnyMessageLikeEventContent::UnstablePollResponse(content))
-                        .await
-                        .context("could not send the vote")?;
-                }
-                // These go out as raw JSON: the SDK's types cannot express
-                // the layouts other clients use.
-                PollFormat::Standard | PollFormat::Mixed => {
-                    let (event_type, content) =
-                        stable_polls::response_event(format, &poll_event_id, &answers);
-                    timeline
-                        .room()
-                        .send_raw(event_type, content)
-                        .await
-                        .context("could not send the vote")?;
-                }
-            }
-        }
-        Command::Reply {
-            event_id,
-            text,
-            mentions,
-        } => {
-            let content = MessageParts::new(&text, &mentions).into_content_without_relation();
-            timeline_of(open)?
-                .send_reply(content, EventId::parse(&event_id)?)
-                .await
-                .context("could not send the reply")?;
-        }
-        Command::Edit {
-            event_id,
-            text,
-            mentions,
-        } => {
-            let content = MessageParts::new(&text, &mentions).into_content_without_relation();
-            timeline_of(open)?
-                .edit(&item_id(&event_id)?, EditedContent::RoomMessage(content))
-                .await
-                .context("could not edit the message")?;
-        }
-        Command::Delete { event_id } => {
-            timeline_of(open)?
-                .redact(&item_id(&event_id)?, None)
-                .await
-                .context("could not delete the message")?;
-        }
-        Command::React { event_id, key } => {
-            timeline_of(open)?
-                .toggle_reaction(&item_id(&event_id)?, &key)
-                .await
-                .context("could not send the reaction")?;
-        }
-        Command::CreatePoll {
-            question,
-            answers,
-            multiple,
-            hidden,
-        } => {
-            let content = build_poll_start(&question, &answers, multiple, hidden)?;
-            timeline_of(open)?
-                .send(AnyMessageLikeEventContent::UnstablePollStart(
-                    UnstablePollStartEventContent::New(content),
-                ))
-                .await
-                .context("could not create the poll")?;
-        }
-        Command::EndPoll {
-            poll_event_id,
-            format,
-        } => {
-            let timeline = timeline_of(open)?;
-            let text = "The poll has ended.";
-            match format {
-                PollFormat::Unstable => {
-                    let content =
-                        UnstablePollEndEventContent::new(text, EventId::parse(&poll_event_id)?);
-                    timeline
-                        .send(AnyMessageLikeEventContent::UnstablePollEnd(content))
-                        .await
-                        .context("could not end the poll")?;
-                }
-                PollFormat::Standard | PollFormat::Mixed => {
-                    let (event_type, content) =
-                        stable_polls::end_event(format, &poll_event_id, text);
-                    timeline
-                        .room()
-                        .send_raw(event_type, content)
-                        .await
-                        .context("could not end the poll")?;
-                }
-            }
-        }
-        Command::TogglePin { event_id } => {
-            let current = open.as_ref().ok_or_else(|| anyhow!("open a room first"))?;
-            let id = EventId::parse(&event_id)?;
-            let pinned = current
-                .room
-                .pinned_event_ids()
-                .is_some_and(|ids| ids.contains(&id));
-            let (room, tx, nudge) = (current.room.clone(), tx.clone(), current.nudge.clone());
-            // On its own, with a time limit: a server that never answers
-            // (seen with IServ) must not hold up the account's other commands.
-            tokio::spawn(async move {
-                let change = async {
-                    if pinned {
-                        room.unpin_event(&id).await
-                    } else {
-                        room.pin_event(&id).await
-                    }
-                };
-                let notice = match tokio::time::timeout(Duration::from_secs(20), change).await {
-                    Ok(Ok(_)) if pinned => "Unpinned.".to_owned(),
-                    Ok(Ok(_)) => "Pinned for everyone in the room.".to_owned(),
-                    Ok(Err(error)) => {
-                        format!(
-                            "Could not change the pin (you may not be allowed to here): {error}"
-                        )
-                    }
-                    Err(_) => "The server did not answer the pin in 20 seconds.".to_owned(),
-                };
-                let _ = tx.send(Update::Notice(notice));
-                // Show it once the server has confirmed.
-                tokio::time::sleep(Duration::from_millis(1200)).await;
-                let _ = nudge.send(Nudge::Republish);
-            });
-        }
-        Command::Forward { event_id, room_id } => {
-            let timeline = timeline_of(open)?;
-            let item = timeline
-                .item_by_event_id(&EventId::parse(&event_id)?)
-                .await
-                .ok_or_else(|| anyhow!("that message is no longer loaded"))?;
-            let message = item
-                .content()
-                .as_message()
-                .ok_or_else(|| anyhow!("only messages and files can be forwarded"))?;
-            // The same content (for files: the same upload), without the
-            // reply or thread it belonged to.
-            let msgtype = message.msgtype();
-            let _ = tx.send(Update::ToForward {
-                to: room_id,
-                content: serde_json::to_string(msgtype)?,
-                encrypted_file: holds_encrypted_file(msgtype),
-            });
-        }
         Command::SendForwarded {
             room_id,
             content,
@@ -2095,70 +2285,6 @@ async fn handle(
                 .map(|name| name.to_string())
                 .unwrap_or_default();
             let _ = tx.send(Update::Notice(format!("Forwarded to {name}.")));
-        }
-        Command::PreviewLink(url) => {
-            let client = client.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let data = client
-                    .media()
-                    .get_media_preview(&url, None)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|raw| serde_json::from_str::<Value>(raw.get()).ok())
-                    .unwrap_or_default();
-                let text = |key: &str| {
-                    data[key]
-                        .as_str()
-                        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
-                        .unwrap_or_default()
-                };
-                let _ = tx.send(Update::LinkPreview {
-                    title: text("og:title"),
-                    description: text("og:description"),
-                    url,
-                });
-            });
-        }
-        Command::StopAudio => {
-            let notice = if stop_audio() {
-                "Stopped."
-            } else {
-                "Nothing is playing."
-            };
-            let _ = tx.send(Update::Notice(notice.to_owned()));
-        }
-        Command::OpenLink(address) => {
-            // Only what a browser or mail program is meant to get.
-            if !["https://", "http://", "mailto:"]
-                .iter()
-                .any(|scheme| address.starts_with(scheme))
-            {
-                bail!("mothrix does not open this kind of address");
-            }
-            open_with_desktop(address.as_ref()).context("could not start the browser")?;
-            let _ = tx.send(Update::Notice(format!("Opened {address}")));
-        }
-        Command::OpenMedia { event_id } => {
-            let timeline = Arc::clone(timeline_of(open)?);
-            let client = client.clone();
-            let tx = tx.clone();
-            // Downloads can take a while; do not hold up other commands.
-            tokio::spawn(async move {
-                let update = match open_media(&client, &timeline, &event_id).await {
-                    Ok((path, _)) if HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed) => {
-                        Update::MediaFile {
-                            event_id,
-                            path: path.display().to_string(),
-                        }
-                    }
-                    Ok((_, true)) => Update::Notice("Playing; /stop ends it.".to_owned()),
-                    Ok((path, false)) => Update::Notice(format!("Opened {}", path.display())),
-                    Err(error) => Update::Notice(format!("{error:#}")),
-                };
-                let _ = tx.send(update);
-            });
         }
         Command::SetFavourite { room_id, value } => {
             let room = client
@@ -2184,13 +2310,6 @@ async fn handle(
                 Some(mode) => settings.set_room_notification_mode(&room_id, mode).await,
             }
             .context("could not change the notifications")?;
-        }
-        Command::RoomDetails { room_id } => {
-            let room = room_of(client, &room_id)?;
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(Update::RoomDetails(room_details(&room).await));
-            });
         }
         Command::Invite { room_id, user_id } => {
             let room = room_of(client, &room_id)?;
@@ -2233,22 +2352,6 @@ async fn handle(
                 .context("could not change the topic")?;
             refresh_details(room, tx);
         }
-        Command::MarkRead { room_id } => {
-            let room = room_of(client, &room_id)?;
-            tokio::spawn(async move { read_newest(&room).await });
-        }
-        Command::Leave { room_id } => {
-            let room = room_of(client, &room_id)?;
-            if open
-                .as_ref()
-                .is_some_and(|current| current.room_id == room_id)
-                && let Some(current) = open.take()
-            {
-                current.task.abort();
-            }
-            room.leave().await.context("could not leave the room")?;
-            let _ = tx.send(Update::Notice("Left the room.".to_owned()));
-        }
         Command::StartDm { user_id } => {
             let user = parse_user(&user_id)?;
             let room = match client.get_dm_room(&user) {
@@ -2289,26 +2392,18 @@ async fn handle(
         }
         Command::Backup { renew } => {
             let recovery = client.encryption().recovery();
-            match (recovery.state(), renew) {
-                (RecoveryState::Enabled, false) => {
-                    let _ = tx.send(Update::Notice(
-                        "Key backup is on. `/backup new` makes a new recovery key.".to_owned(),
-                    ));
+            match backup_step(recovery.state(), renew) {
+                BackupStep::Say(text) => {
+                    let _ = tx.send(Update::Notice(text.to_owned()));
                 }
-                (RecoveryState::Incomplete, false) => {
-                    let _ = tx.send(Update::Notice(
-                        "Key backup exists, but this device lacks its key: /recover <recovery key>, or /verify."
-                            .to_owned(),
-                    ));
-                }
-                (RecoveryState::Enabled | RecoveryState::Incomplete, true) => {
+                BackupStep::NewKey => {
                     let key = recovery
                         .reset_key()
                         .await
                         .context("could not make a new recovery key")?;
                     let _ = tx.send(Update::RecoveryKey(key));
                 }
-                (RecoveryState::Disabled | RecoveryState::Unknown, _) => {
+                BackupStep::SetUp => {
                     let _ = tx.send(Update::Notice("Setting up key backup…".to_owned()));
                     let key = recovery
                         .enable()
@@ -2369,17 +2464,6 @@ async fn handle(
             ));
             let _ = tx.send(Update::RecoveryKey(key));
         }
-        Command::SetSections(sections) => {
-            let client = client.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                if let Err(error) = store_sections(&client, sections).await {
-                    let _ = tx.send(Update::Notice(format!(
-                        "Your sections could not be kept in the account: {error:#}"
-                    )));
-                }
-            });
-        }
         Command::SetPusher(target) => {
             if let Err(error) = crate::push::add(client, &target).await {
                 let _ = tx.send(Update::Notice(format!(
@@ -2403,8 +2487,46 @@ async fn handle(
                 "Encryption recovery set up; old messages will decrypt as they load.".to_owned(),
             ));
         }
+        Command::Leave { room_id } => {
+            let room = room_of(client, &room_id)?;
+            room.leave().await.context("could not leave the room")?;
+            let _ = tx.send(Update::Notice("Left the room.".to_owned()));
+        }
+        // `Session::handle` keeps everything else.
+        other => bail!("not a command for the account's lane: {other:?}"),
     }
     Ok(())
+}
+
+/// Whether an address is one a browser or mail program is meant to get.
+fn desktop_opens(address: &str) -> bool {
+    ["https://", "http://", "mailto:"]
+        .iter()
+        .any(|scheme| address.starts_with(scheme))
+}
+
+/// What `/backup` (`renew`: `/backup new`) does about key backup.
+#[derive(Debug, PartialEq, Eq)]
+enum BackupStep {
+    /// Nothing; say this.
+    Say(&'static str),
+    /// Make a new recovery key for the backup there is.
+    NewKey,
+    /// Set key backup up, with its recovery key.
+    SetUp,
+}
+
+fn backup_step(state: RecoveryState, renew: bool) -> BackupStep {
+    match (state, renew) {
+        (RecoveryState::Enabled, false) => {
+            BackupStep::Say("Key backup is on. `/backup new` makes a new recovery key.")
+        }
+        (RecoveryState::Incomplete, false) => BackupStep::Say(
+            "Key backup exists, but this device lacks its key: /recover <recovery key>, or /verify.",
+        ),
+        (RecoveryState::Enabled | RecoveryState::Incomplete, true) => BackupStep::NewKey,
+        (RecoveryState::Disabled | RecoveryState::Unknown, _) => BackupStep::SetUp,
+    }
 }
 
 /// The verification that is running.
@@ -2765,6 +2887,25 @@ fn play_audio(path: &Path) -> bool {
 /// Download an attachment and open it. Returns where it was saved, and
 /// whether it is being played here (audio, with mpv) rather than handed
 /// to the desktop.
+/// A name for a downloaded file that stays inside the folder it is put
+/// in, whatever the sender called it.
+fn safe_file_name(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    match safe.trim_matches(|c| c == '.' || c == ' ') {
+        "" => "attachment".to_owned(),
+        safe => safe.to_owned(),
+    }
+}
+
 async fn open_media(
     client: &Client,
     timeline: &Timeline,
@@ -2798,23 +2939,11 @@ async fn open_media(
         .await
         .context("could not download the attachment")?;
 
-    // Never let a remote file name escape the cache directory.
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let safe = safe.trim_matches(|c| c == '.' || c == ' ');
     let dir = crate::folders::cache()
         .context("no cache directory")?
         .join("media");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(if safe.is_empty() { "attachment" } else { safe });
+    let path = dir.join(safe_file_name(&name));
     std::fs::write(&path, bytes)?;
 
     if HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2967,16 +3096,20 @@ async fn timeline_loop(
                 ));
             }
         }
-        if todo.mark_read {
-            let _ = timeline.mark_as_read(ReceiptType::Read).await;
+        // A receipt that did not go out is sent again with the next
+        // snapshot (the loop comes round with every change in the room).
+        if todo.mark_read && timeline.mark_as_read(ReceiptType::Read).await.is_err() {
+            watch.read_failed();
         }
         if let Some(newest) = todo
             .read_with_threads
             .and_then(|id| OwnedEventId::try_from(id).ok())
-        {
-            let _ = room
+            && room
                 .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, newest)
-                .await;
+                .await
+                .is_err()
+        {
+            watch.read_with_threads_failed();
         }
         if todo.clear_unread_flag && room.is_marked_unread() {
             let _ = room.set_unread_flag(false).await;
@@ -3251,9 +3384,10 @@ async fn publish_timeline(
 #[cfg(test)]
 mod tests {
     use super::{
-        EMPTY_LIST_GRACE, EmptyListGate, MessageParts, MessageType, Notify, build_poll_start,
-        holds_encrypted_file, mode_of, notify_of, pick_clipboard_image_type, server_from_input,
-        shape_of, unread_counts,
+        BackupStep, EMPTY_LIST_GRACE, EmptyListGate, MessageParts, MessageType, Notify,
+        RecoveryState, backup_step, build_poll_start, desktop_opens, holds_encrypted_file, mode_of,
+        notify_of, pick_clipboard_image_type, safe_file_name, server_from_input, shape_of,
+        unread_counts,
     };
 
     #[test]
@@ -3451,6 +3585,42 @@ mod tests {
         let parts = MessageParts::new("never mind", &[member("@amy:x.org", "Amy")]);
         assert!(parts.mentioned.is_empty());
         assert!(parts.html.is_none());
+    }
+
+    #[test]
+    fn a_downloaded_file_s_name_cannot_leave_its_folder() {
+        assert_eq!(safe_file_name("cat picture-1.png"), "cat picture-1.png");
+        assert_eq!(safe_file_name("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(safe_file_name("a\\b:c"), "a_b_c");
+        assert_eq!(safe_file_name(".bashrc"), "bashrc");
+        assert_eq!(safe_file_name(" .. "), "attachment");
+        assert_eq!(safe_file_name(""), "attachment");
+        assert_eq!(safe_file_name("grüße.txt"), "grüße.txt");
+    }
+
+    #[test]
+    fn only_web_and_mail_addresses_are_opened() {
+        assert!(desktop_opens("https://example.org/a"));
+        assert!(desktop_opens("http://example.org"));
+        assert!(desktop_opens("mailto:amy@example.org"));
+        assert!(!desktop_opens("file:///etc/passwd"));
+        assert!(!desktop_opens("javascript:alert(1)"));
+        assert!(!desktop_opens(" https://example.org"));
+        assert!(!desktop_opens("/usr/bin/true"));
+    }
+
+    #[test]
+    fn backup_is_set_up_once_and_renewed_only_when_asked() {
+        use RecoveryState::{Disabled, Enabled, Incomplete, Unknown};
+        assert!(matches!(backup_step(Enabled, false), BackupStep::Say(_)));
+        assert!(matches!(backup_step(Incomplete, false), BackupStep::Say(_)));
+        assert_ne!(backup_step(Enabled, false), backup_step(Incomplete, false));
+        assert_eq!(backup_step(Enabled, true), BackupStep::NewKey);
+        assert_eq!(backup_step(Incomplete, true), BackupStep::NewKey);
+        for renew in [false, true] {
+            assert_eq!(backup_step(Disabled, renew), BackupStep::SetUp);
+            assert_eq!(backup_step(Unknown, renew), BackupStep::SetUp);
+        }
     }
 
     #[test]

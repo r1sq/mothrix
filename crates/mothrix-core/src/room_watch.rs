@@ -142,6 +142,18 @@ impl RoomWatch {
         todo
     }
 
+    /// The receipt for the conversation shown ([`ToDo::mark_read`]) did
+    /// not go out: the next snapshot asks for it again.
+    pub fn read_failed(&mut self) {
+        self.last_read = None;
+    }
+
+    /// The receipt with threads ([`ToDo::read_with_threads`]) did not go
+    /// out: the next snapshot asks for it again.
+    pub fn read_with_threads_failed(&mut self) {
+        self.read_with_threads = None;
+    }
+
     /// The answers of a poll were read: count them anew.
     pub fn poll_loaded(&mut self, poll: &str, events: &[Value]) {
         if let Some(poll) = self.polls.get_mut(poll) {
@@ -171,6 +183,20 @@ mod tests {
                 .collect(),
             ..Seen::default()
         }
+    }
+
+    #[test]
+    fn a_receipt_that_did_not_go_out_is_sent_again() {
+        let mut watch = RoomWatch::new(true);
+        let snapshot = || seen("$2", &[(1, "$1"), (2, "$2")]);
+        assert!(watch.see(snapshot()).mark_read);
+        watch.read_failed();
+        let todo = watch.see(snapshot());
+        assert!(todo.mark_read && todo.read_with_threads.is_none());
+        watch.read_with_threads_failed();
+        let todo = watch.see(snapshot());
+        assert!(!todo.mark_read);
+        assert_eq!(todo.read_with_threads.as_deref(), Some("$2"));
     }
 
     #[test]

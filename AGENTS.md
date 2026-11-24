@@ -182,6 +182,14 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   second mothrix leaves that account out and says why. The iOS app and its
   notification extension do share a store: `matrix::share_stores` turns
   that lock off and the SDK's cross-process locks on.
+- **Where a command waits.** `Session::handle` (`matrix.rs`) lists every
+  `Command` and says which of three ways it goes: what uses or changes
+  the conversation followed is done in the backend's loop, in order;
+  what changes something on the server for a room by its id or for the
+  account (invite, rename, join, key backup, forwarding into a room)
+  goes to `account_lane`, in order among themselves, so that a slow
+  server holds up only these; lookups get a task each. A new command
+  has to be put into one of the three there.
 - **Two sync loops.** The SDK's `SyncService` runs the room list and
   encryption on separate connections. Answers the crypto layer queues
   after a message that arrived in a room (verification with another
