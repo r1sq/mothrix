@@ -48,16 +48,19 @@ To check a download by hand, compare its SHA-256 with `SHA256SUMS` or
   tree. The private half goes into the secret `RELEASE_SIGNING_KEY` of the
   GitHub environment `release`.
 - The approval, and who can reach the key, are settings on GitHub that
-  nothing in the repository enforces. To be made once, and looked at
-  again after any change of who has access:
-  - [ ] Environment `release`: **required reviewers** set.
-  - [ ] Environment `release`: **deployment branches and tags** limited
+  nothing in the repository enforces. As they were on 2026-11-24 (to be
+  looked at again after any change of who has access; `gh api
+  repos/r1sq/mothrix/environments/release`, `…/rulesets`,
+  `…/actions/permissions/workflow` show them):
+  - [x] Environment `release`: **required reviewers** set.
+  - [x] Environment `release`: **deployment branches and tags** limited
         to tags `v*` (else a pushed branch with a workflow of its own
         that names the environment could read the key).
-  - [ ] A **tag ruleset** for `v*`: who may create such tags, and no
-        moving or deleting them (a tag moved between build and approval
-        would be published with the earlier commit's files).
-  - [ ] Actions' default token permissions: read only.
+  - [x] A **tag ruleset** for `v*` ("release tags"): such a tag cannot
+        be moved or deleted (a tag moved between build and approval
+        would be published with the earlier commit's files). Who can
+        push can still create one.
+  - [x] Actions' default token permissions: read only.
 - `keygen` does not replace a public key that is in the tree: installed
   copies trust that one, and there is no way yet to move them to another.
 - A release is a pushed tag `vX.Y.Z` naming `Cargo.toml`'s version;
