@@ -22,20 +22,20 @@ final class NotificationService: UNNotificationServiceExtension {
         let content = (request.content.mutableCopy() as? UNMutableNotificationContent)
             ?? UNMutableNotificationContent()
         let info = request.content.userInfo
-        let unread = (info["unread_count"] as? NSNumber)?.intValue
         guard let roomId = info["room_id"] as? String,
               let eventId = info["event_id"] as? String
         else {
             // No message: the homeserver tells a new count (something was
             // read elsewhere). Only the app icon's number changes.
+            // The number on the app's icon is the app's: its unread rooms
+            // over all accounts. One server's count of messages is another
+            // number, and the two took turns there.
             let quiet = UNMutableNotificationContent()
-            if let unread { quiet.badge = NSNumber(value: unread) }
             begin(handler, quiet)
             return finish()
         }
-        if let unread {
-            content.badge = NSNumber(value: unread)
-        }
+        // (No badge from here, see above.)
+        content.badge = nil
         // Until the message is there, and if it never is: fixed words, not
         // the push's own (whoever sends pushes could write anything there),
         // no room for a tap or a reply to go to, and no Reply (it would

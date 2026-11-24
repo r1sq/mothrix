@@ -7,6 +7,8 @@ Everything the terminal client can do, by topic. Keys and commands are in
 
 - Invitations, pinned chats, rooms, direct chats and low-priority rooms,
   with unread and mention counts
+- An invitation is joined by opening it twice: the first time mothrix
+  says what it is; its menu's "Leave…" turns it down
 - Right-click a room or person for its menu: open, pin, move to a
   section, low priority, notifications
 - Pin a room or person to the top (the menu, or `p`); pins use the

@@ -319,6 +319,8 @@ pub struct App {
     pub drafts: HashMap<String, String>,
     /// The room to open again once it is listed (the one open last time).
     reopen: Option<String>,
+    /// The invitation the user was just asked about (see `open`).
+    invite_asked: Option<String>,
     /// Drafts or the open room changed; the main loop saves them.
     pub state_dirty: bool,
     /// Room id the sidebar cursor is on (keyboard navigation).
@@ -420,6 +422,7 @@ impl App {
             typing_told: String::new(),
             drafts: HashMap::new(),
             reopen: None,
+            invite_asked: None,
             state_dirty: false,
             cursor_room: None,
             sidebar_cursor_seen: None,
@@ -512,6 +515,26 @@ impl App {
     }
 
     fn open(&mut self, room_id: String, commands: &mut Vec<Command>) {
+        // An invitation: opening it accepts it, so the first time only
+        // asks. A slip of the hand on an invitation from a stranger would
+        // else join their room.
+        let invite = self
+            .state
+            .rooms
+            .iter()
+            .find(|room| room.id == room_id && room.is_invite)
+            .map(|room| room.name.clone());
+        if let Some(name) = invite
+            && self.invite_asked.as_deref() != Some(room_id.as_str())
+        {
+            self.notice = Some(format!(
+                "{name} is an invitation: Enter or a click again joins it; its menu (right click, m) has \"Leave\" to turn it down."
+            ));
+            self.cursor_room = Some(room_id.clone());
+            self.invite_asked = Some(room_id);
+            return;
+        }
+        self.invite_asked = None;
         let opening = self.state.open(&room_id);
         // Whoever was told we are writing in the room we leave hears that
         // we stopped, before the backend turns to the other room.
@@ -2407,6 +2430,34 @@ mod tests {
         assert_eq!(app.composer.text(), "half a");
         app.on_event(key(KeyCode::Left));
         assert!(app.take_commands().is_empty(), "nothing was typed");
+    }
+
+    #[test]
+    fn an_invitation_is_joined_only_when_opened_twice() {
+        let mut app = chat();
+        let mut rooms = app.state.rooms.clone();
+        rooms.push(RoomEntry {
+            id: "!party".into(),
+            name: "Party".into(),
+            is_invite: true,
+            ..RoomEntry::default()
+        });
+        app.on_update(Update::Rooms(rooms));
+        let mut commands = Vec::new();
+        app.open("!party".into(), &mut commands);
+        assert!(commands.is_empty(), "{commands:?}");
+        assert_eq!(app.state.open_room.as_deref(), Some("!a"));
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("invitation"))
+        );
+        app.open("!party".into(), &mut commands);
+        assert!(
+            matches!(&commands[..], [Command::Open { .. }, ..]),
+            "{commands:?}"
+        );
+        assert_eq!(app.state.open_room.as_deref(), Some("!party"));
     }
 
     #[test]
