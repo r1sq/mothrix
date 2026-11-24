@@ -1068,7 +1068,15 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
                         break;
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+                // A day by the clock on the wall: the timer alone stands
+                // still while a laptop sleeps.
+                let looked = std::time::SystemTime::now();
+                while looked
+                    .elapsed()
+                    .is_ok_and(|since| since < Duration::from_secs(24 * 60 * 60))
+                {
+                    tokio::time::sleep(Duration::from_secs(15 * 60)).await;
+                }
             }
         });
     }

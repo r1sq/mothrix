@@ -207,7 +207,13 @@ async fn watch_sections(client: Client, tx: mpsc::UnboundedSender<Update>) {
                 .flatten(),
         ),
     };
-    let _ = tx.send(Update::Sections(parse(&first)));
+    // What is there but cannot be read (a newer mothrix's form) is not
+    // "nothing stored": saying so would have this device write its own
+    // over it. Then the account does not speak, and nothing is sent to it.
+    let readable = |json: &Option<String>| json.is_none() || parse(json).is_some();
+    if readable(&first) {
+        let _ = tx.send(Update::Sections(parse(&first)));
+    }
     let mut last = first;
     let mut tick = tokio::time::interval(Duration::from_secs(4));
     loop {
@@ -224,8 +230,51 @@ async fn watch_sections(client: Client, tx: mpsc::UnboundedSender<Update>) {
                 .flatten(),
         );
         if now.is_some() && now != last {
-            let _ = tx.send(Update::Sections(parse(&now)));
+            if readable(&now) {
+                let _ = tx.send(Update::Sections(parse(&now)));
+            }
             last = now;
+        }
+    }
+}
+
+/// Write the account's sections into its account data, one write at a
+/// time and always the newest asked for: two changes in quick succession
+/// cannot reach the server the wrong way round, and one that did not get
+/// there (no network) is tried again, a few times and further apart,
+/// until a newer one takes its place.
+async fn keep_sections(
+    client: Client,
+    mut wanted: tokio::sync::watch::Receiver<Option<Vec<Section>>>,
+    tx: mpsc::UnboundedSender<Update>,
+) {
+    const WAITS: [u64; 5] = [5, 15, 60, 300, 900];
+    while wanted.changed().await.is_ok() {
+        let mut tries = 0;
+        loop {
+            let Some(sections) = wanted.borrow_and_update().clone() else {
+                break;
+            };
+            let Err(error) = store_sections(&client, sections).await else {
+                break;
+            };
+            let Some(wait) = WAITS.get(tries) else {
+                let _ = tx.send(Update::Notice(format!(
+                    "Your sections could not be kept in the account: {error:#}"
+                )));
+                break;
+            };
+            tries += 1;
+            // Again after a while, or at once with something newer.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(*wait)) => {}
+                changed = wanted.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    tries = 0;
+                }
+            }
         }
     }
 }
@@ -1334,6 +1383,12 @@ async fn run(
 
     let (account, account_commands) = mpsc::unbounded_channel();
     tokio::spawn(account_lane(client.clone(), account_commands, tx.clone()));
+    let (sections, sections_to_keep) = tokio::sync::watch::channel(None);
+    let _keeping = EndsWith(tokio::spawn(keep_sections(
+        client.clone(),
+        sections_to_keep,
+        tx.clone(),
+    )));
     let mut session = Session {
         client: client.clone(),
         sync,
@@ -1342,6 +1397,7 @@ async fn run(
         verifying: None,
         tx: tx.clone(),
         account,
+        sections,
     };
 
     let mut gate = EmptyListGate::default();
@@ -1808,6 +1864,8 @@ struct Session {
     tx: mpsc::UnboundedSender<Update>,
     /// Commands for [`account_lane`].
     account: mpsc::UnboundedSender<Command>,
+    /// The sections to keep in the account, for [`keep_sections`].
+    sections: tokio::sync::watch::Sender<Option<Vec<Section>>>,
 }
 
 impl Session {
@@ -1835,6 +1893,7 @@ impl Session {
             verifying,
             tx,
             account,
+            sections: sections_to_keep,
         } = self;
         let (client, sync, tx) = (&*client, &*sync, &*tx);
         let own_user_id = own_user_id.as_deref();
@@ -2339,15 +2398,7 @@ impl Session {
                 tokio::spawn(async move { read_newest(&room).await });
             }
             Command::SetSections(sections) => {
-                let client = client.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = store_sections(&client, sections).await {
-                        let _ = tx.send(Update::Notice(format!(
-                            "Your sections could not be kept in the account: {error:#}"
-                        )));
-                    }
-                });
+                let _ = sections_to_keep.send(Some(sections));
             }
             Command::Leave { room_id } => {
                 if open

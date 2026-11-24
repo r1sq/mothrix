@@ -272,7 +272,10 @@ impl Installed {
 
     /// Put the old program back.
     pub fn undo(self) -> Result<()> {
-        std::fs::remove_file(&self.exe)?;
+        // (Windows does not move a file over another.)
+        if cfg!(not(unix)) {
+            std::fs::remove_file(&self.exe)?;
+        }
         std::fs::rename(&self.old, &self.exe)?;
         Ok(())
     }
@@ -330,13 +333,25 @@ fn install_if(
         return Err(error);
     }
     let _ = std::fs::remove_file(&old);
-    if let Err(error) = std::fs::rename(exe, &old) {
+    // Where a file can take a running program's place in one step (not
+    // on Windows), there is no moment without a mothrix: the old one gets
+    // its second name first, then the new one moves over the first.
+    let aside = if cfg!(unix) {
+        std::fs::hard_link(exe, &old)
+    } else {
+        std::fs::rename(exe, &old)
+    };
+    if let Err(error) = aside {
         let _ = std::fs::remove_file(&new);
         return Err(describe(error, exe));
     }
     if let Err(error) = std::fs::rename(&new, exe) {
         // Whatever happens, mothrix must still be there next time.
-        std::fs::rename(&old, exe).context("could not put the old mothrix back")?;
+        if cfg!(unix) {
+            let _ = std::fs::remove_file(&old);
+        } else {
+            std::fs::rename(&old, exe).context("could not put the old mothrix back")?;
+        }
         let _ = std::fs::remove_file(&new);
         return Err(describe(error, exe));
     }

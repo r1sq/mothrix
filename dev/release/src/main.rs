@@ -59,6 +59,14 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 fn keygen(file: &Path) -> Result<()> {
+    // Every installed copy trusts the key that is there, and nothing
+    // signed with another: it is not replaced in passing.
+    if std::fs::read_to_string(PUBLIC_KEY_FILE).is_ok_and(|key| !key.trim().is_empty()) {
+        return Err(format!(
+            "{PUBLIC_KEY_FILE} holds a key already, which installed copies of mothrix trust. \
+             Empty that file first if a new key is really meant."
+        ));
+    }
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|error| format!("no randomness: {error}"))?;
     let key = SigningKey::from_bytes(&seed);
