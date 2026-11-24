@@ -19,6 +19,10 @@ _Avoid_: room id (for the key)
 **Open room**:
 The one room whose conversation is shown; at most one over all accounts.
 
+**Conversation**:
+What is shown of the open room: its own messages, those of one of its threads, or its pinned messages.
+_Avoid_: timeline (for what is shown), chat
+
 **Forwarding**:
 Sending a copy of a message into another room, of the same account or another one.
 
@@ -45,3 +49,8 @@ _Avoid_: UI (for one of them), frontend
 
 **Client state**:
 What both front ends know about the accounts and rooms (the open room, own sections, fold state, unread counts, when to notify), apart from how they show it.
+
+## The backend
+
+**Account lane**:
+Where an account's backend carries out, one after the other, the commands that change something on the server for a room or for the account itself, apart from the conversation and the room list.
