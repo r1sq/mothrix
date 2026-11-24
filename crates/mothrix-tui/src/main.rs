@@ -339,9 +339,25 @@ fn parse_args() -> Result<Option<Args>> {
     Ok(Some(Args { profile, mode }))
 }
 
+/// Close the folders with drafts and opened attachments to other users of
+/// this computer (older versions made them open), and delete the
+/// attachments opened more than a day ago.
+fn keep_private() {
+    use mothrix_core::folders;
+    if let Some(data) = folders::data() {
+        let _ = folders::private_dir(&data);
+    }
+    if let Some(cache) = folders::cache() {
+        let _ = folders::private_dir(&cache);
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        folders::sweep(&cache.join("media"), day);
+        folders::sweep(&cache.join("pasted"), day);
+    }
+}
+
 fn init_logging(paths: &Paths) {
     // The terminal belongs to the UI, so diagnostics go to a file.
-    let _ = std::fs::create_dir_all(&paths.data_dir);
+    let _ = mothrix_core::folders::private_dir(&paths.data_dir);
     if let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -452,6 +468,7 @@ async fn run() -> Result<()> {
                 clients.push((primary, client));
             }
             init_logging(&paths);
+            keep_private();
             if let Ok(exe) = std::env::current_exe() {
                 update::cleanup(&exe);
             }
@@ -610,7 +627,13 @@ fn user_of(client: &Client) -> String {
 }
 
 fn new_app(paths: &Paths, accounts: Vec<app::Account>) -> App {
-    let config = Config::load(&paths.config_file);
+    let read = Config::read(&paths.config_file);
+    let broken = read.as_ref().err().map(|error| {
+        format!(
+            "{error}. mothrix runs with its defaults and saves no settings until that is put right"
+        )
+    });
+    let config = read.unwrap_or_default();
     let (themes, mut problems) = config.custom_themes();
     theme::set_custom(themes);
     let (keymap, key_problems) = keys::keymap(&config.keys);
@@ -621,6 +644,9 @@ fn new_app(paths: &Paths, accounts: Vec<app::Account>) -> App {
     // One line is all the status bar has.
     if let Some(first) = problems.first() {
         app.notice = Some(format!("config.toml: {first}"));
+    }
+    if broken.is_some() {
+        app.notice = broken;
     }
     app.state.accounts = accounts;
     app.pictures.kitty_supported = kitty::supported();
@@ -665,13 +691,8 @@ fn save_state(app: &mut App) {
         drafts: drafts.into_iter().collect(),
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&state) {
-        let _ = std::fs::write(&file, bytes);
         // Drafts are private.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
-        }
+        let _ = mothrix_core::folders::write_private(&file, &bytes);
     }
 }
 
@@ -881,13 +902,9 @@ fn restart(version: &str, installed: update::Installed) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let error = std::env::current_exe()
-            .map(|exe| {
-                std::process::Command::new(exe)
-                    .args(std::env::args_os().skip(1))
-                    .exec()
-            })
-            .unwrap_or_else(|error| error);
+        let error = std::process::Command::new(installed.program())
+            .args(std::env::args_os().skip(1))
+            .exec();
         // Still here: it did not start. The old one goes back.
         let undone = installed.undo();
         eprintln!(
@@ -1149,7 +1166,11 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
                     Effect::SaveState => save_state(&mut app),
                     Effect::SaveConfig => {
                         let file = &paths.config_file;
-                        let _ = Config::load(file).updated(&app).save(file);
+                        // Never over a file with a mistake in it: that
+                        // would cost what the user wrote there.
+                        if let Ok(config) = Config::read(file) {
+                            let _ = config.updated(&app).save(file);
+                        }
                     }
                     Effect::Quit => quit = true,
                 }

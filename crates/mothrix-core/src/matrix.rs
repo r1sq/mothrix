@@ -240,6 +240,45 @@ async fn store_sections(client: &Client, sections: Vec<Section>) -> Result<()> {
     Ok(())
 }
 
+/// The profiles this process holds, each with its open, locked file.
+static HELD: std::sync::Mutex<Vec<(PathBuf, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
+
+/// The lock's file in a profile's folder.
+const LOCK: &str = "lock";
+
+/// Delete what a profile keeps on this computer: session, store, log.
+/// Its lock file stays (empty, in an otherwise empty folder): the lock is
+/// on the file, and with the file gone this process would go on holding
+/// nothing while another one locks a new file and opens the same account.
+fn forget(paths: &Paths) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(&paths.data_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name() == LOCK {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Let go of a profile this process no longer uses (signed out, or the
+/// sign-in failed), so that another mothrix can take it.
+fn release(paths: &Paths) {
+    let path = paths.data_dir.join(LOCK);
+    HELD.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(known, _)| *known != path);
+}
+
 /// Keep other mothrix processes away from a profile while this one uses
 /// it: two at once on one store would mix up its encryption keys. Held
 /// until the process ends. Not when stores are shared ([`share_stores`]).
@@ -247,14 +286,12 @@ fn hold(paths: &Paths) -> Result<()> {
     if SHARED_AS.get().is_some() {
         return Ok(());
     }
-    static HELD: std::sync::Mutex<Vec<(PathBuf, std::fs::File)>> =
-        std::sync::Mutex::new(Vec::new());
     let mut held = HELD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = paths.data_dir.join("lock");
+    let path = paths.data_dir.join(LOCK);
     if held.iter().any(|(known, _)| *known == path) {
         return Ok(());
     }
-    std::fs::create_dir_all(&paths.data_dir)?;
+    crate::folders::private_dir(&paths.data_dir)?;
     let file = std::fs::File::options()
         .create(true)
         .truncate(false)
@@ -296,7 +333,7 @@ async fn build_client(paths: &Paths, homeserver: &str) -> Result<Client> {
         None => builder,
     };
     // Networks without a direct way out (school labs) have a proxy.
-    let builder = match crate::config::Config::load(&paths.config_file).proxy() {
+    let builder = match crate::config::Config::read(&paths.config_file)?.proxy() {
         Some(proxy) => builder.proxy(proxy),
         None => builder,
     };
@@ -337,15 +374,9 @@ fn save_session(paths: &Paths, client: &Client) -> Result<()> {
         homeserver: client.homeserver().to_string(),
         session,
     };
-    std::fs::create_dir_all(&paths.data_dir)?;
-    let file = paths.session_file();
-    std::fs::write(&file, serde_json::to_vec_pretty(&stored)?)?;
+    crate::folders::private_dir(&paths.data_dir)?;
     // The file holds the access token: owner-only.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
-    }
+    crate::folders::write_private(&paths.session_file(), &serde_json::to_vec_pretty(&stored)?)?;
     Ok(())
 }
 
@@ -370,18 +401,26 @@ pub async fn restore(paths: &Paths) -> Result<Option<Client>> {
 /// Sign a running account out and delete what it kept on this computer.
 pub async fn sign_out(client: Client, paths: Paths) {
     let _ = client.matrix_auth().logout().await;
-    let _ = std::fs::remove_dir_all(&paths.data_dir);
+    // The client first: it has the store's files open.
+    drop(client);
+    let _ = forget(&paths);
+    release(&paths);
 }
 
 /// Remove the saved session and local store (does not sign the device out
-/// server-side when the server is unreachable).
+/// server-side when the server is unreachable). Not while another mothrix
+/// runs with the account: that one would go on with files that are gone,
+/// still signed in.
 pub async fn logout(paths: &Paths) -> Result<()> {
+    if !paths.data_dir.exists() {
+        return Ok(());
+    }
+    hold(paths)?;
     if let Ok(Some(client)) = restore(paths).await {
         let _ = client.matrix_auth().logout().await;
     }
-    if paths.data_dir.exists() {
-        std::fs::remove_dir_all(&paths.data_dir)?;
-    }
+    forget(paths)?;
+    release(paths);
     Ok(())
 }
 
@@ -394,9 +433,11 @@ fn open_with_desktop(target: &std::ffi::OsStr) -> std::io::Result<()> {
     let mut command = if cfg!(target_os = "macos") {
         std::process::Command::new("open")
     } else if cfg!(windows) {
-        // `start` is part of the shell; the empty string is the window title.
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", ""]);
+        // Not `cmd /C start`: the shell would read `&`, `|` and `%NAME%`
+        // in an address as its own, and a link in a message could then run
+        // a program. This hands the target to the desktop as one string.
+        let mut command = std::process::Command::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler");
         command
     } else {
         std::process::Command::new("xdg-open")
@@ -480,15 +521,29 @@ pub async fn sign_in(
     if server.trim().is_empty() {
         bail!("no homeserver given");
     }
+    // Before anything is touched: another mothrix may be signing in here.
+    hold(paths)?;
+    let signed_in = sign_in_held(paths, server, password_login, credentials, say).await;
+    if signed_in.is_err() {
+        // Nothing of a sign-in that failed stays, and the profile is free.
+        let _ = forget(paths);
+        release(paths);
+    }
+    signed_in
+}
 
+async fn sign_in_held(
+    paths: &Paths,
+    server: &str,
+    password_login: bool,
+    credentials: impl FnOnce() -> Result<(String, String)>,
+    say: impl Fn(String) + Clone + Send + Sync + 'static,
+) -> Result<Client> {
     // A previous half-finished login would leave a crypto store belonging to
     // another device behind; start clean.
     if paths.store_dir().exists() {
         std::fs::remove_dir_all(paths.store_dir())?;
     }
-    std::fs::create_dir_all(&paths.data_dir)?;
-
-    hold(paths)?;
     let client = build_client(paths, server_from_input(server)).await?;
     let flows = client
         .matrix_auth()
@@ -1902,9 +1957,9 @@ impl Session {
                         let dir = crate::folders::cache()
                             .context("no cache directory on this system")?
                             .join("pasted");
-                        std::fs::create_dir_all(&dir)?;
+                        crate::folders::private_dir(&dir)?;
                         let file = dir.join(format!("pasted-{seconds}.{extension}"));
-                        std::fs::write(&file, bytes)?;
+                        crate::folders::write_private(&file, &bytes)?;
                         let _ = tx.send(Update::PastedImage(file.display().to_string()));
                     }
                     Err(text) => {
@@ -2510,6 +2565,9 @@ fn desktop_opens(address: &str) -> bool {
     ["https://", "http://", "mailto:"]
         .iter()
         .any(|scheme| address.starts_with(scheme))
+        && !address
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '"')
 }
 
 /// What `/backup` (`renew`: `/backup new`) does about key backup.
@@ -2949,9 +3007,10 @@ async fn open_media(
     let dir = crate::folders::cache()
         .context("no cache directory")?
         .join("media");
-    std::fs::create_dir_all(&dir)?;
+    // What an encrypted room sent lies here decrypted.
+    crate::folders::private_dir(&dir)?;
     let path = dir.join(safe_file_name(&name));
-    std::fs::write(&path, bytes)?;
+    crate::folders::write_private(&path, &bytes)?;
 
     if HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok((path, false));
@@ -3398,6 +3457,41 @@ mod tests {
     };
 
     #[test]
+    fn a_profile_s_lock_outlives_what_is_deleted_and_is_let_go_when_asked() {
+        let dir = std::env::temp_dir().join(format!("mothrix-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = super::Paths {
+            config_file: dir.join("config.toml"),
+            data_dir: dir.join("work"),
+        };
+        let lock = paths.data_dir.join(super::LOCK);
+        let taken = |path: &std::path::Path| {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+        };
+        super::hold(&paths).unwrap();
+        std::fs::write(paths.session_file(), "{}").unwrap();
+        std::fs::create_dir_all(paths.store_dir().join("deep")).unwrap();
+        // A failed sign-in or a sign-out deletes the account's files: the
+        // lock's file is not among them, so the profile is still held.
+        super::forget(&paths).unwrap();
+        assert!(!paths.session_file().exists() && !paths.store_dir().exists());
+        assert!(taken(&lock), "a second mothrix is still kept out");
+        super::hold(&paths).unwrap();
+        assert!(taken(&lock));
+        super::release(&paths);
+        assert!(!taken(&lock), "free for another mothrix");
+        // A profile that never was: nothing to delete.
+        let none = super::Paths {
+            config_file: dir.join("config.toml"),
+            data_dir: dir.join("none"),
+        };
+        super::forget(&none).unwrap();
+        assert!(!none.data_dir.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn unread_counts_take_the_larger_and_a_marked_room_counts_one() {
         // A gap the SDK did not see: the server's count.
         assert_eq!(unread_counts((1, 0), (5, 0), false), (5, 0));
@@ -3614,6 +3708,10 @@ mod tests {
         assert!(!desktop_opens("javascript:alert(1)"));
         assert!(!desktop_opens(" https://example.org"));
         assert!(!desktop_opens("/usr/bin/true"));
+        // Nothing a shell or an opener could take for a second argument.
+        assert!(!desktop_opens("https://example.org/ --flag"));
+        assert!(!desktop_opens("https://example.org/\"&calc"));
+        assert!(!desktop_opens("https://example.org/\u{1b}[2J"));
     }
 
     #[test]

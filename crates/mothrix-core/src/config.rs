@@ -109,23 +109,42 @@ impl Config {
     /// The config in `path`; the defaults where there is none or it cannot
     /// be read.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| toml::from_str(&text).ok())
-            .unwrap_or_default()
+        Self::read(path).unwrap_or_default()
+    }
+
+    /// The config in `path`, the defaults where there is no such file, and
+    /// what is wrong with a file that is there but cannot be used. Who
+    /// saves the config or needs its proxy asks here: a file with a typing
+    /// mistake in it must not be taken for an empty one, written over, or
+    /// lead to connecting without the proxy it names.
+    pub fn read(path: &Path) -> Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => anyhow::bail!("{} cannot be read: {error}", path.display()),
+        };
+        toml::from_str(&text).map_err(|error| {
+            // Where it is, when the parser knows: for a value of the wrong
+            // kind among the settings it only knows the file's start.
+            let what = error.message();
+            match error.span().filter(|span| span.start > 0) {
+                Some(span) => {
+                    let line = text[..span.start.min(text.len())].matches('\n').count() + 1;
+                    anyhow::anyhow!("{} has a mistake in line {line}: {what}", path.display())
+                }
+                None => anyhow::anyhow!("{} has a mistake: {what}", path.display()),
+            }
+        })
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
         // It may hold an API key: readable by the user only.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
+        crate::folders::write_private(path, toml::to_string_pretty(self)?.as_bytes())?;
         Ok(())
     }
 
@@ -151,7 +170,13 @@ impl Config {
             .map(|proxy| matrix_sdk::reqwest::Proxy::all(&proxy))
         {
             Some(Ok(proxy)) => builder.proxy(proxy),
-            _ => builder,
+            // A proxy that cannot be understood is no reason to go around
+            // it: nothing gets out, and the request says why not.
+            Some(Err(_)) => match matrix_sdk::reqwest::Proxy::all("http://proxy.invalid:9") {
+                Ok(nowhere) => builder.proxy(nowhere),
+                Err(_) => builder,
+            },
+            None => builder,
         };
         builder.build().unwrap_or_default()
     }
@@ -249,6 +274,36 @@ mod tests {
             sync: SyncStatus::Connecting,
             verified: None,
         }
+    }
+
+    #[test]
+    fn a_file_with_a_mistake_is_not_taken_for_an_empty_one() {
+        let dir = std::env::temp_dir().join(format!("mothrix-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        // No file: the defaults, and nothing wrong.
+        assert!(Config::read(&file).unwrap().prefs.proxy.is_empty());
+        std::fs::write(
+            &file,
+            "proxy = \"http://proxy:3128\"\nnotifications = \"yes\"\n",
+        )
+        .unwrap();
+        let error = Config::read(&file).err().expect("a mistake").to_string();
+        assert!(error.contains("config.toml has a mistake: "), "{error}");
+        assert!(error.contains("expected a boolean"), "{error}");
+        std::fs::write(&file, "proxy = \"http://proxy:3128\"\ntheme = \n").unwrap();
+        let error = Config::read(&file).err().expect("a mistake").to_string();
+        assert!(error.contains("has a mistake in line 2"), "{error}");
+        // The defaults for showing, but who asks `read` knows not to save.
+        assert!(Config::load(&file).prefs.proxy.is_empty());
+        std::fs::write(&file, "proxy = \"http://proxy:3128\"\n").unwrap();
+        let config = Config::read(&file).unwrap();
+        config.save(&file).unwrap();
+        assert_eq!(
+            Config::read(&file).unwrap().proxy().as_deref(),
+            Some("http://proxy:3128")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

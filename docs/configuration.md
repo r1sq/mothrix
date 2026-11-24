@@ -11,11 +11,20 @@ and what only the file can do: your own colours and keys.
 | Accounts | `~/.local/share/mothrix/<profile>/` | `~/Library/Application Support/mothrix/<profile>/` | `%APPDATA%\mothrix\<profile>\` |
 | Attachments you opened | `~/.cache/mothrix/media/` | `~/Library/Caches/mothrix/media/` | `%LOCALAPPDATA%\mothrix\media\` |
 
-Each account's folder holds its session, encryption keys and log; the
-session file contains your access token and is readable only by you.
+Each account's folder holds its session, encryption keys and log, and
+only you can enter it; the same goes for the folder of opened attachments
+(they lie there decrypted) and for the files with your settings and
+drafts. Attachments you opened are deleted again after a day. The
+encryption keys themselves are not protected by a password: who can read
+your files as you can read them.
 Next to the accounts: `emoji.json` (the emoji you take most) and
 `dictionaries/`; next to the settings: `words.txt` (words the spell check
 ignores).
+
+A `config.toml` with a mistake in it (a typing error, `"yes"` where `true`
+is meant) is never written over: mothrix says what is wrong, leaves the
+accounts out (the file may name a proxy it must not go around) and saves
+no settings until the file is put right.
 
 ## The settings
 

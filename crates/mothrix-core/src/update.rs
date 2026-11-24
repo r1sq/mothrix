@@ -263,6 +263,13 @@ pub struct Installed {
 }
 
 impl Installed {
+    /// Where the new program now is: the path the old one had. The
+    /// running process cannot ask for it any more: on Linux its own path
+    /// (`current_exe`) follows the old program to where it was moved.
+    pub fn program(&self) -> &Path {
+        &self.exe
+    }
+
     /// Put the old program back.
     pub fn undo(self) -> Result<()> {
         std::fs::remove_file(&self.exe)?;
@@ -489,6 +496,8 @@ mod tests {
         let exe = dir.join("mothrix");
         std::fs::write(&exe, b"old").unwrap();
         let installed = install(&exe, b"new").unwrap();
+        // What the restart starts: the new program, not the one moved aside.
+        assert_eq!(installed.program(), exe);
         assert_eq!(std::fs::read(&exe).unwrap(), b"new");
         assert_eq!(std::fs::read(with_suffix(&exe, "old")).unwrap(), b"old");
         installed.undo().unwrap();

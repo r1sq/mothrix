@@ -76,7 +76,7 @@ release is checked against mothrix's signature first.
 .TP
 .B logout
 Sign out and delete the account's data on this computer, including its
-encryption keys.
+encryption keys. Not while another mothrix is running with the account.
 .TP
 .BI "dictionary " "[LANGUAGE]"
 List the spell-check dictionaries, or download one (like de_DE).
@@ -154,7 +154,7 @@ One folder per account: session, encryption keys, log.
 The room open last time and unsent drafts.
 .TP
 .I ~/.cache/mothrix/
-Attachments you opened and pictures you pasted.
+Attachments you opened and pictures you pasted, for a day.
 .SH ENVIRONMENT
 .TP
 .B MOTHRIX_PASSWORD

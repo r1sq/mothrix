@@ -182,6 +182,17 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   second mothrix leaves that account out and says why. The iOS app and its
   notification extension do share a store: `matrix::share_stores` turns
   that lock off and the SDK's cross-process locks on.
+- **Other people's text on the screen.** Names, messages and topics go
+  into ratatui as they are; `ui::scrub` takes control characters and
+  bidi overrides out of the finished screen, so no drawing code has to.
+  Anything written to the terminal past ratatui (`notify.rs`, pictures)
+  has to encode what it sends itself.
+- **Private files.** What holds tokens, drafts or decrypted attachments
+  is written with `folders::write_private` (owner-only, whole or not at
+  all) into a `folders::private_dir`. Deleting an account's files is
+  `matrix::forget`, which leaves the lock file: the lock is on that
+  file. `Config::read` tells a missing config from a broken one; who
+  saves the config or needs its proxy uses it, never `load`.
 - **Where a command waits.** `Session::handle` (`matrix.rs`) lists every
   `Command` and says which of three ways it goes: what uses or changes
   the conversation followed is done in the backend's loop, in order;

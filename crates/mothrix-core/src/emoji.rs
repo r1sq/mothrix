@@ -155,7 +155,7 @@ impl Usage {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(json) = serde_json::to_vec(&stored) {
-            let _ = std::fs::write(&file, json);
+            let _ = crate::folders::write_private(&file, &json);
         }
     }
 

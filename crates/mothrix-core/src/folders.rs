@@ -46,3 +46,92 @@ fn within(name: &str, system: fn() -> Option<PathBuf>) -> Option<PathBuf> {
         None => Some(system()?.join("mothrix")),
     }
 }
+
+/// Make `dir` (and what is above it, if missing) a folder only the user
+/// can enter: accounts, drafts and opened attachments are in such folders,
+/// and on a shared computer the usual mode would let others read them.
+/// One made earlier with the usual mode is closed here too.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Write a file only the user can read, whole or not at all: under
+/// another name first (private from the start), then moved over `path`.
+/// A full disk or a kill half way leaves the old file as it was.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = PathBuf::from(name);
+    let mut options = std::fs::File::options();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// Remove the files in `dir` last changed more than `age` ago (opened
+/// attachments, which nothing else ever deletes).
+pub fn sweep(dir: &Path, age: std::time::Duration) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|data| data.modified())
+            .ok()
+            .and_then(|changed| changed.elapsed().ok())
+            .is_some_and(|since| since > age);
+        if old && entry.path().is_file() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_files_and_folders_are_the_user_s_only_and_replace_what_was_there() {
+        let dir = std::env::temp_dir().join(format!("mothrix-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        private_dir(&dir).unwrap();
+        let file = dir.join("state.json");
+        write_private(&file, b"one").unwrap();
+        write_private(&file, b"two").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"two");
+        // Nothing left of the name it was written under.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&file), 0o600);
+        }
+        sweep(&dir, std::time::Duration::from_secs(3600));
+        assert!(file.exists(), "new files stay");
+        sweep(&dir, std::time::Duration::ZERO);
+        assert!(!file.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

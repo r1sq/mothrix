@@ -268,7 +268,7 @@ async fn sign_in(
         anyhow::bail!("there is already an account called '{profile}'");
     }
     let password_login = !browser || !password.is_empty();
-    let result = matrix::sign_in(
+    matrix::sign_in(
         &paths,
         server,
         password_login,
@@ -280,11 +280,7 @@ async fn sign_in(
         },
         move |line| tell(SignInEvent::Progress(line)),
     )
-    .await;
-    if result.is_err() {
-        let _ = std::fs::remove_dir_all(&paths.data_dir);
-    }
-    result
+    .await
 }
 
 /// Start these signed-in profiles' accounts, in this order. Returns the
@@ -489,6 +485,17 @@ impl Accounts {
     }
 
     /// What goes in front of the room ids of each account.
+    /// The running client of the account a room (by its key) belongs to,
+    /// and the room's id there: for what is done to a room outside the
+    /// conversation followed (answering from a notification). A second
+    /// client on the same store beside the running one must never be
+    /// made: both would encrypt with keys the other has moved on from.
+    pub fn client_of(&self, key: &str) -> Option<(Client, String)> {
+        let (account, room_id) = split(&self.prefixes(), key);
+        let client = self.slots.get(account)?.client.clone()?;
+        Some((client, room_id.to_owned()))
+    }
+
     fn prefixes(&self) -> Vec<String> {
         self.slots.iter().map(|slot| slot.prefix.clone()).collect()
     }
