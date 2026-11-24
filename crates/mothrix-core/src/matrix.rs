@@ -150,6 +150,10 @@ pub fn signed_in_as(paths: &Paths) -> Option<String> {
 struct StoredSession {
     homeserver: String,
     session: MatrixSession,
+    /// Where the passphrase of the store is ([`crate::store_key`]); none
+    /// for a store that is not encrypted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_key: Option<String>,
 }
 
 /// Attachments are handed to the app rather than opened here
@@ -251,6 +255,9 @@ const LOCK: &str = "lock";
 /// on the file, and with the file gone this process would go on holding
 /// nothing while another one locks a new file and opens the same account.
 fn forget(paths: &Paths) -> std::io::Result<()> {
+    if SHARED_AS.get().is_none() {
+        crate::store_key::remove(&paths.data_dir);
+    }
     let entries = match std::fs::read_dir(&paths.data_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -310,7 +317,7 @@ fn hold(paths: &Paths) -> Result<()> {
     }
 }
 
-async fn build_client(paths: &Paths, homeserver: &str) -> Result<Client> {
+async fn build_client(paths: &Paths, homeserver: &str, passphrase: Option<&str>) -> Result<Client> {
     let store = paths.store_dir();
     let builder = Client::builder()
         .with_encryption_settings(EncryptionSettings {
@@ -325,7 +332,7 @@ async fn build_client(paths: &Paths, homeserver: &str) -> Result<Client> {
         .with_threading_support(matrix_sdk::ThreadingSupport::Enabled {
             with_subscriptions: false,
         })
-        .sqlite_store(&store, None);
+        .sqlite_store(&store, passphrase);
     let builder = match SHARED_AS.get() {
         Some(holder) => builder.cross_process_store_config(
             matrix_sdk::cross_process_lock::CrossProcessLockConfig::multi_process(holder.clone()),
@@ -365,7 +372,7 @@ async fn share_encryption_store(client: &Client) -> Result<()> {
     Ok(())
 }
 
-fn save_session(paths: &Paths, client: &Client) -> Result<()> {
+fn save_session(paths: &Paths, client: &Client, store_key: Option<String>) -> Result<()> {
     let session = client
         .matrix_auth()
         .session()
@@ -373,6 +380,7 @@ fn save_session(paths: &Paths, client: &Client) -> Result<()> {
     let stored = StoredSession {
         homeserver: client.homeserver().to_string(),
         session,
+        store_key,
     };
     crate::folders::private_dir(&paths.data_dir)?;
     // The file holds the access token: owner-only.
@@ -389,7 +397,18 @@ pub async fn restore(paths: &Paths) -> Result<Option<Client>> {
     let stored: StoredSession =
         serde_json::from_slice(&std::fs::read(&file)?).context("session file is corrupt")?;
     hold(paths)?;
-    let client = build_client(paths, &stored.homeserver).await?;
+    let passphrase = match stored.store_key.as_deref() {
+        Some(crate::store_key::IN_KEYRING) => {
+            let data_dir = paths.data_dir.clone();
+            // Asking the keyring waits for another program.
+            Some(tokio::task::spawn_blocking(move || crate::store_key::fetch(&data_dir)).await??)
+        }
+        Some(other) => {
+            bail!("this account's store is locked in a way this mothrix does not know ({other})")
+        }
+        None => None,
+    };
+    let client = build_client(paths, &stored.homeserver, passphrase.as_deref()).await?;
     client
         .restore_session(stored.session)
         .await
@@ -544,7 +563,26 @@ async fn sign_in_held(
     if paths.store_dir().exists() {
         std::fs::remove_dir_all(paths.store_dir())?;
     }
-    let client = build_client(paths, server_from_input(server)).await?;
+    // The store's passphrase goes into the system keyring, where there is
+    // one; never on the iPhone, whose extensions could not read it.
+    let passphrase = if SHARED_AS.get().is_some() {
+        None
+    } else {
+        let data_dir = paths.data_dir.clone();
+        match tokio::task::spawn_blocking(move || crate::store_key::create(&data_dir)).await? {
+            Ok(passphrase) => Some(passphrase),
+            Err(error) => {
+                tracing::warn!(%error, "no keyring for the store's passphrase");
+                say(
+                    "No system keyring could be reached: this account's encryption keys are \
+                     kept without a passphrase, protected by the file permissions only."
+                        .to_owned(),
+                );
+                None
+            }
+        }
+    };
+    let client = build_client(paths, server_from_input(server), passphrase.as_deref()).await?;
     let flows = client
         .matrix_auth()
         .get_login_types()
@@ -589,7 +627,8 @@ async fn sign_in_held(
         );
     }
 
-    save_session(paths, &client)?;
+    let store_key = passphrase.map(|_| crate::store_key::IN_KEYRING.to_owned());
+    save_session(paths, &client, store_key)?;
     share_encryption_store(&client).await?;
     // Signing in kicks off key uploads and cross-signing setup in the
     // background. Let them finish, so that quitting right after `mothrix login`

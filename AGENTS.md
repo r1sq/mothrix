@@ -69,6 +69,7 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `preview.rs` | pictures made small for showing |
 | `emoji.rs` | finding emoji by name, all of them by group, and `Usage`: the ones the user takes most (`emoji.json`) |
 | `push.rs` | pushers: where the homeserver sends push notifications for phones (`mothrix pushers`, the iOS app) |
+| `store_key.rs` | the passphrase of an account's store, in the system keyring (`session.json` says `"store_key": "keyring"`) |
 | `folders.rs` | where mothrix keeps its files; an app (iOS) names one folder for all (`set_root`) |
 | `toast.rs` | notifications on Windows (toasts) for both front ends, and registering mothrix's app id for them |
 | `art.rs` | the text moth (the start screen when pictures are off or there is no room), and which part of it takes which colour |

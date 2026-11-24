@@ -14,9 +14,18 @@ and what only the file can do: your own colours and keys.
 Each account's folder holds its session, encryption keys and log, and
 only you can enter it; the same goes for the folder of opened attachments
 (they lie there decrypted) and for the files with your settings and
-drafts. Attachments you opened are deleted again after a day. The
-encryption keys themselves are not protected by a password: who can read
-your files as you can read them.
+drafts. Attachments you opened are deleted again after a day.
+
+An account's store (its encryption keys and what it has read of its rooms)
+is encrypted with a passphrase that mothrix makes at sign-in and keeps in
+the system's keyring: the desktop's Secret Service on Linux (GNOME Keyring,
+KWallet), the Keychain on macOS, the Credential Manager on Windows. A copy
+of the files alone then gives nothing away. Where no keyring can be
+reached when signing in (no desktop session, over SSH), mothrix says so
+and the store is protected by the file permissions only. An account
+signed in that way, or with a version before this, stays as it is until
+it signs out and in again. An account whose passphrase is in the keyring
+can only be started where that keyring can be read.
 Next to the accounts: `emoji.json` (the emoji you take most) and
 `dictionaries/`; next to the settings: `words.txt` (words the spell check
 ignores).

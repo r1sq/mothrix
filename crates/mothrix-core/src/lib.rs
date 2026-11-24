@@ -29,6 +29,7 @@ pub mod sections;
 pub mod sidebar;
 pub mod spell;
 pub mod stable_polls;
+pub mod store_key;
 pub mod theme;
 #[cfg(windows)]
 pub mod toast;
