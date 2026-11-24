@@ -40,6 +40,19 @@ It is not in the App Store; testers get it through TestFlight.
   extensions use short-lived clients of their own (`notification`,
   `respond`, `share` in `mothrix-ffi`).
 
+## What is kept on the phone, and how
+
+Everything is in the app group's folder, which the app and its two
+extensions share. Its files can be read from the first unlock after the
+phone started (the notification extension works while the phone is
+locked); accounts and caches stay out of backups. An account's store is
+encrypted with a passphrase the app makes once and keeps in the Keychain
+(`Shared/StoreKey.swift`; the app group is its access group, so the
+extensions read it too; it never leaves the device). Accounts signed in
+before that have no passphrase until they sign out and in again. If the
+Keychain does not give the passphrase out, such an account does not
+start and the app says why.
+
 ## How a notification gets to the phone
 
 1. The app gets an APNs device token and registers a pusher for it with

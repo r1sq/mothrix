@@ -20,6 +20,26 @@ use anyhow::{Context, Result, anyhow};
 /// keyring.
 pub const IN_KEYRING: &str = "keyring";
 
+/// What it says about one whose passphrase the app hands over ([`give`]):
+/// the iPhone app keeps one for all its accounts in the Keychain, where
+/// its extensions can read it too.
+pub const FROM_APP: &str = "app";
+
+static GIVEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The app's passphrase for the stores of this process. Before any
+/// account is started; only the first call counts.
+pub fn give(passphrase: String) {
+    if !passphrase.is_empty() {
+        let _ = GIVEN.set(passphrase);
+    }
+}
+
+/// The passphrase the app handed over, if it did.
+pub fn given() -> Option<&'static str> {
+    GIVEN.get().map(String::as_str)
+}
+
 /// The name all of mothrix's entries are kept under.
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 const SERVICE: &str = "mothrix";

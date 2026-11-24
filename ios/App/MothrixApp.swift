@@ -195,6 +195,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         let task = await MainActor.run { UIApplication.shared.beginBackgroundTask() }
         let failed: String? = await withCheckedContinuation { done in
             DispatchQueue.global(qos: .userInitiated).async {
+                // (iOS may have started the app just for this.)
+                StoreKey.handOver()
                 do {
                     try respond(folder: folder, room: room, text: text, thread: thread)
                     done.resume(returning: nil)

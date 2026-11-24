@@ -56,6 +56,7 @@ final class NotificationService: UNNotificationServiceExtension {
             .containerURL(forSecurityApplicationGroupIdentifier: "group.de.tmrk.mothrix")?.path ?? ""
         // `notification` blocks while it fetches and decrypts.
         DispatchQueue.global(qos: .userInitiated).async {
+            StoreKey.handOver()
             // Failed or nothing found: "New message" stays.
             let found = try? notification(
                 folder: folder, profile: profile, roomId: roomId, eventId: eventId)

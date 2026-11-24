@@ -137,6 +137,7 @@ final class Store: ObservableObject {
         protectSharedFolder()
         // Recordings of the last run: nothing is sending them any more.
         VoiceRecorder.tidy(olderThan: 0)
+        StoreKey.handOver()
         do {
             mothrix = try Mothrix(folder: sharedFolder().path, listener: sink)
             startProblem = nil

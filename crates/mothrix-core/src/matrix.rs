@@ -452,6 +452,14 @@ pub async fn restore(paths: &Paths) -> Result<Option<Client>> {
             // Asking the keyring waits for another program.
             Some(tokio::task::spawn_blocking(move || crate::store_key::fetch(&data_dir)).await??)
         }
+        Some(crate::store_key::FROM_APP) => Some(
+            crate::store_key::given()
+                .context(
+                    "this account's store is locked with the app's passphrase, which the \
+                     Keychain did not give out",
+                )?
+                .to_owned(),
+        ),
         Some(other) => {
             bail!("this account's store is locked in a way this mothrix does not know ({other})")
         }
@@ -615,9 +623,13 @@ async fn sign_in_held(
     if paths.store_dir().exists() {
         std::fs::remove_dir_all(paths.store_dir())?;
     }
-    // The store's passphrase goes into the system keyring, where there is
-    // one; never on the iPhone, whose extensions could not read it.
-    let passphrase = if SHARED_AS.get().is_some() {
+    // The store's passphrase: the one the app hands over (the iPhone's,
+    // from its Keychain, where its extensions read it too), else one made
+    // here and put into the system keyring, where there is one.
+    let from_app = crate::store_key::given().map(str::to_owned);
+    let passphrase = if from_app.is_some() {
+        from_app.clone()
+    } else if SHARED_AS.get().is_some() {
         None
     } else {
         let data_dir = paths.data_dir.clone();
@@ -679,7 +691,13 @@ async fn sign_in_held(
         );
     }
 
-    let store_key = passphrase.map(|_| crate::store_key::IN_KEYRING.to_owned());
+    let store_key = passphrase.map(|_| {
+        if from_app.is_some() {
+            crate::store_key::FROM_APP.to_owned()
+        } else {
+            crate::store_key::IN_KEYRING.to_owned()
+        }
+    });
     save_session(paths, &client, store_key)?;
     share_encryption_store(&client).await?;
     // Signing in kicks off key uploads and cross-signing setup in the

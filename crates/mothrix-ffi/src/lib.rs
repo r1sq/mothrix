@@ -273,6 +273,15 @@ async fn answer_in(
     Ok(())
 }
 
+/// The passphrase new accounts' stores are encrypted with, and those made
+/// with it are opened with: the app's, from the phone's Keychain. To be
+/// called before anything else here, in the app and in each extension;
+/// only the first call counts.
+#[uniffi::export]
+pub fn store_passphrase(passphrase: String) {
+    mothrix_core::store_key::give(passphrase);
+}
+
 /// For the share extension: send `text` (if any) and the files at `files`
 /// (the text as their caption when there are files) into the room with the
 /// key `room`.

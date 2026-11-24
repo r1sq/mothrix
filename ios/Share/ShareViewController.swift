@@ -86,6 +86,7 @@ final class ShareModel: ObservableObject {
         let text = text
         let paths = files.map(\.path)
         Task.detached {
+            StoreKey.handOver()
             do {
                 try share(folder: folder, room: room.id, text: text, files: paths)
                 await MainActor.run {
