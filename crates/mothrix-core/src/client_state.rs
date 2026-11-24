@@ -121,6 +121,9 @@ pub struct ClientState {
     pub focused: bool,
     /// Until [`NOTIFICATION_WARMUP`] after this, nothing notifies.
     pub started: Instant,
+    /// When each account's rooms were first seen, by profile; `None`:
+    /// in the first list, with the program's start.
+    accounts_seen: HashMap<String, Option<Instant>>,
     /// The account the action at hand names, for commands without a
     /// room (the app's actions can name one).
     pub named_account: Option<usize>,
@@ -150,6 +153,7 @@ impl Default for ClientState {
             link_previews_asked: HashSet::new(),
             focused: true,
             started: Instant::now(),
+            accounts_seen: HashMap::new(),
             named_account: None,
             config_dirty: false,
             last_unread: HashMap::new(),
@@ -387,8 +391,26 @@ impl ClientState {
     /// start has settled, unless the room is on screen in front of them.
     pub fn set_rooms(&mut self, rooms: Vec<RoomEntry>) -> Vec<Notification> {
         let settled = self.started.elapsed() >= NOTIFICATION_WARMUP;
+        // Each account has its own start: one signed in later brings its
+        // rooms with what is unread in them, which is no news either.
+        // (Those there from the first list on start with the program.)
+        let first_seen = (!self.last_unread.is_empty()).then(Instant::now);
+        for room in &rooms {
+            if let Some(account) = self.accounts.get(room.account) {
+                self.accounts_seen
+                    .entry(account.profile.clone())
+                    .or_insert(first_seen);
+            }
+        }
         let mut news = Vec::new();
         for room in &rooms {
+            let settled = settled
+                && self
+                    .accounts
+                    .get(room.account)
+                    .and_then(|account| self.accounts_seen.get(&account.profile).copied())
+                    .flatten()
+                    .is_none_or(|seen| seen.elapsed() >= NOTIFICATION_WARMUP);
             let before = self
                 .last_unread
                 .insert(room.id.clone(), room.unread)
@@ -554,6 +576,42 @@ mod tests {
         // Switched off.
         state.prefs.notifications = false;
         assert!(rooms(&mut state, &[("!a", 6), ("!b", 9)]).is_empty());
+    }
+
+    #[test]
+    fn an_account_added_later_brings_its_unread_rooms_without_news() {
+        let mut state = two_accounts();
+        // As at a start with one account only.
+        state.accounts.truncate(1);
+        state.accounts_seen.clear();
+        state.last_unread.clear();
+        let first: Vec<RoomEntry> = state
+            .rooms
+            .iter()
+            .filter(|r| r.account == 0)
+            .cloned()
+            .collect();
+        state.set_rooms(first.clone());
+        state.started = Instant::now() - NOTIFICATION_WARMUP;
+        // "work" signs in from the dialog: its rooms come with what is
+        // unread in them.
+        let work = two_accounts();
+        state.accounts = work.accounts.clone();
+        let mut all = first;
+        all.extend(
+            work.rooms
+                .iter()
+                .filter(|r| r.account == 1)
+                .cloned()
+                .map(|mut room| {
+                    room.unread = 3;
+                    room
+                }),
+        );
+        assert!(state.set_rooms(all.clone()).is_empty());
+        // The first account's rooms still tell.
+        all[0].unread += 1;
+        assert_eq!(state.set_rooms(all).len(), 1);
     }
 
     fn item(event_id: &str) -> Item {

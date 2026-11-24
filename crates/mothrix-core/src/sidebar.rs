@@ -392,7 +392,16 @@ impl Sidebar<'_> {
             order.extend(["ROOMS".to_owned(), "PEOPLE".to_owned()]);
         }
         order.push("LOW PRIORITY".to_owned());
-        order
+        // Each once: an own section or a space can be called what a
+        // built-in section is called, and would else be listed twice with
+        // all its rooms.
+        let mut once: Vec<String> = Vec::with_capacity(order.len());
+        for title in order {
+            if !once.contains(&title) {
+                once.push(title);
+            }
+        }
+        once
     }
 
     fn section_rows(

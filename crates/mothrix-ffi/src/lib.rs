@@ -115,7 +115,13 @@ impl Mothrix {
             message: format!("not an action: {error}"),
         })?;
         if cfg!(debug_assertions) {
-            tracing::warn!("action {json}");
+            // What kind, not what it says: a password, a recovery key or a
+            // whole file can be in it.
+            let kind = serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|value| value["type"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            tracing::warn!("action {kind}");
         }
         self.requests.ask(Request::Act(action));
         Ok(())
@@ -354,12 +360,16 @@ fn emit(listener: &dyn Listener, event: &impl serde::Serialize) {
         Ok(json) => {
             // Debug builds: what went to the app, in the log.
             if cfg!(debug_assertions) {
-                tracing::warn!(len = json.len(), "event {}", &json[..json.len().min(120)]);
+                // By characters: a cut inside one would end this task,
+                // and with it every event after.
+                let start: String = json.chars().take(120).collect();
+                tracing::warn!(len = json.len(), "event {start}");
                 // And the last one of each kind whole, in debug/.
                 if let (Some(root), Ok(value)) = (
                     folders::root(),
                     serde_json::from_str::<serde_json::Value>(&json),
                 ) && let Some(kind) = value["type"].as_str()
+                    && kind != "recovery_key"
                 {
                     let dir = root.join("debug");
                     let _ = std::fs::create_dir_all(&dir);
