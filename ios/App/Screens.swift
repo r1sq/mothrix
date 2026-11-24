@@ -1841,10 +1841,17 @@ struct ForwardView: View {
     /// The room tapped: asked about before the message goes.
     @State private var confirming: RoomEntry?
 
-    /// The rooms of every account, the open room's first.
+    /// What was typed to narrow the list.
+    @State private var filter = ""
+
+    /// The rooms of every account, the open room's first, narrowed by
+    /// what was typed (as in the terminal: no spaces, no invitations).
     private var rooms: [RoomEntry] {
         let account = store.room(store.openRoom)?.account
-        let rooms = store.rooms.filter { !$0.isInvite }
+        let needle = filter.trimmingCharacters(in: .whitespaces).lowercased()
+        let rooms = store.rooms.filter {
+            !$0.isInvite && !$0.isSpace && (needle.isEmpty || $0.name.lowercased().contains(needle))
+        }
         return rooms.filter { $0.account == account } + rooms.filter { $0.account != account }
     }
 
@@ -1856,18 +1863,28 @@ struct ForwardView: View {
 
     var body: some View {
         NavigationStack {
-            List(rooms) { room in
-                Button {
-                    confirming = room
-                } label: {
-                    Text(name(room)).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            VStack(spacing: 0) {
+                TextField("", text: $filter, prompt: Text("room").foregroundColor(store.theme.faint))
+                    .font(.mono())
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .padding(8)
+                    .overlay(Rectangle().stroke(store.theme.line))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                List(rooms) { room in
+                    Button {
+                        confirming = room
+                    } label: {
+                        Text(name(room)).frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(store.theme.bg)
                 }
-                .buttonStyle(.plain)
-                .listRowBackground(store.theme.bg)
+                .font(.mono())
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
-            .font(.mono())
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
             .background(store.theme.bg)
             .foregroundStyle(store.theme.text)
             .navigationBarTitleDisplayMode(.inline)

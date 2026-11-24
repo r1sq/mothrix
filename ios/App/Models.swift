@@ -169,6 +169,7 @@ struct RoomEntry: Decodable, Hashable, Identifiable {
     var topic: String
     var isDm: Bool
     var isInvite: Bool
+    var isSpace: Bool
     var unread: Int
     var mentions: Int
     /// "Default", "All", "Mentions" or "Mute".
