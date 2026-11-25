@@ -114,7 +114,10 @@ pub fn parse_start(sender: &str, content: &Value) -> Option<StablePoll> {
         .get("max_selections")
         .and_then(Value::as_u64)
         .unwrap_or(1)
-        .max(1);
+        // The sender may write any number; more than there are answers
+        // means nothing, and a huge one is more than an app reading this
+        // as JSON can hold in its numbers.
+        .clamp(1, answers.len() as u64);
     Some(StablePoll {
         sender: sender.to_owned(),
         format,
@@ -285,6 +288,28 @@ mod tests {
 
     fn respond(poll: &mut StablePoll, sender: &str, ts: u64, ids: &[&str]) {
         poll.apply("m.poll.response", sender, ts, &json!({"m.selections": ids}));
+    }
+
+    #[test]
+    fn no_more_answers_can_be_chosen_than_there_are() {
+        let poll = |max: Value| {
+            parse_start(
+                "@amy:x",
+                &json!({"m.poll": {
+                    "max_selections": max,
+                    "question": {"m.text": [{"body": "Lunch?"}]},
+                    "answers": [
+                        {"m.id": "a", "m.text": [{"body": "Pizza"}]},
+                        {"m.id": "b", "m.text": [{"body": "Sushi"}]},
+                    ],
+                }}),
+            )
+            .expect("a poll")
+            .max_selections
+        };
+        assert_eq!(poll(json!(18_446_744_073_709_551_615u64)), 2);
+        assert_eq!(poll(json!(2)), 2);
+        assert_eq!(poll(json!(0)), 1);
     }
 
     #[test]

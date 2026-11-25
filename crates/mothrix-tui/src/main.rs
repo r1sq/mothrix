@@ -43,10 +43,17 @@ fn build() -> update::Build {
     update::Build::of(VERSION, env!("CARGO_PKG_VERSION"), packaged)
 }
 
+/// A server's or another person's words for printing outside the drawn
+/// screen (the command-line modes, errors at the end): without control
+/// characters, which the terminal would obey.
+fn plain(text: impl AsRef<str>) -> String {
+    message::for_terminal(text.as_ref())
+}
+
 /// Fetching releases through the config's proxy.
 fn release_fetch(paths: &Paths) -> update::Http {
     update::Http {
-        client: Config::load(&paths.config_file).http_client(),
+        client: Config::http_client_at(&paths.config_file),
         agent: format!("mothrix/{}", env!("CARGO_PKG_VERSION")),
     }
 }
@@ -106,6 +113,13 @@ Usage:
   mothrix pushers remove --app-id ID --pushkey KEY
                                         add or remove one by hand, for trying a
                                         push gateway (Sygnal)
+  mothrix --snapshot SECONDS [--room NAME] [--say TEXT] [--size WIDTHxHEIGHT]
+                                        without a keyboard: sync that long, print
+                                        the screen as text and end. --room names
+                                        the room to open (else the first one);
+                                        --say SENDS its text there as a message
+                                        (\"keys:...\" presses keys instead);
+                                        --size is the screen's (110x36)
   mothrix --help | --version
 
 Inside mothrix (F1 or ? shows every key and command):
@@ -386,7 +400,9 @@ fn init_logging(paths: &Paths) {
 async fn main() -> Result<()> {
     let result = run().await;
     if let Err(error) = &result {
-        eprintln!("mothrix: {error:#}");
+        // An error may carry the server's own words (its `error` text):
+        // here no screen is drawn that would take control characters out.
+        eprintln!("mothrix: {}", plain(format!("{error:#}")));
     }
     let installed = INSTALLED
         .lock()
@@ -421,7 +437,7 @@ async fn run() -> Result<()> {
             }
             for profile in profiles {
                 let user = matrix::signed_in_as(&Paths::for_profile(&profile)?);
-                println!("{profile:<12} {}", user.unwrap_or_default());
+                println!("{profile:<12} {}", plain(user.unwrap_or_default()));
             }
             println!("Add one with `mothrix login SERVER --profile NAME`.");
             Ok(())
@@ -441,7 +457,7 @@ async fn run() -> Result<()> {
             let client = matrix::login(&paths, options).await?;
             println!(
                 "Signed in as {}. Start mothrix to chat.",
-                app::short_id(&user_of(&client), 48)
+                plain(app::short_id(&user_of(&client), 48))
             );
             Ok(())
         }
@@ -520,7 +536,10 @@ async fn restore_accounts(named: &Option<String>) -> Result<Vec<(String, Client)
     let (clients, problems) = accounts::restore_all(profiles).await;
     let mut failure = None;
     for (profile, error) in problems {
-        eprintln!("mothrix: account '{profile}' left out: {error:#}");
+        eprintln!(
+            "mothrix: account '{profile}' left out: {}",
+            plain(format!("{error:#}"))
+        );
         failure = Some(error.context(format!("account '{profile}'")));
     }
     match failure {
@@ -541,13 +560,14 @@ async fn pushers_command(client: &Client, action: PushersAction) -> Result<()> {
                 println!("No pushers.");
             }
             for pusher in pushers {
+                // All of it is what the server says some app registered.
                 println!(
                     "{} on {}\n  app id   {}\n  pushkey  {}\n  gateway  {}{}",
-                    pusher.app_name,
-                    pusher.device_name,
-                    pusher.app_id,
-                    pusher.pushkey,
-                    pusher.gateway,
+                    plain(pusher.app_name),
+                    plain(pusher.device_name),
+                    plain(pusher.app_id),
+                    plain(pusher.pushkey),
+                    plain(pusher.gateway),
                     if pusher.event_id_only {
                         " (ids only)"
                     } else {
@@ -560,7 +580,7 @@ async fn pushers_command(client: &Client, action: PushersAction) -> Result<()> {
             push::add(client, &target).await?;
             println!(
                 "Added: {} sends pushes for {} to {}.",
-                user_of(client),
+                plain(user_of(client)),
                 target.app_id,
                 target.gateway
             );
@@ -606,7 +626,8 @@ async fn dictionary_command(paths: &Paths, language: Option<String>) -> Result<(
     })?;
     let target = spell::user_dictionary_dir()?;
     std::fs::create_dir_all(&target)?;
-    let http = Config::load(&paths.config_file).http_client();
+    // `read`: a config with a mistake in it may name a proxy.
+    let http = Config::read(&paths.config_file)?.http_client();
     for (url, extension) in [(aff_url, "aff"), (dic_url, "dic")] {
         println!("Downloading {url}");
         let response = http.get(&url).send().await?.error_for_status()?;
@@ -909,6 +930,9 @@ async fn update_command(paths: &Paths) -> Result<()> {
     }
     let key = update::public_key()
         .context("this build has no release key: it cannot look for updates")?;
+    // A config with a mistake in it may name a proxy: say what is wrong
+    // with it, rather than fail to connect.
+    Config::read(&paths.config_file)?;
     let fetch = release_fetch(paths);
     let repository = env!("CARGO_PKG_REPOSITORY");
     let Some(available) =
@@ -1027,7 +1051,7 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
 
     // LanguageTool (only with a server set): ask once typing pauses.
     let (grammar_tx, mut grammar_rx) = tokio::sync::mpsc::unbounded_channel();
-    let grammar_http = Config::load(&paths.config_file).http_client();
+    let grammar_http = Config::http_client_at(&paths.config_file);
     let grammar_variants = languagetool::preferred_variants(&languages);
     let mut grammar_due: Option<(String, tokio::time::Instant)> = None;
     tokio::task::spawn_blocking(move || {
@@ -1285,6 +1309,9 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
                     Effect::Quit => quit = true,
                 }
             }
+            // The event's commands are out: which account it named says
+            // nothing about what a timer or the news sends next.
+            app.state.named_account = None;
             // A new release is in place: it starts once the terminal is back.
             if quit || updated {
                 break;
@@ -1334,6 +1361,7 @@ fn snapshot_effects(
             | Effect::Quit => {}
         }
     }
+    app.state.named_account = None;
 }
 
 async fn snapshot(

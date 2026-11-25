@@ -54,9 +54,15 @@ no settings until the file is put right.
 - `long_messages` (lines before a message folds, `0` for never)
 - `spell_languages`, `languagetool_url`, `languagetool_languages`,
   `languagetool_username`, `languagetool_api_key`
-- `proxy = "http://proxy:3128"` for networks without a direct way out;
-  without it, the `HTTPS_PROXY` or `ALL_PROXY` environment variable, else
-  direct (automatic proxy discovery is not used)
+- `proxy = "http://proxy:3128"` for networks without a direct way out:
+  every connection goes through it (`https://` and `socks5://`,
+  `socks5h://`, `socks4://` proxies work too). Without it the
+  environment's, as other programs read them: `HTTPS_PROXY`,
+  `HTTP_PROXY` (for `http://` addresses, a LanguageTool server for one)
+  and `ALL_PROXY`, none of them for the hosts `NO_PROXY` names; else
+  direct (automatic proxy discovery is not used). A proxy address that
+  cannot be used stops mothrix from connecting rather than going around
+  it
 - `account` (the profile the room list shows; empty for all),
   `[account_names]` (your names for accounts), `folded` (folded sections),
   `[[sections]]` (your sections; the accounts keep them too, and what they

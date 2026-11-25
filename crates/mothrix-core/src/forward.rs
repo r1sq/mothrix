@@ -34,7 +34,30 @@ pub fn attributed(mut content: Value, from: &str) -> Value {
     };
     let label_html = format!("Forwarded from <b>{}</b>", escape(from));
     match content["msgtype"].as_str().unwrap_or_default() {
-        kind @ ("m.text" | "m.notice" | "m.emote") => {
+        "m.image" | "m.file" | "m.audio" | "m.video" => {
+            // Without a file name of its own, the body is the name: then
+            // nothing was written with the file.
+            let captioned = text("filename").is_some_and(|name| name != body);
+            content["format"] = "org.matrix.custom.html".into();
+            if captioned {
+                content["body"] = format!("{label}:\n{body}").into();
+                content["formatted_body"] =
+                    format!("<p>{label_html}:</p><p>{}</p>", html_of(&body)).into();
+            } else {
+                // The line is what is written with the copy now, so HTML
+                // the file came with would be shown as ours: it goes too.
+                content["filename"] = body.into();
+                content["body"] = label.into();
+                content["formatted_body"] = format!("<p>{label_html}</p>").into();
+            }
+        }
+        // A place: as it is. It has no HTML of its own.
+        "m.location" => {}
+        // A text, and any other kind (mothrix shows its body like a
+        // text): only the body goes on, quoted. Whatever else the message
+        // held (a verification request's devices, fields of a kind no one
+        // here knows) was never seen by whoever forwards.
+        kind => {
             // "* Name did something", as an emote reads.
             let body = if kind == "m.emote" {
                 format!("* {from} {body}")
@@ -43,28 +66,13 @@ pub fn attributed(mut content: Value, from: &str) -> Value {
             };
             let quoted: Vec<String> = body.lines().map(|line| format!("> {line}")).collect();
             let html = html_of(&body);
-            content["msgtype"] = "m.text".into();
-            content["body"] = format!("{label}:\n{}", quoted.join("\n")).into();
-            content["format"] = "org.matrix.custom.html".into();
-            content["formatted_body"] =
-                format!("<p>{label_html}:</p><blockquote>{html}</blockquote>").into();
+            content = serde_json::json!({
+                "msgtype": "m.text",
+                "body": format!("{label}:\n{}", quoted.join("\n")),
+                "format": "org.matrix.custom.html",
+                "formatted_body": format!("<p>{label_html}:</p><blockquote>{html}</blockquote>"),
+            });
         }
-        "m.image" | "m.file" | "m.audio" | "m.video" => {
-            // Without a file name of its own, the body is the name: then
-            // nothing was written with the file.
-            let captioned = text("filename").is_some_and(|name| name != body);
-            if captioned {
-                content["body"] = format!("{label}:\n{body}").into();
-                content["format"] = "org.matrix.custom.html".into();
-                content["formatted_body"] =
-                    format!("<p>{label_html}:</p><p>{}</p>", html_of(&body)).into();
-            } else {
-                content["filename"] = body.into();
-                content["body"] = label.into();
-            }
-        }
-        // A place, a verification request: as it is.
-        _ => {}
     }
     content
 }
@@ -223,6 +231,51 @@ mod tests {
 
         let place = json!({"msgtype": "m.location", "body": "here", "geo_uri": "geo:1,2"});
         assert_eq!(attributed(place.clone(), "Amy"), place);
+    }
+
+    #[test]
+    fn html_a_file_came_with_is_not_passed_on_as_the_forwarder_s_words() {
+        // No file name of its own: mothrix shows "[image] cat.png", and
+        // never the HTML.
+        let copy = attributed(
+            json!({"msgtype": "m.image", "body": "cat.png", "url": "mxc://a/1",
+                   "format": "org.matrix.custom.html",
+                   "formatted_body": "<a href='https://evil.example'>Invoice, please pay</a>"}),
+            "Amy & Co",
+        );
+        assert_eq!(copy["filename"], "cat.png");
+        assert_eq!(copy["body"], "Forwarded from Amy & Co");
+        assert_eq!(
+            copy["formatted_body"],
+            "<p>Forwarded from <b>Amy &amp; Co</b></p>"
+        );
+        assert_eq!(copy["url"], "mxc://a/1");
+    }
+
+    #[test]
+    fn a_message_of_an_unknown_kind_is_forwarded_as_its_text() {
+        let copy = attributed(
+            json!({"msgtype": "org.example.card", "body": "pay me",
+                   "format": "org.matrix.custom.html",
+                   "formatted_body": "<a href='https://evil.example'>from your bank</a>",
+                   "org.example.extra": {"x": 1}}),
+            "Amy",
+        );
+        assert_eq!(
+            copy,
+            json!({"msgtype": "m.text", "body": "Forwarded from Amy:\n> pay me",
+                   "format": "org.matrix.custom.html",
+                   "formatted_body":
+                       "<p>Forwarded from <b>Amy</b>:</p><blockquote>pay me</blockquote>"})
+        );
+        // A request to verify does not start one in the other room.
+        let copy = attributed(
+            json!({"msgtype": "m.key.verification.request", "body": "verify me",
+                   "from_device": "ABC", "methods": ["m.sas.v1"], "to": "@ben:x"}),
+            "Amy",
+        );
+        assert_eq!(copy["msgtype"], "m.text");
+        assert!(copy.get("from_device").is_none() && copy.get("to").is_none());
     }
 
     #[test]

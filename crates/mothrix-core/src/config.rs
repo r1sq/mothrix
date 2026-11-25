@@ -148,42 +148,44 @@ impl Config {
         Ok(())
     }
 
-    /// The proxy to use: the config's, else the environment's.
-    pub fn proxy(&self) -> Option<String> {
-        let configured = self.prefs.proxy.trim();
-        if !configured.is_empty() {
-            return Some(configured.to_owned());
-        }
-        // The first that says something: an empty one names no proxy.
-        ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+    /// The proxies to use ([`proxy_rules`]), from this config and the
+    /// environment.
+    fn proxies(&self) -> Result<Vec<matrix_sdk::reqwest::Proxy>> {
+        proxy_rules(&self.prefs.proxy, |name| std::env::var(name).ok())
             .iter()
-            .filter_map(|name| std::env::var(name).ok())
-            .map(|value| value.trim().to_owned())
-            .find(|value| !value.is_empty())
+            .map(ProxyRule::proxy)
+            .collect()
     }
 
     /// An HTTP client for what is not Matrix (LanguageTool, downloads),
     /// through the proxy if there is one.
     pub fn http_client(&self) -> matrix_sdk::reqwest::Client {
-        // A server that stops answering must not keep a download or a
-        // grammar check waiting for ever.
+        client_through(self.proxies())
+    }
+
+    /// [`Config::http_client`] of the config in `path`. A file with a
+    /// mistake in it may name a proxy all the same: the client then
+    /// reaches nothing, rather than go around it.
+    pub fn http_client_at(path: &Path) -> matrix_sdk::reqwest::Client {
+        client_through(Self::proxies_at(path))
+    }
+
+    fn proxies_at(path: &Path) -> Result<Vec<matrix_sdk::reqwest::Proxy>> {
+        Self::read(path)?.proxies()
+    }
+
+    /// The HTTP client an account talks to its homeserver with, through
+    /// the same proxies as everything else. The SDK would make its own
+    /// from one proxy address: for every request, also to the hosts
+    /// `NO_PROXY` names, and it writes the address (which may hold a
+    /// password) into the log. Otherwise this is the client the SDK
+    /// makes: its name, its time limit, no TLS older than 1.2.
+    pub fn matrix_http_client(&self) -> Result<matrix_sdk::reqwest::Client> {
         let builder = matrix_sdk::reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(20))
-            .read_timeout(std::time::Duration::from_secs(60));
-        let builder = match self
-            .proxy()
-            .map(|proxy| matrix_sdk::reqwest::Proxy::all(&proxy))
-        {
-            Some(Ok(proxy)) => builder.proxy(proxy),
-            // A proxy that cannot be understood is no reason to go around
-            // it: nothing gets out, and the request says why not.
-            Some(Err(_)) => match matrix_sdk::reqwest::Proxy::all("http://proxy.invalid:9") {
-                Ok(nowhere) => builder.proxy(nowhere),
-                Err(_) => builder,
-            },
-            None => builder,
-        };
-        builder.build().unwrap_or_default()
+            .user_agent("matrix-rust-sdk")
+            .min_tls_version(matrix_sdk::reqwest::tls::Version::TLS_1_2)
+            .timeout(std::time::Duration::from_secs(30));
+        Ok(through(builder, self.proxies()?).build()?)
     }
 
     /// The dictionaries named, or the defaults.
@@ -275,6 +277,130 @@ impl Config {
     }
 }
 
+/// The kinds of proxy the HTTP library knows.
+const PROXY_KINDS: [&str; 6] = ["http", "https", "socks4", "socks4a", "socks5", "socks5h"];
+
+/// Which requests a proxy takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Takes {
+    All,
+    Https,
+    Http,
+}
+
+/// One proxy, for some of the requests, and the hosts that are reached
+/// without it (`NO_PROXY`, as it is written there).
+#[derive(Debug, PartialEq, Eq)]
+struct ProxyRule {
+    takes: Takes,
+    address: String,
+    except: Option<String>,
+}
+
+impl ProxyRule {
+    fn proxy(&self) -> Result<matrix_sdk::reqwest::Proxy> {
+        use matrix_sdk::reqwest::{NoProxy, Proxy};
+        // Not the address itself: it may hold a password, and this ends
+        // up on the screen and in the log.
+        let unusable = || {
+            anyhow::anyhow!(
+                "the proxy cannot be used: its address has to be like http://proxy:3128 \
+                 (or https://, socks5://)"
+            )
+        };
+        // "proxy:3128" is an HTTP proxy.
+        let address = if self.address.contains("://") {
+            self.address.clone()
+        } else {
+            format!("http://{}", self.address)
+        };
+        // Checked here: the HTTP library takes any address with a host,
+        // and then goes without a proxy where it does not know the kind
+        // (a slip like "sock5://").
+        url::Url::parse(&address)
+            .ok()
+            .filter(|url| url.has_host() && PROXY_KINDS.contains(&url.scheme()))
+            .ok_or_else(unusable)?;
+        let proxy = match self.takes {
+            Takes::All => Proxy::all(&address),
+            Takes::Https => Proxy::https(&address),
+            Takes::Http => Proxy::http(&address),
+        }
+        .map_err(|_| unusable())?;
+        Ok(proxy.no_proxy(self.except.as_deref().and_then(NoProxy::from_string)))
+    }
+}
+
+/// The proxies to use, in the order they are asked. One named in the
+/// config (`configured`) takes every request: it is there for networks
+/// with no other way out. Else the environment's (`env` reads a
+/// variable), each for what its variable is for (`HTTPS_PROXY` does not
+/// take `http://` requests, a LanguageTool server on this computer for
+/// one) and none for the hosts `NO_PROXY` names.
+fn proxy_rules(configured: &str, env: impl Fn(&str) -> Option<String>) -> Vec<ProxyRule> {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return vec![ProxyRule {
+            takes: Takes::All,
+            address: configured.to_owned(),
+            except: None,
+        }];
+    }
+    // The first that says something: an empty one names no proxy.
+    let named = |names: [&str; 2]| {
+        names
+            .iter()
+            .filter_map(|name| env(name))
+            .map(|value| value.trim().to_owned())
+            .find(|value| !value.is_empty())
+    };
+    let except = named(["NO_PROXY", "no_proxy"]);
+    [
+        (Takes::Https, ["HTTPS_PROXY", "https_proxy"]),
+        (Takes::Http, ["HTTP_PROXY", "http_proxy"]),
+        (Takes::All, ["ALL_PROXY", "all_proxy"]),
+    ]
+    .into_iter()
+    .filter_map(|(takes, names)| {
+        Some(ProxyRule {
+            takes,
+            address: named(names)?,
+            except: except.clone(),
+        })
+    })
+    .collect()
+}
+
+/// An HTTP client that goes through `proxies`.
+fn client_through(proxies: Result<Vec<matrix_sdk::reqwest::Proxy>>) -> matrix_sdk::reqwest::Client {
+    // A server that stops answering must not keep a download or a
+    // grammar check waiting for ever.
+    let builder = matrix_sdk::reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(60));
+    let builder = match proxies {
+        Ok(proxies) => through(builder, proxies),
+        // A proxy that cannot be understood is no reason to go around
+        // it: nothing gets out, and the request says why not.
+        Err(_) => match matrix_sdk::reqwest::Proxy::all("http://proxy.invalid:9") {
+            Ok(nowhere) => builder.proxy(nowhere),
+            Err(_) => builder,
+        },
+    };
+    builder.build().unwrap_or_default()
+}
+
+/// `builder` with these proxies, and no others: without any, the HTTP
+/// library would read the environment itself, by rules of its own.
+fn through(
+    builder: matrix_sdk::reqwest::ClientBuilder,
+    proxies: Vec<matrix_sdk::reqwest::Proxy>,
+) -> matrix_sdk::reqwest::ClientBuilder {
+    proxies
+        .into_iter()
+        .fold(builder.no_proxy(), |builder, proxy| builder.proxy(proxy))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,12 +437,14 @@ mod tests {
         assert!(error.contains("has a mistake in line 2"), "{error}");
         // The defaults for showing, but who asks `read` knows not to save.
         assert!(Config::load(&file).prefs.proxy.is_empty());
+        // Nor to connect: the file names a proxy, mistake or not.
+        assert!(Config::proxies_at(&file).is_err());
         std::fs::write(&file, "proxy = \"http://proxy:3128\"\n").unwrap();
         let config = Config::read(&file).unwrap();
         config.save(&file).unwrap();
         assert_eq!(
-            Config::read(&file).unwrap().proxy().as_deref(),
-            Some("http://proxy:3128")
+            Config::read(&file).unwrap().prefs.proxy,
+            "http://proxy:3128"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -324,11 +452,89 @@ mod tests {
     #[test]
     fn a_proxy_in_the_file_wins_and_is_kept_when_saving() {
         let config: Config = toml::from_str(r#"proxy = " http://172.28.28.49:3128 ""#).unwrap();
-        assert_eq!(config.proxy().as_deref(), Some("http://172.28.28.49:3128"));
+        let env = |name: &str| (name == "HTTPS_PROXY").then(|| "http://other:1".to_owned());
+        // For everything, whatever the environment says.
+        assert_eq!(
+            proxy_rules(&config.prefs.proxy, env),
+            [ProxyRule {
+                takes: Takes::All,
+                address: "http://172.28.28.49:3128".into(),
+                except: None,
+            }]
+        );
         let text = toml::to_string(&config).unwrap();
         assert!(text.contains("proxy = "));
         // None: direct, unless the environment names one.
         assert!(Config::default().prefs.proxy.is_empty());
+        assert!(proxy_rules("", |_| None).is_empty());
+    }
+
+    #[test]
+    fn the_environment_s_proxies_each_take_what_they_are_for() {
+        let env = |name: &str| match name {
+            // An empty one names nothing; the other spelling counts.
+            "HTTPS_PROXY" => Some(" ".to_owned()),
+            "https_proxy" => Some("http://secure:3128".to_owned()),
+            "ALL_PROXY" => Some("socks5://socks:1080".to_owned()),
+            "NO_PROXY" => Some("localhost,127.0.0.1,.lan".to_owned()),
+            _ => None,
+        };
+        let except = Some("localhost,127.0.0.1,.lan".to_owned());
+        let rules = proxy_rules(" ", env);
+        assert_eq!(
+            rules,
+            [
+                // Not for `http://`: that goes on to ALL_PROXY.
+                ProxyRule {
+                    takes: Takes::Https,
+                    address: "http://secure:3128".into(),
+                    except: except.clone(),
+                },
+                ProxyRule {
+                    takes: Takes::All,
+                    address: "socks5://socks:1080".into(),
+                    except,
+                },
+            ]
+        );
+        // All of them are proxies the HTTP library takes, SOCKS too.
+        for rule in &rules {
+            rule.proxy().unwrap();
+        }
+        // Without a kind it is an HTTP proxy.
+        ProxyRule {
+            takes: Takes::All,
+            address: "proxy:3128".into(),
+            except: None,
+        }
+        .proxy()
+        .unwrap();
+        let http = proxy_rules("", |name| {
+            (name == "http_proxy").then(|| "http://plain:3128".to_owned())
+        });
+        assert_eq!(http[0].takes, Takes::Http);
+    }
+
+    #[test]
+    fn a_proxy_that_cannot_be_understood_stops_requests_and_keeps_its_password() {
+        for address in [
+            "http://user:secret@",
+            "gopher://user:secret@proxy:70",
+            "sock5://user:secret@proxy:1080",
+            "http://user:secret@pro xy:3128",
+        ] {
+            let rule = ProxyRule {
+                takes: Takes::All,
+                address: address.into(),
+                except: None,
+            };
+            let error = rule.proxy().expect_err("no proxy").to_string();
+            assert!(error.starts_with("the proxy cannot be used"), "{error}");
+            assert!(!error.contains("secret"), "{error}");
+        }
+        // No client for the homeserver, rather than one that goes direct.
+        let config: Config = toml::from_str(r#"proxy = "http://user:secret@""#).unwrap();
+        assert!(config.matrix_http_client().is_err());
     }
 
     #[test]

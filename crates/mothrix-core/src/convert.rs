@@ -551,7 +551,7 @@ pub fn build_poll(
         }
     }
 
-    let answers = answers
+    let answers: Vec<PollAnswer> = answers
         .iter()
         .map(|(id, text)| {
             let all: &[String] = votes.get(id).map(Vec::as_slice).unwrap_or(&[]);
@@ -575,7 +575,10 @@ pub fn build_poll(
 
     Poll {
         question: question.to_owned(),
-        max_selections: max_selections.max(1),
+        // No more than there are answers, whatever the poll says: see
+        // `stable_polls::parse_start`. The SDK's polls come through here
+        // too.
+        max_selections: max_selections.clamp(1, answers.len().max(1) as u64),
         is_ended,
         results_visible,
         voter_count: distinct.len() as u64,
@@ -677,6 +680,27 @@ mod tests {
         assert_eq!(poll.answers[0].voters, ["Amy Winter", "zoe"]);
         assert!(poll.answers[1].self_voted);
         assert!(poll.answers.iter().all(|answer| !answer.is_winner));
+    }
+
+    #[test]
+    fn a_poll_never_says_more_can_be_chosen_than_it_has_answers() {
+        let poll = |max: u64| {
+            build_poll(
+                "Q",
+                true,
+                max,
+                false,
+                &answers(),
+                &HashMap::new(),
+                None,
+                &Names::new(),
+            )
+            .max_selections
+        };
+        // A number an app's JSON reader could not hold.
+        assert_eq!(poll(u64::MAX), 2);
+        assert_eq!(poll(2), 2);
+        assert_eq!(poll(0), 1);
     }
 
     #[test]

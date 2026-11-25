@@ -509,7 +509,9 @@ impl App {
             None => None,
         };
         if let Some(text) = text {
-            self.effects.push(Effect::Copy(text));
+            // Someone else's text, as the whole message is.
+            self.effects
+                .push(Effect::Copy(crate::message::copyable(&text)));
             self.notice = Some("Code copied to the clipboard.".to_owned());
         }
     }
@@ -588,7 +590,7 @@ impl App {
             }
             // A draft found there is not being written: no notice for it
             // until it changes.
-            if !draft.trim().is_empty() && !draft.starts_with('/') {
+            if !draft.trim().is_empty() && !is_command(&draft) {
                 self.typing_told = draft;
             }
         }
@@ -734,9 +736,16 @@ impl App {
             .filter_map(|item| crate::inline::parse_links(&item.body).1.into_iter().next())
             .filter(|url| url.starts_with("http"))
             .collect();
+        // Of the open room: its account's homeserver is the one to ask.
+        let Some(room_id) = self.state.open_room.clone() else {
+            return;
+        };
         for url in wanted {
             if self.state.link_previews_asked.insert(url.clone()) {
-                self.send_later(Command::PreviewLink(url));
+                self.send_later(Command::PreviewLink {
+                    room_id: room_id.clone(),
+                    url,
+                });
             }
         }
     }
@@ -1284,7 +1293,7 @@ impl App {
         let writing = self.state.prefs.typing_notices
             && self.state.open_room.is_some()
             && !text.trim().is_empty()
-            && !text.starts_with('/');
+            && !is_command(text);
         let now = if writing { text } else { "" };
         if now == self.typing_told {
             return;
@@ -1983,6 +1992,14 @@ pub fn dropped_file(text: &str) -> Option<String> {
     (path.starts_with('/') && std::path::Path::new(&path).is_file()).then_some(path)
 }
 
+/// Whether what is in the message box is a command, not a message being
+/// written. As `submit` reads it: spaces in front do not make
+/// " /recover KEY" a message, so it is not told to the room as typing
+/// and not sent to a grammar server either.
+pub(crate) fn is_command(text: &str) -> bool {
+    text.trim_start().starts_with('/')
+}
+
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -2493,6 +2510,10 @@ mod tests {
         type_text(&mut app, "/se");
         assert!(app.take_commands().is_empty());
         app.composer.clear();
+        // Also with a space in front, which runs as a command too.
+        type_text(&mut app, " /recover EsTc");
+        assert!(app.take_commands().is_empty());
+        app.composer.clear();
         app.state.prefs.typing_notices = false;
         type_text(&mut app, "quiet");
         assert!(app.take_commands().is_empty());
@@ -2588,7 +2609,11 @@ mod tests {
         });
         let asked = app.take_commands();
         assert!(
-            matches!(&asked[..], [Command::PreviewLink(url)] if url == "https://example.org/a"),
+            matches!(
+                &asked[..],
+                [Command::PreviewLink { room_id: room, url }]
+                    if url == "https://example.org/a" && *room == room_id
+            ),
             "{asked:?}"
         );
         app.on_update(Update::Timeline { room_id, items });

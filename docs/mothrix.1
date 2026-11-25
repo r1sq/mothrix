@@ -184,11 +184,14 @@ with the documentation (/usr/share/doc/mothrix, or docs/ in the source).
 .I ~/.config/mothrix/config.toml
 Settings, your own themes and key bindings, and
 .B proxy
-(an HTTP proxy for every connection; else the
-.B HTTPS_PROXY
-or
+(a proxy for every connection, HTTP or SOCKS; else the
+.BR HTTPS_PROXY ,
+.B HTTP_PROXY
+and
 .B ALL_PROXY
-environment variable). Readable only by you.
+environment variables, except for the hosts in
+.BR NO_PROXY ).
+Readable only by you.
 .TP
 .I ~/.local/share/mothrix/<profile>/
 One folder per account: session, encryption keys, log.

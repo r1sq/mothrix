@@ -32,6 +32,7 @@ sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+url.workspace = true
 
 # Not on the iPhone: its store is shared with the app's extensions, which
 # could not read the passphrase.

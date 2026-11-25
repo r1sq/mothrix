@@ -428,3 +428,45 @@ async fn one_verification_at_a_time_and_the_other_account_s_is_turned_down() {
         Some(VerifyState::Incoming { device }) if device == "Laptop"
     ));
 }
+
+#[tokio::test]
+async fn a_link_s_preview_is_asked_of_its_room_s_account_whoever_was_named_last() {
+    let (mut accounts, mut app, mut home, mut work) = two_accounts();
+    home.updates
+        .send(Update::Rooms(vec![room("!a", "Lunch")]))
+        .unwrap();
+    work.updates
+        .send(Update::Rooms(vec![room("!w", "Standup")]))
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    app.state.prefs.link_previews = true;
+    app.state.open_room = Some("!a".into());
+    // A key in the room info of the other account's room named that
+    // account; then a message with a link arrives in the open room.
+    app.state.named_account = Some(1);
+    home.updates
+        .send(Update::Timeline {
+            room_id: "!a".into(),
+            items: vec![Item {
+                event_id: "$1".into(),
+                body: "see https://example.org/a".into(),
+                ..Item::default()
+            }],
+        })
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    // News ends what the last action named.
+    assert_eq!(app.state.named_account, None);
+    for command in app.take_commands() {
+        accounts.send(&app, command);
+    }
+    assert!(work.sent().is_empty());
+    let asked = home.sent();
+    assert!(
+        asked
+            .iter()
+            .any(|command| command
+                == r#"PreviewLink { room_id: "!a", url: "https://example.org/a" }"#),
+        "{asked:?}"
+    );
+}

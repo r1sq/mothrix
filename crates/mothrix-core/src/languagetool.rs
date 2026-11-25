@@ -11,25 +11,36 @@ use serde_json::Value;
 
 use crate::model::GrammarMatch;
 
-/// The check address for what the user entered: the server's base address,
-/// its `/v2` address, or the full `/v2/check` address all work.
+/// Whether an address without `http://` or `https://` names this
+/// computer or one on the local network. The host is read the way the
+/// request will read it (`url`), and a number counts only as a whole
+/// address: `10.0.0.1.example.com` is a name out on the internet.
 fn is_local(address: &str) -> bool {
-    let host = address.split(['/', ':']).next().unwrap_or_default();
-    let octets: Vec<u8> = host
-        .split('.')
-        .filter_map(|part| part.parse().ok())
-        .collect();
-    host == "localhost"
-        || host.ends_with(".local")
-        || host.ends_with(".lan")
-        || host.ends_with(".box")
-        || !host.contains('.')
-        || matches!(
-            octets[..],
-            [10 | 127, _, _, _] | [192, 168, _, _] | [172, 16..=31, _, _]
-        )
+    let Ok(url) = url::Url::parse(&format!("http://{address}")) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        // This computer, and the ranges that are not routed: fc00::/7
+        // and fe80::/10.
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.segments()[0] & 0xfe00 == 0xfc00
+                || ip.segments()[0] & 0xffc0 == 0xfe80
+        }
+        Some(url::Host::Domain(host)) => {
+            host == "localhost"
+                || host.ends_with(".local")
+                || host.ends_with(".lan")
+                || host.ends_with(".box")
+                || !host.contains('.')
+        }
+        None => false,
+    }
 }
 
+/// The check address for what the user entered: the server's base address,
+/// its `/v2` address, or the full `/v2/check` address all work.
 pub fn endpoint(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
     // Without a scheme: encrypted, unless it is this computer or the
@@ -339,6 +350,36 @@ mod tests {
             assert_eq!(endpoint(given), "https://lt.example.org/v2/check");
         }
         assert_eq!(endpoint("localhost:8010"), "http://localhost:8010/v2/check");
+    }
+
+    #[test]
+    fn only_this_computer_and_the_local_network_are_reached_unencrypted() {
+        for local in [
+            "localhost:8010",
+            "127.0.0.1:8081",
+            "10.0.0.1",
+            "192.168.1.20:8081/v2",
+            "172.16.4.4",
+            "nas:8081",
+            "nas.lan",
+            "fritz.box",
+            "[::1]:8081",
+            "[fd12:3456::1]:8081",
+        ] {
+            assert!(endpoint(local).starts_with("http://"), "{local}");
+        }
+        for remote in [
+            "lt.example.org",
+            // A name that begins like a private address.
+            "10.0.0.1.example.com",
+            "192.168.1.1.evil.example:8081",
+            // An address out on the internet, though it has no dot.
+            "[2001:db8::1]:8081",
+            "172.32.0.1",
+            "8.8.8.8",
+        ] {
+            assert!(endpoint(remote).starts_with("https://"), "{remote}");
+        }
     }
 
     #[test]

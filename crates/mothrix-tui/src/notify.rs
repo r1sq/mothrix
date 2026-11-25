@@ -191,41 +191,56 @@ fn bring_terminal_to_front() {
     }
 }
 
+/// `osascript` showing a notification. The room name travels as an
+/// argument, not as script text; after "--", since it is someone else's
+/// text and may start with a dash, which would make it an option (`-i`
+/// starts an interactive osascript, `-e…` adds a line to the script).
+#[cfg(not(windows))]
+fn osascript(title: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("osascript");
+    command.args([
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 1 of argv) with title \"mothrix\"",
+        "-e",
+        "end run",
+        "--",
+        title,
+    ]);
+    command
+}
+
+/// `notify-send` showing a notification; "--" as for [`osascript`].
+#[cfg(not(windows))]
+fn notify_send(title: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("notify-send");
+    let icon = icon_file().map_or_else(
+        || "mail-unread".to_owned(),
+        |file| file.display().to_string(),
+    );
+    command.args([
+        "--app-name=mothrix",
+        &format!("--icon={icon}"),
+        "--",
+        title,
+        BODY,
+    ]);
+    command
+}
+
 /// `notify-send` or `osascript`. Best effort: without them, or over SSH,
 /// this does nothing; a click does nothing special.
 #[cfg(not(windows))]
 fn spawn_desktop_notification(_room: &str, title: &str, _clicks: &Clicks) {
     let mut command = if cfg!(target_os = "macos") {
-        // The room name travels as an argument, not as script text.
-        let mut command = std::process::Command::new("osascript");
-        command.args([
-            "-e",
-            "on run argv",
-            "-e",
-            "display notification (item 1 of argv) with title \"mothrix\"",
-            "-e",
-            "end run",
-            title,
-        ]);
-        command
+        osascript(title)
     } else {
-        let mut command = std::process::Command::new("notify-send");
-        let icon = icon_file().map_or_else(
-            || "mail-unread".to_owned(),
-            |file| file.display().to_string(),
-        );
-        // "--": a room's name is someone else's text and may start with
-        // a dash, which would make it an option.
-        command.args([
-            "--app-name=mothrix",
-            &format!("--icon={icon}"),
-            "--",
-            title,
-            BODY,
-        ]);
-        command
+        notify_send(title)
     };
     if let Ok(mut child) = command
+        // Not the terminal: neither tool is to read what the user types.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -337,6 +352,18 @@ fn click_id(answer: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_room_s_name_is_never_an_option_of_osascript() {
+        let command = osascript("-i");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        // The name is the last argument, and "--" stands before it.
+        assert_eq!(args[args.len() - 2..], ["--", "-i"], "{args:?}");
+    }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))

@@ -41,7 +41,12 @@ pub fn blocks(body: &str) -> Vec<Block> {
         .into_iter()
         .map(|segment| match segment {
             Segment::Text(text) => Block::Text { runs: runs(&text) },
-            Segment::Code { language, content } => Block::Code { language, content },
+            // The app copies a block as it is given: without what a
+            // terminal or editor it is pasted into would obey.
+            Segment::Code { language, content } => Block::Code {
+                language,
+                content: mothrix_core::message::copyable(&content),
+            },
         })
         .collect()
 }

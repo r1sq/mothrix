@@ -659,7 +659,7 @@ impl App {
         }
         let text = self.composer.text();
         // Nothing to check in an empty box or a command.
-        if text.trim().is_empty() || text.starts_with('/') {
+        if text.trim().is_empty() || super::is_command(text) {
             self.grammar_requested = None;
             return None;
         }
@@ -1323,6 +1323,11 @@ mod tests {
         let mut app = spelling();
         app.set_languagetool_url("http://lt.test".into());
         type_text(&mut app, "/poll teh");
+        assert!(app.take_grammar_request().is_none());
+        // A space in front still runs as a command: the recovery key
+        // must not go to the grammar server.
+        app.composer.clear();
+        type_text(&mut app, " /recover EsTc teh");
         assert!(app.take_grammar_request().is_none());
 
         app.composer.clear();

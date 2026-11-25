@@ -29,21 +29,30 @@ pub fn link_of(flags: u8) -> Option<bool> {
 
 /// The site an address leads to (`example.org` of
 /// `https://user@example.org:8443/path`), for showing beside a link whose
-/// text does not say.
-fn site(address: &str) -> &str {
-    let rest = address
-        .split_once("://")
-        .map_or_else(|| address.trim_start_matches("mailto:"), |(_, rest)| rest);
-    let rest = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
-    if address.starts_with("mailto:") {
-        return address
-            .trim_start_matches("mailto:")
-            .split('?')
-            .next()
-            .unwrap_or_default();
+/// text does not say; for `mailto:` whom the mail goes to. None for what
+/// mothrix neither shows as a link nor opens: another kind of address,
+/// and one a browser may read differently from how it looks.
+///
+/// The address is read the way browsers read it (`url`), not by hand:
+/// they skip extra slashes after `https:`, and take `\` for `/`, so that
+/// `https://evil.example\@bank.example/` leads to evil.example. An
+/// address with a `\` is refused altogether.
+pub fn site(address: &str) -> Option<String> {
+    let plain = !address
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\'));
+    let known = ["https://", "http://", "mailto:"]
+        .iter()
+        .any(|scheme| address.starts_with(scheme));
+    if !plain || !known {
+        return None;
     }
-    rest.split(':').next().unwrap_or_default()
+    let url = url::Url::parse(address).ok()?;
+    let site = match url.scheme() {
+        "mailto" => url.path(),
+        _ => url.host_str()?,
+    };
+    (!site.is_empty()).then(|| site.to_owned())
 }
 
 /// Whether a link's text already names the site it leads to: it is that
@@ -95,10 +104,7 @@ pub fn parse_links(text: &str) -> (Vec<Styled>, Vec<String>) {
 
 /// Addresses mothrix hands to the browser or mail program.
 fn opens(address: &[char]) -> bool {
-    ["https://", "http://", "mailto:"].iter().any(|scheme| {
-        let scheme: Vec<char> = scheme.chars().collect();
-        starts_with(address, 0, &scheme) && address.len() > scheme.len()
-    })
+    site(&address.iter().collect::<String>()).is_some()
 }
 
 /// The web address that starts at `at`, as far as it goes: up to white
@@ -124,9 +130,10 @@ fn address_at(chars: &[char], at: usize) -> Option<usize> {
         }
     }
     // More than just "https://".
-    (chars[at..end].iter().filter(|c| **c == '/').count() >= 2 && chars[end - 1] != '/'
+    ((chars[at..end].iter().filter(|c| **c == '/').count() >= 2 && chars[end - 1] != '/'
         || end - at > 8)
-        .then_some(end)
+        && opens(&chars[at..end]))
+    .then_some(end)
 }
 
 /// How long a link's text and its address may be, in characters.
@@ -319,8 +326,9 @@ fn walk(chars: &[char], flags: u8, out: &mut Vec<Styled>, links: &mut Vec<String
                     // Where it leads, unless its text says so: a link
                     // may be called anything, another site's address too.
                     let shown: String = out[before..].iter().map(|(c, _)| *c).collect();
-                    let site = site(&address);
-                    if !site.is_empty() && !names_site(&shown, site) {
+                    // `link_at` took only an address that has one.
+                    let site = site(&address).unwrap_or_default();
+                    if !site.is_empty() && !names_site(&shown, &site) {
                         out.extend(format!(" ({site})").chars().map(|c| (c, flags)));
                     }
                     links.push(address);
@@ -533,6 +541,27 @@ mod tests {
             shown("[write](mailto:amy@example.org?subject=x)"),
             "write (amy@example.org)"
         );
+
+        // The site is the one a browser goes to: it skips extra slashes,
+        // and what stands before an `@` is a user name.
+        assert_eq!(
+            shown("[https://bank.example/login](https:///evil.example/login)"),
+            "https://bank.example/login (evil.example)"
+        );
+        assert_eq!(shown("[x](https://[::1]:8080/)"), "x ([::1])");
+        // An address with a backslash is no link at all: browsers read
+        // `\` as `/`, so this one leads to evil.example.
+        for text in [
+            "[bank.example](https://evil.example\\@bank.example/login)",
+            "[pay](https://evil.example\\@bank.example/login)",
+            "https://evil.example\\@bank.example/login",
+            "[x](https://)",
+            "[x](mailto:?subject=x)",
+        ] {
+            let (styled, links) = parse_links(text);
+            assert!(links.is_empty(), "{text}");
+            assert!(styled.iter().all(|(_, flags)| flags & LINK == 0), "{text}");
+        }
 
         // A sentence's own brackets stay out; an address's own stay in.
         let (_, links) =

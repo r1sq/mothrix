@@ -131,7 +131,7 @@ fn scrub(buffer: &mut Buffer) {
 /// Control characters (C0, C1, DEL) and the bidi embeddings, overrides and
 /// isolates.
 fn unsafe_on_screen(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    crate::message::obeyed(c)
 }
 
 /// The dialogs and menus over the main screen, the one on top last. Each

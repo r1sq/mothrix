@@ -24,22 +24,32 @@ const HD_CELL_WIDTH_PX: u32 = 12;
 const MAX_SIDE: u32 = 10_000;
 const MAX_DECODED: u64 = 256 * 1024 * 1024;
 
-/// Decode `bytes`, turned as the camera said it was held (EXIF
-/// orientation: phones store a photo as the sensor saw it and say how to
-/// turn it).
-fn decode_upright(bytes: &[u8]) -> Option<image::DynamicImage> {
+/// What reads the picture in `bytes`, unless decoding it would take more
+/// memory than a large photo needs. A few kilobytes can claim to be a
+/// picture of any size, and decoding takes the memory it claims.
+fn decoder_of(bytes: &[u8]) -> Option<impl image::ImageDecoder + '_> {
     use image::ImageDecoder;
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
-    // A few kilobytes can claim to be a picture of any size, and decoding
-    // takes the memory it claims: no more than a large photo needs.
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
     limits.max_alloc = Some(MAX_DECODED);
     reader.limits(limits);
-    let mut decoder = reader.into_decoder().ok()?;
+    let decoder = reader.into_decoder().ok()?;
+    // The limits above hold for what the decoder itself needs. The
+    // picture it is decoded into is ours to check: the longest sides
+    // allowed, at eight bytes a pixel, would be 800 MB.
+    (decoder.total_bytes() <= MAX_DECODED).then_some(decoder)
+}
+
+/// Decode `bytes`, turned as the camera said it was held (EXIF
+/// orientation: phones store a photo as the sensor saw it and say how to
+/// turn it).
+fn decode_upright(bytes: &[u8]) -> Option<image::DynamicImage> {
+    use image::ImageDecoder;
+    let mut decoder = decoder_of(bytes)?;
     let orientation = decoder.orientation().ok();
     let mut picture = image::DynamicImage::from_decoder(decoder).ok()?;
     if let Some(orientation) = orientation {
@@ -197,6 +207,45 @@ mod tests {
         assert!(b > 200 && r < 60, "left is {r},{b}");
         let [r, _, b, _] = preview.pixel(37, 5);
         assert!(r > 200 && b < 60, "right is {r},{b}");
+    }
+
+    /// The beginning of a PNG that says it holds `side` x `side` pixels
+    /// of four 16-bit channels: all a decoder reads before it is asked
+    /// for the picture.
+    fn png_claiming(side: u32) -> Vec<u8> {
+        fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let named: Vec<u8> = kind.iter().chain(data).copied().collect();
+            let mut crc = u32::MAX;
+            for byte in &named {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            let mut out = (data.len() as u32).to_be_bytes().to_vec();
+            out.extend(named);
+            out.extend((!crc).to_be_bytes());
+            out
+        }
+        let mut header = Vec::new();
+        header.extend(side.to_be_bytes());
+        header.extend(side.to_be_bytes());
+        // 16 bits, red green blue alpha; no interlacing.
+        header.extend([16, 6, 0, 0, 0]);
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend(chunk(b"IHDR", &header));
+        bytes.extend(chunk(b"IDAT", &[0x78, 0x9c]));
+        bytes
+    }
+
+    #[test]
+    fn a_picture_that_would_decode_into_too_much_memory_is_not_decoded() {
+        // 10000 x 10000 at eight bytes a pixel: 800 MB out of a file
+        // that is small when its pixels are all alike.
+        assert!(decoder_of(&png_claiming(MAX_SIDE)).is_none());
+        assert!(make_preview(&png_claiming(MAX_SIDE)).is_none());
+        // The same kind of picture in a size a camera makes is read.
+        assert!(decoder_of(&png_claiming(4000)).is_some());
     }
 
     #[test]

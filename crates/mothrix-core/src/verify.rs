@@ -287,7 +287,8 @@ async fn compare(
         tokio::select! {
             next = changes.next() => {
                 state = next.context("the comparison went away")?;
-                tracing::info!(?state, "emoji comparison changed");
+                // Its name only: the state itself holds the emoji.
+                tracing::info!(state = step(&state), "emoji comparison changed");
                 nudge(client, request).await;
             }
             input = inputs.recv() => match input {
@@ -305,5 +306,36 @@ async fn compare(
                 Some(_) => {}
             },
         }
+    }
+}
+
+/// Where an emoji comparison stands, for the log: the state as it is
+/// would write the emoji (and the numbers) there, which are for the two
+/// people comparing and no one else.
+fn step(state: &SasState) -> &'static str {
+    match state {
+        SasState::Created { .. } => "created",
+        SasState::Started { .. } => "started",
+        SasState::Accepted { .. } => "accepted",
+        SasState::KeysExchanged { .. } => "keys exchanged",
+        SasState::Confirmed => "confirmed",
+        SasState::Done { .. } => "done",
+        SasState::Cancelled(_) => "cancelled",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_log_names_the_step_of_a_comparison_not_what_is_compared() {
+        let state = SasState::KeysExchanged {
+            emojis: None,
+            decimals: (1234, 5678, 9012),
+        };
+        assert_eq!(step(&state), "keys exchanged");
+        // What the log line had before: the numbers (and the emoji).
+        assert!(format!("{state:?}").contains("5678"));
     }
 }

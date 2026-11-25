@@ -884,10 +884,12 @@ impl View {
             }
             Action::Forward { .. } => {}
             Action::PreviewLink { url } => {
+                // Of the open room: its account's homeserver is asked.
                 if self.state.prefs.link_previews
+                    && let Some(room_id) = self.state.open_room.clone()
                     && self.state.link_previews_asked.insert(url.clone())
                 {
-                    return vec![Command::PreviewLink(url)];
+                    return vec![Command::PreviewLink { room_id, url }];
                 }
             }
             Action::Typing { active } => {
@@ -2137,7 +2139,13 @@ mod tests {
         };
         assert!(view.act(url()).is_empty());
         view.state.prefs.link_previews = true;
-        assert_eq!(view.act(url()).len(), 1);
+        // No room is open: there is no one to ask.
+        assert!(view.act(url()).is_empty());
+        view.act(Action::Open { room: "!a".into() });
+        assert!(matches!(
+            &view.act(url())[..],
+            [Command::PreviewLink { room_id, .. }] if room_id == "!a"
+        ));
         assert!(view.act(url()).is_empty());
     }
 

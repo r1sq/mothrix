@@ -389,10 +389,8 @@ async fn build_client(paths: &Paths, homeserver: &str, passphrase: Option<&str>)
         None => builder,
     };
     // Networks without a direct way out (school labs) have a proxy.
-    let builder = match crate::config::Config::read(&paths.config_file)?.proxy() {
-        Some(proxy) => builder.proxy(proxy),
-        None => builder,
-    };
+    let builder =
+        builder.http_client(crate::config::Config::read(&paths.config_file)?.matrix_http_client()?);
 
     let homeserver = homeserver.trim();
     let builder = if homeserver.starts_with("http://") || homeserver.starts_with("https://") {
@@ -580,7 +578,8 @@ pub async fn login(paths: &Paths, options: LoginOptions) -> Result<Client> {
             };
             Ok((user, password))
         },
-        |line| println!("{line}"),
+        // A line may hold the server's words (its address for signing in).
+        |line| println!("{}", crate::message::for_terminal(&line)),
     )
     .await
 }
@@ -774,7 +773,12 @@ pub async fn print_events(client: &Client, room_name: Option<&str>, limit: u32) 
     let (room, name) = chosen.context(
         "no such room (start mothrix once so it knows your rooms, then pass part of the room's name)",
     )?;
-    println!("# {name}  ({} events, newest first; text is masked)", limit);
+    // The name, and below the types and senders, are other people's
+    // text: nothing of it is to be obeyed by the terminal.
+    println!(
+        "# {}  ({limit} events, newest first; text is masked)",
+        crate::message::for_terminal(&name)
+    );
 
     let mut options = matrix_sdk::room::MessagesOptions::backward();
     options.limit = UInt::from(limit);
@@ -787,12 +791,13 @@ pub async fn print_events(client: &Client, room_name: Option<&str>, limit: u32) 
             continue;
         };
         let sender = value["sender"].as_str().unwrap_or("?");
-        println!(
+        let line = format!(
             "{}  from {}\n    {}",
             value["type"].as_str().unwrap_or("?"),
             convert::localpart(sender),
             shape_of(&value["content"]),
         );
+        println!("{}", crate::message::for_terminal(&line));
     }
     Ok(())
 }
@@ -912,6 +917,7 @@ impl Command {
             | Self::SetTopic { room_id, .. }
             | Self::SendForwarded { room_id, .. }
             | Self::Leave { room_id }
+            | Self::PreviewLink { room_id, .. }
             | Self::MarkRead { room_id } => Some(room_id),
             Self::Search { room_id, .. } => room_id.as_mut(),
             // About the open room, an account as a whole, or the desktop.
@@ -938,7 +944,6 @@ impl Command {
             | Self::Vote { .. }
             | Self::EndPoll { .. }
             | Self::TogglePin { .. }
-            | Self::PreviewLink(_)
             | Self::StopAudio
             | Self::OpenLink(_)
             | Self::OpenMedia { .. }
@@ -1098,8 +1103,14 @@ pub enum Command {
         content: String,
         encrypted_file: bool,
     },
-    /// Ask the homeserver what is behind a web address (title, summary).
-    PreviewLink(String),
+    /// Ask the homeserver what is behind a web address (title, summary)
+    /// that stands in a message of this room. The room says which
+    /// account's homeserver is asked, and lets the backend refuse for a
+    /// room it does not show or that is encrypted.
+    PreviewLink {
+        room_id: String,
+        url: String,
+    },
     /// Stop the audio that is playing.
     StopAudio,
     /// Hand a web address from a message to the browser.
@@ -2341,13 +2352,15 @@ impl Session {
                     encrypted_file: holds_encrypted_file(msgtype),
                 });
             }
-            Command::PreviewLink(url) => {
-                // The homeserver makes the preview, and would learn of a
-                // link from a room it cannot read otherwise.
-                if open
-                    .as_ref()
-                    .is_some_and(|current| current.room.encryption_state().is_encrypted())
-                {
+            Command::PreviewLink { room_id, url } => {
+                let shown = open.as_ref().map(|current| {
+                    let plain = matches!(
+                        current.room.encryption_state(),
+                        matrix_sdk::EncryptionState::NotEncrypted
+                    );
+                    (current.room_id.as_str(), plain)
+                });
+                if !previews_links(shown, &room_id) {
                     return Ok(());
                 }
                 let client = client.clone();
@@ -2397,13 +2410,20 @@ impl Session {
                 // Downloads can take a while; do not hold up other commands.
                 tokio::spawn(async move {
                     let update = match open_media(&client, &timeline, &event_id).await {
-                        Ok((path, _))
+                        Ok((path, Opened::Handed)) => Update::MediaFile {
+                            event_id,
+                            path: path.display().to_string(),
+                        },
+                        // In an app the folder is not one its user gets
+                        // to: there is no use in naming it.
+                        Ok((path, Opened::Kept))
                             if HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed) =>
                         {
-                            Update::MediaFile {
-                                event_id,
-                                path: path.display().to_string(),
-                            }
+                            Update::Notice(format!(
+                                "{} was not opened: mothrix only opens pictures, sound, video \
+                                 and documents.",
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            ))
                         }
                         Ok((_, Opened::Playing)) => {
                             Update::Notice("Playing; /stop ends it.".to_owned())
@@ -2671,7 +2691,10 @@ async fn account_command(
                     }
                     CrossSigningResetAuthType::OAuth(info) => {
                         let url = info.approval_url.to_string();
-                        let _ = open_with_desktop(url.as_ref());
+                        // Any other address is only shown.
+                        if approval_opens(&url) {
+                            let _ = open_with_desktop(url.as_ref());
+                        }
                         let _ = tx.send(Update::Notice(format!(
                             "Approve the reset in your browser: {url}"
                         )));
@@ -2730,14 +2753,42 @@ async fn account_command(
     Ok(())
 }
 
-/// Whether an address is one a browser or mail program is meant to get.
+/// Whether the homeserver is asked what is behind a link of the room
+/// `asked`. It makes the preview, and would learn of a link from a room
+/// it cannot read otherwise: only for the room open here (`shown`: its
+/// id, and whether it is known not to be encrypted), so that the answer
+/// is this account's own and about a room whose state it has.
+fn previews_links(shown: Option<(&str, bool)>, asked: &str) -> bool {
+    shown.is_some_and(|(room_id, plain)| plain && room_id == asked)
+}
+
+/// A user id as it stands in a matrix.to address. Ids from the early
+/// days may hold nearly anything: a `)` would end the Markdown link the
+/// id is put into, and what follows it would be read as Markdown or HTML
+/// of ours. Whatever is not usual in an id is percent-encoded.
+fn in_address(user_id: &str) -> String {
+    let mut out = String::with_capacity(user_id.len());
+    for byte in user_id.bytes() {
+        if byte.is_ascii_alphanumeric() || b"@:._=-/+".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Whether an address is one a browser or mail program is meant to get:
+/// the same ones a message shows as links ([`crate::inline::site`]).
 fn desktop_opens(address: &str) -> bool {
-    ["https://", "http://", "mailto:"]
-        .iter()
-        .any(|scheme| address.starts_with(scheme))
-        && !address
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || c == '"')
+    crate::inline::site(address).is_some()
+}
+
+/// Whether the address a homeserver names for approving an identity
+/// reset is opened in the browser. The server may name anything: only a
+/// web page, and only an encrypted one.
+fn approval_opens(address: &str) -> bool {
+    address.starts_with("https://") && desktop_opens(address)
 }
 
 /// What `/backup` (`renew`: `/backup new`) does about key backup.
@@ -2995,7 +3046,7 @@ impl MessageParts {
                         .collect();
                     source.push_str(&format!(
                         "[{label}](https://matrix.to/#/{})",
-                        member.user_id
+                        in_address(&member.user_id)
                     ));
                     plain.push_str(&member.name);
                     if !mentioned.contains(user_id) {
@@ -3166,8 +3217,11 @@ fn play_audio(path: &Path) -> bool {
             "--no-video",
             "--really-quiet",
             "--no-terminal",
-            // Nothing but this file: no fetching through yt-dlp.
+            // Nothing but this file: no fetching through yt-dlp, and
+            // should mpv take it for a list after all, nothing the list
+            // names that is not a plain file beside it.
             "--no-ytdl",
+            "--load-unsafe-playlists=no",
         ])
         .arg(path)
         .stdin(std::process::Stdio::null())
@@ -3219,23 +3273,43 @@ enum Opened {
     Shown,
     /// Played here, with mpv.
     Playing,
-    /// Saved only (or handed to the app, on the iPhone).
+    /// Saved only.
     Kept,
+    /// Saved for the app to show ([`hand_media_over`]).
+    Handed,
 }
 
 /// The kinds of file the desktop is asked to open, by the ending of the
 /// name: pictures, sound, video and documents. The name comes from
 /// whoever sent the file, and "open" would run a program, a script or a
 /// shortcut called `holiday.bat` as readily as it shows a picture.
-const OPENED_BY_ITSELF: [&str; 34] = [
-    "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "mp3", "ogg", "oga", "opus", "m4a",
-    "aac", "flac", "wav", "mp4", "webm", "mkv", "mov", "avi", "pdf", "txt", "md", "csv", "odt",
-    "ods", "odp", "docx", "xlsx", "pptx", "rtf", "epub", "ics",
+///
+/// No `svg`: where no viewer is set for it the browser opens it, and to
+/// a browser it is a page with scripts.
+const OPENED_BY_ITSELF: [&str; 33] = [
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "mp3", "ogg", "oga", "opus", "m4a", "aac",
+    "flac", "wav", "mp4", "webm", "mkv", "mov", "avi", "pdf", "txt", "md", "csv", "odt", "ods",
+    "odp", "docx", "xlsx", "pptx", "rtf", "epub", "ics",
 ];
 
-fn opened_by_itself(name: &str) -> bool {
+/// The endings mpv is given: by a name like `voice.m3u` or `voice.txt` it
+/// would take a file for a list of addresses to play, whatever the file
+/// begins with.
+const SOUND_ENDINGS: [&str; 9] = [
+    "mp3", "ogg", "oga", "opus", "m4a", "aac", "flac", "wav", "webm",
+];
+
+fn ending_in(name: &str, endings: &[&str]) -> bool {
     name.rsplit_once('.')
-        .is_some_and(|(_, ending)| OPENED_BY_ITSELF.contains(&ending.to_lowercase().as_str()))
+        .is_some_and(|(_, ending)| endings.contains(&ending.to_lowercase().as_str()))
+}
+
+fn opened_by_itself(name: &str) -> bool {
+    ending_in(name, &OPENED_BY_ITSELF)
+}
+
+fn named_as_sound(name: &str) -> bool {
+    ending_in(name, &SOUND_ENDINGS)
 }
 
 /// The ending a picture's own bytes call for, whatever its name says.
@@ -3250,31 +3324,64 @@ fn picture_ending(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Whether `bytes` begin like a sound file. mpv would also take a list of
-/// addresses to play (called `voice.ogg`), and fetch them.
-fn is_sound(bytes: &[u8]) -> bool {
+/// The ending a sound file's own bytes call for; none for what does not
+/// begin like sound. mpv would also take a list of addresses to play
+/// (called `voice.ogg`), and fetch them.
+fn sound_ending(bytes: &[u8]) -> Option<&'static str> {
     let starts = |magic: &[u8]| bytes.starts_with(magic);
-    starts(b"OggS")
-        || starts(b"ID3")
-        || starts(b"fLaC")
-        || starts(b"\x1a\x45\xdf\xa3")
-        || (starts(b"RIFF") && bytes.get(8..12) == Some(b"WAVE"))
-        || bytes.get(4..8) == Some(b"ftyp")
-        || matches!(bytes, [0xff, second, ..] if second & 0xe0 == 0xe0)
+    if starts(b"OggS") {
+        Some("ogg")
+    } else if starts(b"ID3") || matches!(bytes, [0xff, second, ..] if second & 0xe0 == 0xe0) {
+        Some("mp3")
+    } else if starts(b"fLaC") {
+        Some("flac")
+    } else if starts(b"\x1a\x45\xdf\xa3") {
+        Some("webm")
+    } else if starts(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        Some("wav")
+    } else if bytes.get(4..8) == Some(b"ftyp") {
+        Some("m4a")
+    } else {
+        None
+    }
 }
 
 /// The name an attachment is saved under: the sender's, made harmless,
-/// with the ending a picture's bytes call for, and a mark of its message
-/// in front so that two files of one name do not overwrite each other.
-fn saved_name(name: &str, event_id: &str, picture: Option<&'static str>) -> String {
+/// with the ending its bytes call for (`ending`: of a picture or, with
+/// `sound`, of an audio message) unless it has a fitting one, and a mark
+/// of its message in front so that two files of one name do not overwrite
+/// each other.
+fn saved_name(name: &str, event_id: &str, ending: Option<&'static str>, sound: bool) -> String {
     let mut name = safe_file_name(name);
-    if let Some(ending) = picture
-        && !opened_by_itself(&name)
+    let fits = if sound {
+        named_as_sound(&name)
+    } else {
+        opened_by_itself(&name)
+    };
+    if let Some(ending) = ending
+        && !fits
     {
         name = format!("{name}.{ending}");
     }
     let mark = hex::encode(&<sha2::Sha256 as sha2::Digest>::digest(event_id.as_bytes())[..3]);
     format!("{mark}-{name}")
+}
+
+/// What is done with a downloaded attachment saved as `name`. `sound`
+/// says of an audio message whether it begins like sound (`None`: not an
+/// audio message); `hand_over` that an app shows files itself.
+fn way_to_open(name: &str, sound: Option<bool>, hand_over: bool) -> Opened {
+    // An audio message that is no sound is something else under that
+    // name: nothing gets to open it, whatever its ending.
+    if sound == Some(false) || !opened_by_itself(name) {
+        Opened::Kept
+    } else if hand_over {
+        Opened::Handed
+    } else if sound == Some(true) && named_as_sound(name) {
+        Opened::Playing
+    } else {
+        Opened::Shown
+    }
 }
 
 async fn open_media(
@@ -3315,20 +3422,26 @@ async fn open_media(
         .join("media");
     // What an encrypted room sent lies here decrypted.
     crate::folders::private_dir(&dir)?;
-    let picture = matches!(message.msgtype(), MessageType::Image(_))
-        .then(|| picture_ending(&bytes))
-        .flatten();
-    let path = dir.join(saved_name(&name, event_id, picture));
+    let sound = matches!(message.msgtype(), MessageType::Audio(_));
+    let ending = match message.msgtype() {
+        MessageType::Image(_) => picture_ending(&bytes),
+        MessageType::Audio(_) => sound_ending(&bytes),
+        _ => None,
+    };
+    let path = dir.join(saved_name(&name, event_id, ending, sound));
     crate::folders::write_private(&path, &bytes)?;
 
-    if HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok((path, Opened::Kept));
-    }
-    if matches!(message.msgtype(), MessageType::Audio(_)) && is_sound(&bytes) && play_audio(&path) {
-        return Ok((path, Opened::Playing));
-    }
-    if !opened_by_itself(&path.to_string_lossy()) {
-        return Ok((path, Opened::Kept));
+    let hand_over = HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed);
+    let way = way_to_open(
+        &path.to_string_lossy(),
+        sound.then_some(ending.is_some()),
+        hand_over,
+    );
+    match way {
+        Opened::Kept | Opened::Handed => return Ok((path, way)),
+        // Without mpv the desktop's player gets it.
+        Opened::Playing if play_audio(&path) => return Ok((path, way)),
+        Opened::Playing | Opened::Shown => {}
     }
     open_with_desktop(path.as_os_str())
         .with_context(|| format!("saved to {}, but could not start a viewer", path.display()))?;
@@ -4034,7 +4147,9 @@ mod tests {
 
     #[test]
     fn only_harmless_kinds_of_file_are_opened_and_under_a_name_that_fits() {
-        use super::{is_sound, opened_by_itself, picture_ending, saved_name};
+        use super::{
+            Opened, opened_by_itself, picture_ending, saved_name, sound_ending, way_to_open,
+        };
         assert!(opened_by_itself("Holiday.PNG") && opened_by_itself("minutes.pdf"));
         for name in [
             "holiday.bat",
@@ -4043,6 +4158,8 @@ mod tests {
             "x.desktop",
             "run.sh",
             "noending",
+            // A browser would run its scripts.
+            "drawing.svg",
         ] {
             assert!(!opened_by_itself(name), "{name}");
         }
@@ -4050,24 +4167,70 @@ mod tests {
         let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         assert_eq!(picture_ending(&png), Some("png"));
         assert!(
-            saved_name("holiday.bat", "$1", picture_ending(&png)).ends_with("-holiday.bat.png")
-        );
-        assert!(saved_name("holiday.png", "$1", picture_ending(&png)).ends_with("-holiday.png"));
-        assert_ne!(
-            saved_name("a.png", "$1", None),
-            saved_name("a.png", "$2", None)
+            saved_name("holiday.bat", "$1", picture_ending(&png), false)
+                .ends_with("-holiday.bat.png")
         );
         assert!(
-            saved_name("../../CON.txt", "$1", None).ends_with("-_.._CON.txt")
-                || saved_name("CON.txt", "$1", None).ends_with("-_CON.txt")
+            saved_name("holiday.png", "$1", picture_ending(&png), false).ends_with("-holiday.png")
+        );
+        assert_ne!(
+            saved_name("a.png", "$1", None, false),
+            saved_name("a.png", "$2", None, false)
+        );
+        assert!(
+            saved_name("../../CON.txt", "$1", None, false).ends_with("-_.._CON.txt")
+                || saved_name("CON.txt", "$1", None, false).ends_with("-_CON.txt")
         );
         assert_eq!(super::safe_file_name("nul"), "_nul");
         assert_eq!(super::safe_file_name("com1.txt"), "_com1.txt");
         // Sound is sound; a list of addresses is not.
-        assert!(
-            is_sound(b"OggS\0\x02") && is_sound(b"ID3\x04") && is_sound(b"RIFF\0\0\0\0WAVEfmt ")
-        );
-        assert!(!is_sound(b"#EXTM3U\nhttps://example.org/a.mp3") && !is_sound(b"https://x"));
+        assert_eq!(sound_ending(b"OggS\0\x02"), Some("ogg"));
+        assert_eq!(sound_ending(b"ID3\x04"), Some("mp3"));
+        assert_eq!(sound_ending(b"RIFF\0\0\0\0WAVEfmt "), Some("wav"));
+        assert_eq!(sound_ending(b"#EXTM3U\nhttps://example.org/a.mp3"), None);
+        assert_eq!(sound_ending(b"https://x"), None);
+
+        // Hand a file to the app only when it is of a kind that is
+        // opened; `sound` is what an audio message's bytes say.
+        let way = |name: &str, sound: Option<bool>| way_to_open(name, sound, false);
+        assert_eq!(way("a.png", None), Opened::Shown);
+        assert_eq!(way("voice.ogg", Some(true)), Opened::Playing);
+        // A sound file sent as a file goes to the desktop's player.
+        assert_eq!(way("song.mp3", None), Opened::Shown);
+        for name in ["invoice.html", "x.svg", "page.webarchive", "model.usdz"] {
+            assert_eq!(way(name, None), Opened::Kept, "{name}");
+            assert_eq!(way_to_open(name, None, true), Opened::Kept, "{name}");
+        }
+        assert_eq!(way_to_open("a.png", None, true), Opened::Handed);
+        assert_eq!(way_to_open("voice.ogg", Some(true), true), Opened::Handed);
+    }
+
+    #[test]
+    fn an_audio_message_that_is_not_sound_reaches_no_player() {
+        use super::{Opened, saved_name, sound_ending, way_to_open};
+        // A list of addresses called `voice.ogg`: neither mpv nor the
+        // desktop's player (nor the app) gets it.
+        let list = b"#EXTM3U\nhttps://example.org/a.mp3";
+        let name = saved_name("voice.ogg", "$1", sound_ending(list), true);
+        assert!(name.ends_with("-voice.ogg"), "{name}");
+        for hand_over in [false, true] {
+            assert_eq!(way_to_open(&name, Some(false), hand_over), Opened::Kept);
+        }
+        // A list that begins like sound, under a list's name: saved as
+        // the sound it begins like, so that mpv does not read it by its
+        // name.
+        let name = saved_name("voice.m3u", "$1", sound_ending(b"OggS\nhttps://x"), true);
+        assert!(name.ends_with("-voice.m3u.ogg"), "{name}");
+        assert_eq!(way_to_open(&name, Some(true), false), Opened::Playing);
+        // Also under a name that is opened, but not as sound.
+        let name = saved_name("voice.txt", "$1", sound_ending(b"OggS\0"), true);
+        assert!(name.ends_with("-voice.txt.ogg"), "{name}");
+        // And never played under a name mpv could read as a list.
+        assert_eq!(way_to_open("voice.txt", Some(true), false), Opened::Shown);
+        assert_eq!(way_to_open("voice.m3u", Some(true), false), Opened::Kept);
+        // A voice message without an ending still plays.
+        let name = saved_name("Voice message", "$1", sound_ending(b"OggS\0"), true);
+        assert_eq!(way_to_open(&name, Some(true), false), Opened::Playing);
     }
 
     #[test]
@@ -4096,6 +4259,40 @@ mod tests {
             serde_json::json!(["@amy:x.org", "@amyw:x.org"])
         );
         assert_eq!(json["format"], "org.matrix.custom.html");
+    }
+
+    #[test]
+    fn a_user_id_cannot_put_a_link_or_html_into_a_mention() {
+        assert_eq!(super::in_address("@amy:x.org"), "@amy:x.org");
+        assert_eq!(
+            super::in_address("@a)<b>*[ä%:x.org"),
+            "@a%29%3Cb%3E%2A%5B%C3%A4%25:x.org"
+        );
+        let id = "@a)[pay-here](//evil.example/x)<img src=x>:evil.example";
+        let parts = MessageParts::new("hi @Amy", &[member(id, "Amy")]);
+        // The id is one the SDK takes, so the mention is made.
+        assert_eq!(parts.mentioned.len(), 1, "the id must count as one");
+        let html = parts.html.expect("mentions make html");
+        assert_eq!(html.matches("<a ").count(), 1, "{html}");
+        assert!(!html.contains("<img"), "{html}");
+        assert!(
+            html.contains(
+                "href=\"https://matrix.to/#/@a%29%5Bpay-here%5D%28//evil.example/x%29%3Cimg%20src=x%3E:evil.example\""
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn links_are_previewed_only_for_the_open_room_when_it_is_not_encrypted() {
+        use super::previews_links;
+        assert!(previews_links(Some(("!a:x", true)), "!a:x"));
+        // Encrypted, or not known yet.
+        assert!(!previews_links(Some(("!a:x", false)), "!a:x"));
+        // Another account's room is open, and this one has none open or
+        // another one: its homeserver is not asked.
+        assert!(!previews_links(None, "!a:x"));
+        assert!(!previews_links(Some(("!b:x", true)), "!a:x"));
     }
 
     #[test]
@@ -4129,6 +4326,28 @@ mod tests {
         assert!(!desktop_opens("https://example.org/ --flag"));
         assert!(!desktop_opens("https://example.org/\"&calc"));
         assert!(!desktop_opens("https://example.org/\u{1b}[2J"));
+        // Nor what a browser reads differently from how it looks, or
+        // what is no address.
+        assert!(!desktop_opens("https://evil.example\\@bank.example/login"));
+        assert!(!desktop_opens("https://"));
+        assert!(!desktop_opens("mailto:"));
+    }
+
+    #[test]
+    fn an_identity_reset_opens_only_a_web_page_the_server_names() {
+        assert!(super::approval_opens(
+            "https://account.example.org/reset?x=1"
+        ));
+        for address in [
+            "file://host/share/x.exe",
+            "smb://host/share",
+            "ms-msdt:/id",
+            "http://account.example.org/reset",
+            "mailto:amy@example.org",
+            "https://evil.example\\@account.example.org/",
+        ] {
+            assert!(!super::approval_opens(address), "{address}");
+        }
     }
 
     #[test]

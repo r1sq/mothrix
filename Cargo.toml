@@ -12,7 +12,8 @@ publish = false
 
 [workspace.dependencies]
 mothrix-core = { path = "crates/mothrix-core" }
-matrix-sdk = { version = "0.19.0", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "bundled-sqlite", "rustls-aws-lc-rs", "sso-login", "markdown"] }
+# "socks": for ALL_PROXY=socks5://…; it brings no crate along.
+matrix-sdk = { version = "0.19.0", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "bundled-sqlite", "rustls-aws-lc-rs", "sso-login", "markdown", "socks"] }
 matrix-sdk-ui = "0.19.0"
 matrix-sdk-base = "0.19.0"
 spellbook = "0.4.0"
@@ -44,6 +45,8 @@ getrandom = "0.4"
 keyring = "4.2"
 mime_guess = "2"
 tracing = "0.1"
+# Reads a link's address the way a browser does (the SDK uses it already).
+url = "2"
 tracing-subscriber = "0.3"
 
 # Disk space on the development machine is tight: full debug info made

@@ -65,7 +65,7 @@ pub fn offered(item: &Item, in_thread: bool) -> Offered {
 /// What "copy" puts on the clipboard for a message: its text, and for a
 /// poll the question with its answers.
 pub fn copy_text(item: &Item) -> String {
-    match &item.kind {
+    let text = match &item.kind {
         ItemKind::Poll(poll) => {
             let mut text = poll.question.clone();
             for answer in &poll.answers {
@@ -75,7 +75,41 @@ pub fn copy_text(item: &Item) -> String {
             text
         }
         _ => item.body.clone(),
-    }
+    };
+    copyable(&text)
+}
+
+/// Characters that are obeyed rather than shown: control characters (C0,
+/// C1, DEL) and the bidi embeddings, overrides and isolates, which let a
+/// text show in another order than it has.
+pub fn obeyed(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Other people's text as it goes to the clipboard: what is pasted into
+/// a terminal or an editor next is typed there, so an escape sequence or
+/// a text that reads otherwise than it is stays behind. Lines and tabs
+/// are kept.
+pub fn copyable(text: &str) -> String {
+    text.chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !obeyed(*c))
+        .collect()
+}
+
+/// Text for a plain terminal: what the command-line modes print of a
+/// server's words (names, event types, error messages), where no screen
+/// is drawn that would take care. An escape sequence there could write
+/// the clipboard or answer as if typed. A control character shows as
+/// "\u{fffd}", the bidi ones go; lines and tabs are kept.
+pub fn for_terminal(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' | '\t' => Some(c),
+            c if c.is_control() => Some('\u{fffd}'),
+            c if obeyed(c) => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 /// The poll of the message `event_id` among `items`.
@@ -160,6 +194,25 @@ pub fn mentions_kept(text: &str, mentions: Vec<Member>) -> Vec<Member> {
 mod tests {
     use super::*;
     use crate::model::PollAnswer;
+
+    #[test]
+    fn copy_leaves_out_what_a_terminal_or_editor_would_obey() {
+        let body = "run\tthis:\n\u{1b}]52;c;ZXZpbA==\u{7}ls \u{202e}gnp.exe\u{2069}\r";
+        assert_eq!(
+            copy_text(&item(ItemKind::Text, body)),
+            "run\tthis:\n]52;c;ZXZpbA==ls gnp.exe"
+        );
+        assert_eq!(copyable("plain ä 漢 👍"), "plain ä 漢 👍");
+    }
+
+    #[test]
+    fn a_plain_terminal_gets_no_control_characters() {
+        assert_eq!(
+            for_terminal("M_FORBIDDEN: \u{1b}]52;c;eA==\u{7}no\u{9b}\u{202e}\n\tnext"),
+            "M_FORBIDDEN: \u{fffd}]52;c;eA==\u{fffd}no\u{fffd}\n\tnext"
+        );
+        assert_eq!(for_terminal("Zoë's room"), "Zoë's room");
+    }
 
     fn item(kind: ItemKind, body: &str) -> Item {
         Item {

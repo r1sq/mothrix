@@ -511,6 +511,10 @@ impl Accounts {
         let Some(account) = self.slots.iter().position(|slot| slot.id == id) else {
             return;
         };
+        // News is no action of the user: which account the last one named
+        // says nothing about the commands this leads to (a link to
+        // preview, a receipt).
+        app.state_mut().named_account = None;
         // Inside the UI a room is known by its key.
         let prefix = &self.slots[account].prefix;
         for room_id in update.room_ids_mut() {

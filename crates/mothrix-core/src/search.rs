@@ -115,6 +115,23 @@ fn hit_from_event(
     })
 }
 
+/// A hit out of the server's answer: for a room that was asked about
+/// (`names`), and not for an encrypted one. The server cannot read those,
+/// so a "message" it finds there is one it made up, and would stand
+/// among the real ones under the room's and a member's name.
+fn hit_from_server(
+    event: &Value,
+    names: &HashMap<String, String>,
+    encrypted: &HashSet<String>,
+    terms: &[String],
+) -> Option<SearchHit> {
+    let room_id = event["room_id"].as_str()?;
+    if encrypted.contains(room_id) {
+        return None;
+    }
+    hit_from_event(event, room_id, names.get(room_id)?, terms)
+}
+
 async fn room_name(room: &Room) -> String {
     match room.cached_display_name() {
         Some(name) => name.to_string(),
@@ -137,8 +154,12 @@ pub async fn search(client: &Client, query: &str, only_room: Option<&RoomId>) ->
         None => client.joined_rooms(),
     };
     let mut names = HashMap::new();
+    let mut encrypted = HashSet::new();
     for room in &rooms {
         names.insert(room.room_id().to_string(), room_name(room).await);
+        if room.encryption_state().is_encrypted() {
+            encrypted.insert(room.room_id().to_string());
+        }
     }
 
     let mut hits: Vec<SearchHit> = Vec::new();
@@ -196,13 +217,7 @@ pub async fn search(client: &Client, query: &str, only_room: Option<&RoomId>) ->
             let Ok(value) = serde_json::from_str::<Value>(raw.json().get()) else {
                 continue;
             };
-            let Some(room_id) = value["room_id"].as_str() else {
-                continue;
-            };
-            let Some(name) = names.get(room_id) else {
-                continue;
-            };
-            if let Some(hit) = hit_from_event(&value, room_id, name, &terms)
+            if let Some(hit) = hit_from_server(&value, &names, &encrypted, &terms)
                 && seen.insert(hit.event_id.clone())
             {
                 hits.push(hit);
@@ -287,5 +302,26 @@ mod tests {
 
         let other = json!({"type": "m.reaction", "event_id": "$3", "content": {"body": "lunch"}});
         assert!(hit_from_event(&other, "!r", "Club", &terms).is_none());
+    }
+
+    #[test]
+    fn the_server_s_hits_for_encrypted_and_unknown_rooms_are_dropped() {
+        let terms = terms("iban");
+        let names: HashMap<String, String> = [("!open", "Club"), ("!dm", "Amy")]
+            .into_iter()
+            .map(|(id, name)| (id.to_owned(), name.to_owned()))
+            .collect();
+        let encrypted: HashSet<String> = ["!dm".to_owned()].into();
+        let event = |room: &str| {
+            json!({
+                "type": "m.room.message", "event_id": "$1", "sender": "@amy:x", "room_id": room,
+                "content": {"msgtype": "m.text", "body": "my new IBAN is DE00"},
+            })
+        };
+        let hit = |room: &str| hit_from_server(&event(room), &names, &encrypted, &terms);
+        assert_eq!(hit("!open").expect("a hit").room_name, "Club");
+        // The server cannot read the direct chat: this one is invented.
+        assert!(hit("!dm").is_none());
+        assert!(hit("!elsewhere").is_none());
     }
 }

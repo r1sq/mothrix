@@ -96,10 +96,11 @@ pub struct Prefs {
     pub languagetool_username: String,
     #[serde(default)]
     pub languagetool_api_key: String,
-    /// An HTTP proxy for every connection, like "http://proxy:3128", for
-    /// networks without a direct way out. Empty (the default): the
-    /// `HTTPS_PROXY` or `ALL_PROXY` environment variable if set, else
-    /// direct. Used from the next start (and by new sign-ins).
+    /// A proxy for every connection, like "http://proxy:3128" (or
+    /// socks5://…), for networks without a direct way out. Empty (the
+    /// default): the environment's (`HTTPS_PROXY`, `HTTP_PROXY`,
+    /// `ALL_PROXY`, but for the hosts in `NO_PROXY`) if set, else direct.
+    /// Used from the next start (and by new sign-ins).
     #[serde(default)]
     pub proxy: String,
     /// Fold messages longer than this many lines; 0 shows all in full.

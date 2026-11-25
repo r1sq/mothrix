@@ -351,29 +351,20 @@ fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) ->
                             let mut next_link = 0usize;
                             let mut in_link: Option<(usize, bool)> = None;
                             for styled in inline::wrap(&parsed, body_width) {
-                                let mut link_spots: Vec<(usize, usize, usize)> = Vec::new();
-                                let mut column = 2usize;
-                                for (c, flags) in &styled {
-                                    let cells = crate::inline::cells(*c);
+                                // The link each character belongs to.
+                                let mut link_of_char: Vec<Option<usize>> =
+                                    Vec::with_capacity(styled.len());
+                                for (_, flags) in &styled {
                                     if let Some(kind) = inline::link_of(*flags) {
                                         // Another link, also right after one.
                                         if in_link.is_none_or(|(_, last)| last != kind) {
                                             in_link = Some((next_link, kind));
                                             next_link += 1;
                                         }
-                                        let link = in_link.map_or(0, |(link, _)| link);
-                                        match link_spots.last_mut() {
-                                            Some((last, start, width))
-                                                if *last == link && *start + *width == column =>
-                                            {
-                                                *width += cells;
-                                            }
-                                            _ => link_spots.push((link, column, cells)),
-                                        }
                                     } else {
                                         in_link = None;
                                     }
-                                    column += cells;
+                                    link_of_char.push(in_link.map(|(link, _)| link));
                                 }
                                 let mut spans = vec![Span::raw("  ")];
                                 let mut run = String::new();
@@ -408,14 +399,27 @@ fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) ->
                                     }
                                     spans.push(Span::styled(std::mem::take(run), look));
                                 };
-                                for (c, flags) in styled {
+                                // One entry per span: the link it is of.
+                                let mut span_links: Vec<Option<usize>> = vec![None];
+                                let mut run_link = None;
+                                for ((c, flags), link) in styled.into_iter().zip(link_of_char) {
+                                    // Two links side by side differ in
+                                    // their flags, so a run is of one.
                                     if flags != run_flags {
+                                        if !run.is_empty() {
+                                            span_links.push(run_link);
+                                        }
                                         flush(&mut run, run_flags, &mut spans);
                                         run_flags = flags;
                                     }
+                                    run_link = link;
                                     run.push(c);
                                 }
+                                if !run.is_empty() {
+                                    span_links.push(run_link);
+                                }
                                 flush(&mut run, run_flags, &mut spans);
+                                let link_spots = link_spots(&spans, &span_links);
                                 let mut entry = Row::of(item, Line::from(spans));
                                 for (link, start, width) in link_spots {
                                     if let Some(address) = links.get(link) {
@@ -640,6 +644,34 @@ fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) ->
 const NAMES_SHOWN: usize = 3;
 
 /// Who reacted so: the user ("you") first, then the others in order.
+/// Where the links of a row are on the screen: (link, first column,
+/// cells) for the spans that are of a link (`links`, one entry per span).
+/// Measured the way the terminal library places a row, by what is drawn
+/// as one sign: counting character by character, "a" with an invisible
+/// U+FE0F after it or a family emoji would count wider than it is drawn,
+/// and a click on one link would open the one before it.
+fn link_spots(spans: &[Span], links: &[Option<usize>]) -> Vec<(usize, usize, usize)> {
+    use unicode_width::UnicodeWidthStr;
+    let mut spots: Vec<(usize, usize, usize)> = Vec::new();
+    let mut column = 0usize;
+    for (span, link) in spans.iter().zip(links) {
+        let cells: usize = span
+            .styled_graphemes(Style::default())
+            .map(|grapheme| grapheme.symbol.width())
+            .sum();
+        if let Some(link) = *link {
+            match spots.last_mut() {
+                Some((last, start, width)) if *last == link && *start + *width == column => {
+                    *width += cells;
+                }
+                _ => spots.push((link, column, cells)),
+            }
+        }
+        column += cells;
+    }
+    spots
+}
+
 fn reaction_names(reaction: &Reaction) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     if reaction.mine {
@@ -989,6 +1021,36 @@ mod tests {
         let layout = Layout::of(items, &Options::of(&app, width));
         let text = layout.rows.iter().map(|row| row.line.to_string()).collect();
         (text, layout)
+    }
+
+    #[test]
+    fn a_link_s_click_target_is_where_the_link_is_drawn() {
+        use ratatui::widgets::Widget;
+        // Signs that count wider character by character than they are
+        // drawn: letters with an invisible U+FE0F, a family emoji.
+        let body = "a\u{fe0f}b\u{fe0f}c\u{fe0f} 👨\u{200d}👩\u{200d}👧 https://one.example/a and https://two.example/b";
+        let (_, layout) = laid_out(&[message("$1", body)], 100, |_| {});
+        let row = layout
+            .rows
+            .iter()
+            .find(|row| !row.spots.is_empty())
+            .expect("a row with links");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 1));
+        (&row.line).render(buffer.area, &mut buffer);
+        let drawn: Vec<String> = row
+            .spots
+            .iter()
+            .map(|(start, width, _)| {
+                (*start..*start + *width)
+                    .map(|x| buffer[(x as u16, 0)].symbol().to_owned())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(drawn, ["https://one.example/a", "https://two.example/b"]);
+        assert!(matches!(
+            &row.spots[1].2,
+            HitAction::OpenLink(address) if address == "https://two.example/b"
+        ));
     }
 
     fn message(event_id: &str, body: &str) -> Item {
