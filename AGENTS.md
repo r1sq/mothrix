@@ -293,7 +293,10 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   old process); Windows cannot, and says to start it again.
 - **Versions** are SemVer, in one place: `[workspace.package] version`
   in `Cargo.toml` (the iOS app takes it from there, `build-rust.sh`). A
-  release raises it and is tagged `vX.Y.Z`. `crates/build-version.rs`
+  release raises it and is tagged `vX.Y.Z`; its notes go into
+  `CHANGELOG.md` first, and onto the release's page on GitHub with
+  `gh release edit` once it is published (the workflow writes only the
+  first paragraph). `crates/build-version.rs`
   (the build scripts of both front ends) makes `MOTHRIX_VERSION`: a clean
   build at the release's tag shows "0.2.0", any other build adds its
   commit, "0.2.0 (ce613f6)", "-dirty" with uncommitted changes. The
