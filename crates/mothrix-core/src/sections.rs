@@ -12,6 +12,11 @@
 //! and an account whose share changed here is told ([`Sync::to_send`]).
 //! What stays on the device: which sections are folded.
 //!
+//! The backend of an account reads what it stores and tells of it
+//! ([`Watch`]). Every write says which device made it and as which of its
+//! writes ([`Written`]): that is how a device knows an older write of its
+//! own coming back from one another device made with the same content.
+//!
 //! The content is not encrypted: the homeserver can read section names.
 
 use std::ops::Deref;
@@ -27,11 +32,137 @@ use crate::{
 /// The account data type mothrix keeps sections under.
 pub const EVENT_TYPE: &str = "de.tmrk.mothrix.sections";
 
-/// The account data's content.
+/// The account data's content. Without `sections` it is not ours to
+/// read (`{}`, a later form): taking that for "no sections" would have
+/// this device write its own over it.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stored {
-    #[serde(default)]
     pub sections: Vec<Section>,
+    /// Who wrote it; none from a mothrix that did not say yet (0.3.0 and
+    /// before, which pass over this when they read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<Written>,
+}
+
+/// The device that wrote the stored sections, and which of its writes it
+/// was.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Written {
+    /// The device's id in its account.
+    pub device: String,
+    /// A number that grows with every write of that device, also over
+    /// its restarts ([`next_write`]).
+    pub write: u64,
+}
+
+/// The number of a device's next write, after `last` (0: none yet in this
+/// run): the time in milliseconds, so that it is larger than those of
+/// earlier runs too, and always larger than the last.
+pub fn next_write(last: u64, now_ms: u64) -> u64 {
+    now_ms.max(last + 1)
+}
+
+/// What an account says of the sections it stores.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// It stores none yet.
+    Nothing,
+    Sections(Vec<Section>),
+    /// What it stores cannot be read here (a newer mothrix's form): not
+    /// "nothing", and nothing is to be written over it.
+    Unreadable,
+}
+
+impl Said {
+    /// What stored content (JSON, if any) says.
+    fn of(content: Option<&str>) -> Self {
+        match content.map(serde_json::from_str::<Stored>) {
+            None => Self::Nothing,
+            Some(Ok(stored)) => Self::Sections(stored.sections),
+            Some(Err(_)) => Self::Unreadable,
+        }
+    }
+}
+
+/// What the backend of one account keeps to tell of the sections the
+/// account stores: at the start what the server has, then what each sync
+/// brings into the local store, which it looks at every few seconds.
+/// Plain data in and out; `matrix::watch_sections` does the reading.
+#[derive(Debug)]
+pub struct Watch {
+    /// This device's id, as its writes name it.
+    device: String,
+    /// The local store's content when last looked at.
+    store: Option<String>,
+    /// What was last told; the outer `None`: nothing yet.
+    told: Option<Option<String>>,
+}
+
+impl Watch {
+    /// For this device, with what the local store holds at the start
+    /// (read before the server is asked).
+    pub fn new(device: &str, store: Option<String>) -> Self {
+        Self {
+            device: device.to_owned(),
+            store,
+            told: None,
+        }
+    }
+
+    /// Whether the account has said what it stores.
+    pub fn has_told(&self) -> bool {
+        self.told.is_some()
+    }
+
+    fn tell(&mut self, content: Option<String>) -> Said {
+        let said = Said::of(content.as_deref());
+        self.told = Some(content);
+        said
+    }
+
+    /// The server answered what the account stores: that is said.
+    pub fn fetched(&mut self, content: Option<String>) -> Said {
+        self.tell(content)
+    }
+
+    /// The server could not be asked. What the local store holds is said
+    /// in its place; with nothing there, nothing is said (and the server
+    /// is to be asked again): an empty store does not mean that the
+    /// account stores none, and saying so would send this device's
+    /// sections up over those the server has.
+    pub fn not_fetched(&mut self) -> Option<Said> {
+        let store = self.store.clone()?;
+        Some(self.tell(Some(store)))
+    }
+
+    /// The local store holds `now`; `latest` is the number of this
+    /// device's newest write asked for (0: none in this run). Returns
+    /// what there is to say, if anything:
+    ///
+    /// - not what the store held before (at the start that may be an
+    ///   older copy than the server's answer, and is no news),
+    /// - not what was said last (the server's answer reaching the store),
+    /// - not an older write of this device coming back after a newer one
+    ///   was sent: the newer one stands.
+    pub fn look(&mut self, now: Option<String>, latest: u64) -> Option<Said> {
+        // The store does not lose what it had; a failed reading looks so.
+        let now = now?;
+        if self.store.as_ref() == Some(&now) {
+            return None;
+        }
+        self.store = Some(now.clone());
+        if self.told.as_ref() == Some(&Some(now.clone())) {
+            return None;
+        }
+        let stale = serde_json::from_str::<Stored>(&now)
+            .ok()
+            .and_then(|stored| stored.by)
+            .is_some_and(|by| by.device == self.device && by.write < latest);
+        if stale {
+            return None;
+        }
+        Some(self.tell(Some(now)))
+    }
 }
 
 /// Titles of the room list's built-in sections; own sections cannot take
@@ -201,6 +332,20 @@ impl OwnSections {
         true
     }
 
+    /// Take out the rooms of the account at `account` of `prefixes` (it
+    /// is signed out, or another account takes its profile's name).
+    /// Returns whether there were any.
+    pub fn forget_account(&mut self, prefixes: &[String], account: usize) -> bool {
+        let before = self.0.clone();
+        for section in &mut self.0 {
+            section
+                .rooms
+                .retain(|key| split(prefixes, key).is_none_or(|(owner, _)| owner != account));
+        }
+        self.tidy();
+        self.0 != before
+    }
+
     /// Tidy a typed section name ("work / Clients" becomes "Work/Clients"
     /// if "Work" exists). Returns the name and whether a section other
     /// than the one at `except` has it already; the error says what is
@@ -291,11 +436,7 @@ impl OwnSections {
 /// out at this start): its keys wait in the sections, and are neither
 /// another account's to store on its server nor to take out.
 fn owner<'a>(prefixes: &[String], key: &'a str) -> Option<(usize, &'a str)> {
-    let (account, id) = split(prefixes, key);
-    let prefix = prefixes.get(account)?;
-    // `split` hands what fits no prefix to some account; a room id as it
-    // is belongs to the account without a prefix only.
-    (key.strip_prefix(prefix.as_str()) == Some(id) && id.starts_with('!')).then_some((account, id))
+    split(prefixes, key)
 }
 
 /// What of `sections` belongs to `account`: every section that holds its
@@ -399,18 +540,32 @@ pub struct Sync {
     /// `None` until heard; then what it stores (`None` inside: nothing
     /// yet).
     known: Option<Option<Vec<Section>>>,
-    /// What was sent lately, newest last. A sync can bring back an older
-    /// one of these after a newer was sent; that echo is no news and must
-    /// not undo the newer.
-    sent: Vec<Vec<Section>>,
 }
 
-/// How many sent shares are remembered as possible echoes.
-const ECHOES: usize = 8;
-
 impl Sync {
-    /// The account (at `account` in `prefixes`) says what it stores
-    /// (`None`: nothing yet). Returns whether `sections` changed. What it
+    /// The account (at `account` in `prefixes`) says what it stores.
+    /// Returns whether `sections` changed.
+    pub fn said(
+        &mut self,
+        sections: &mut OwnSections,
+        prefixes: &[String],
+        account: usize,
+        said: Said,
+    ) -> bool {
+        match said {
+            Said::Nothing => self.heard(sections, prefixes, account, None),
+            Said::Sections(stored) => self.heard(sections, prefixes, account, Some(stored)),
+            // As before it spoke: nothing is sent to it, until it stores
+            // something this device can read again.
+            Said::Unreadable => {
+                self.known = None;
+                false
+            }
+        }
+    }
+
+    /// The account (at `account` in `prefixes`) stores this (`None`:
+    /// nothing yet). Returns whether `sections` changed. What it
     /// stores is tidied on the way in; when that changed it,
     /// [`Sync::to_send`] writes the tidy form back.
     pub fn heard(
@@ -420,18 +575,6 @@ impl Sync {
         account: usize,
         stored: Option<Vec<Section>>,
     ) -> bool {
-        // An older write of ours coming back: the newer one stands. Once
-        // back it is forgotten, with those before it: the same content
-        // coming later is another device's write, not an echo.
-        if let Some(theirs) = &stored
-            && let Some(at) = self.sent.iter().position(|sent| sent == theirs)
-        {
-            let newest = at + 1 == self.sent.len();
-            self.sent.drain(..=at);
-            if !newest {
-                return false;
-            }
-        }
         // Only room ids: what an account stores is its server's word, and
         // anything else could name another account's room here.
         let stored = stored.map(|theirs| {
@@ -476,10 +619,6 @@ impl Sync {
             return None;
         }
         *stored = Some(now.clone());
-        self.sent.push(now.clone());
-        if self.sent.len() > ECHOES {
-            self.sent.remove(0);
-        }
         Some(now)
     }
 }
@@ -524,40 +663,113 @@ mod tests {
         );
     }
 
-    /// Devices of one account and what it stores: each hears every write
-    /// (its own too) in the order the server took them, and sends what it
-    /// then has to say.
+    /// One device of the account in a [`World`]: what its UI holds, what
+    /// `Accounts` keeps of the account, and its backend's reader.
+    struct Device {
+        sections: OwnSections,
+        sync: Sync,
+        watch: Watch,
+        prefixes: Vec<String>,
+        /// The number of its newest write.
+        latest: u64,
+        /// How many of the server's writes it has looked at.
+        seen: usize,
+    }
+
+    impl Device {
+        fn take(&mut self, said: Said) {
+            self.sync.said(&mut self.sections, &self.prefixes, 0, said);
+        }
+    }
+
+    /// Devices of one account and what it stores, as the content the
+    /// server took, write after write. A device reads the server's answer
+    /// at its start, then what its store holds when it looks, and sends
+    /// what it then has to say.
     struct World {
-        devices: Vec<(OwnSections, Sync, Vec<String>)>,
-        stored: Vec<Vec<Section>>,
-        heard: Vec<usize>,
+        devices: Vec<Device>,
+        stored: Vec<String>,
+    }
+
+    /// The content a device writes, or (without one) an older mothrix.
+    fn content(sections: &[Section], by: Option<(&str, u64)>) -> String {
+        serde_json::to_string(&Stored {
+            sections: sections.to_vec(),
+            by: by.map(|(device, write)| Written {
+                device: device.into(),
+                write,
+            }),
+        })
+        .unwrap()
     }
 
     impl World {
         fn new(stored: Vec<Section>, devices: Vec<(OwnSections, Vec<String>)>) -> Self {
+            let first = content(&stored, None);
+            let devices = devices
+                .into_iter()
+                .enumerate()
+                .map(|(index, (sections, prefixes))| {
+                    let mut device = Device {
+                        sections,
+                        sync: Sync::default(),
+                        watch: Watch::new(&format!("DEVICE{index}"), Some(first.clone())),
+                        prefixes,
+                        latest: 0,
+                        seen: 1,
+                    };
+                    let said = device.watch.fetched(Some(first.clone()));
+                    device.take(said);
+                    device
+                })
+                .collect();
             World {
-                heard: vec![0; devices.len()],
-                devices: devices
-                    .into_iter()
-                    .map(|(sections, prefixes)| (sections, Sync::default(), prefixes))
-                    .collect(),
-                stored: vec![stored],
+                devices,
+                stored: vec![first],
             }
         }
 
-        /// Run until all are silent; the number of writes that took.
+        /// The device sends its share, if it has something to say.
+        fn send(&mut self, index: usize) -> bool {
+            let device = &mut self.devices[index];
+            let Some(share) = device.sync.to_send(&device.sections, &device.prefixes, 0) else {
+                return false;
+            };
+            device.latest = next_write(device.latest, 0);
+            let by = format!("DEVICE{index}");
+            self.stored
+                .push(content(&share, Some((&by, device.latest))));
+            true
+        }
+
+        /// The device looks at its store, which holds the newest write:
+        /// what was written between two looks it never sees.
+        fn look(&mut self, index: usize) {
+            let device = &mut self.devices[index];
+            device.seen = self.stored.len();
+            let newest = self.stored.last().cloned();
+            if let Some(said) = device.watch.look(newest, device.latest) {
+                device.take(said);
+            }
+        }
+
+        /// Run until all are silent, each device seeing every write (its
+        /// own too) in the order the server took them; the number of
+        /// writes that took.
         fn settle(&mut self) -> usize {
             let before = self.stored.len();
             for _ in 0..20 {
                 let mut quiet = true;
-                for (index, (sections, sync, prefixes)) in self.devices.iter_mut().enumerate() {
-                    while self.heard[index] < self.stored.len() {
-                        let stored = self.stored[self.heard[index]].clone();
-                        sync.heard(sections, prefixes, 0, Some(stored));
-                        self.heard[index] += 1;
+                for index in 0..self.devices.len() {
+                    while self.devices[index].seen < self.stored.len() {
+                        let device = &mut self.devices[index];
+                        let stored = self.stored[device.seen].clone();
+                        device.seen += 1;
+                        if let Some(said) = device.watch.look(Some(stored), device.latest) {
+                            device.take(said);
+                        }
                     }
-                    if let Some(share) = sync.to_send(sections, prefixes, 0) {
-                        self.stored.push(share);
+                    if self.send(index) {
                         quiet = false;
                     }
                 }
@@ -570,21 +782,196 @@ mod tests {
     }
 
     #[test]
+    fn a_change_undone_at_once_does_not_swallow_what_another_device_writes_later() {
+        let one = vec![String::new()];
+        let before = vec![section("Team", &["!a"])];
+        let device = || (OwnSections::new(before.clone()), one.clone());
+        let mut world = World::new(before.clone(), vec![device(), device()]);
+        assert_eq!(world.settle(), 0);
+        // On the first device a room goes into the section and out again,
+        // faster than its store is looked at: it sees the second write
+        // only, which holds what was there before.
+        world.devices[0]
+            .sections
+            .assign("!b", Some("Team"))
+            .unwrap();
+        assert!(world.send(0));
+        world.devices[0].sections.assign("!b", None).unwrap();
+        assert!(world.send(0));
+        world.look(0);
+        world.settle();
+        assert_eq!(world.devices[1].sections[..], before[..]);
+        // Later the other device puts the room there: the same content as
+        // the first device's first write, and no echo of it.
+        world.devices[1]
+            .sections
+            .assign("!b", Some("Team"))
+            .unwrap();
+        assert_eq!(world.settle(), 1);
+        let after = [section("Team", &["!a", "!b"])];
+        assert_eq!(world.devices[0].sections[..], after);
+        assert_eq!(world.devices[1].sections[..], after);
+    }
+
+    #[test]
+    fn a_device_that_writes_no_mark_is_heard_like_any_other() {
+        // The other device runs mothrix 0.3.0: its writes say nothing of
+        // who made them.
+        let one = vec![String::new()];
+        let before = vec![section("Team", &["!a"])];
+        let mut world = World::new(
+            before.clone(),
+            vec![(OwnSections::new(before.clone()), one.clone())],
+        );
+        world.devices[0]
+            .sections
+            .assign("!b", Some("Team"))
+            .unwrap();
+        assert_eq!(world.settle(), 1);
+        // It takes the room out again: what this device stored at first.
+        world.stored.push(content(&before, None));
+        assert_eq!(world.settle(), 0);
+        assert_eq!(world.devices[0].sections[..], before[..]);
+        // And what this version writes, 0.3.0 reads: the sections where
+        // they were, the mark beside them.
+        let written: serde_json::Value = serde_json::from_str(&world.stored[1]).unwrap();
+        assert_eq!(written["sections"][0]["rooms"][1], "!b");
+        assert_eq!(written["by"]["device"], "DEVICE0");
+    }
+
+    #[test]
+    fn at_the_start_an_older_copy_in_the_store_is_no_news() {
+        let old = content(&[section("Old", &["!a"])], None);
+        let new = content(&[section("New", &["!a"])], Some(("PHONE", 7)));
+        // The store still holds what the last run left; the server has
+        // what the phone wrote since.
+        let mut watch = Watch::new("HERE", Some(old.clone()));
+        assert_eq!(
+            watch.fetched(Some(new.clone())),
+            Said::Sections(vec![section("New", &["!a"])])
+        );
+        // The first looks find the old copy, then the sync stores the
+        // server's: neither is news.
+        assert_eq!(watch.look(Some(old.clone()), 0), None);
+        assert_eq!(watch.look(Some(new), 0), None);
+        // The phone writes the old content again: that is.
+        let again = content(&[section("Old", &["!a"])], Some(("PHONE", 8)));
+        assert_eq!(
+            watch.look(Some(again), 0),
+            Some(Said::Sections(vec![section("Old", &["!a"])]))
+        );
+        // A reading of the store that failed says nothing.
+        assert_eq!(watch.look(None, 0), None);
+    }
+
+    #[test]
+    fn content_without_sections_is_unreadable_and_nothing_is_written_over_it() {
+        for other in ["{}", r#"{"groups":[]}"#, "[]", r#"{"sections":7}"#] {
+            assert_eq!(Said::of(Some(other)), Said::Unreadable, "{other}");
+        }
+        assert_eq!(Said::of(None), Said::Nothing);
+        assert_eq!(
+            Said::of(Some(r#"{"sections":[]}"#)),
+            Said::Sections(Vec::new())
+        );
+
+        // It turns unreadable while running (a newer mothrix wrote): the
+        // account is silent again, whatever changes here.
+        let mut sync = Sync::default();
+        let mut sections = OwnSections::new(vec![section("Team", &["!a"])]);
+        sync.said(&mut sections, &prefixes(), 0, Said::Nothing);
+        assert!(sync.to_send(&sections, &prefixes(), 0).is_some());
+        let mut watch = Watch::new("HERE", None);
+        watch.fetched(None);
+        let said = watch.look(Some(r#"{"version":2}"#.into()), 0).unwrap();
+        assert_eq!(said, Said::Unreadable);
+        assert!(!sync.said(&mut sections, &prefixes(), 0, said));
+        sections.assign("!b", Some("Team")).unwrap();
+        assert!(sync.to_send(&sections, &prefixes(), 0).is_none());
+        assert_eq!(sections[..], [section("Team", &["!a", "!b"])]);
+    }
+
+    #[test]
+    fn a_server_that_could_not_be_asked_does_not_mean_the_account_stores_nothing() {
+        // No network at the start, and nothing in the store (a new
+        // sign-in): the account has not spoken, and nothing goes up.
+        let mut watch = Watch::new("HERE", None);
+        assert_eq!(watch.not_fetched(), None);
+        assert!(!watch.has_told());
+        // With something in the store, that is what is known.
+        let stored = content(&[section("Team", &["!a"])], None);
+        let mut offline = Watch::new("HERE", Some(stored.clone()));
+        assert_eq!(
+            offline.not_fetched(),
+            Some(Said::Sections(vec![section("Team", &["!a"])]))
+        );
+        // The first sync stores the account's sections: now it has.
+        assert!(matches!(
+            watch.look(Some(stored), 0),
+            Some(Said::Sections(_))
+        ));
+        assert!(watch.has_told());
+    }
+
+    #[test]
+    fn an_older_write_of_this_device_coming_back_is_passed_over() {
+        let first = content(&[section("Team", &["!a"])], Some(("HERE", 1)));
+        let second = content(&[section("Team", &["!a", "!b"])], Some(("HERE", 2)));
+        let mut watch = Watch::new("HERE", None);
+        watch.fetched(None);
+        // The sync brings the first write back after the second was sent.
+        assert_eq!(watch.look(Some(first.clone()), 2), None);
+        // The newest one is said: had another device written between the
+        // two, this is what puts this device right again.
+        assert!(watch.look(Some(second), 2).is_some());
+        // The same content from another device, or from one that leaves
+        // no mark, is that device's write.
+        let phone = content(&[section("Team", &["!a"])], Some(("PHONE", 1)));
+        assert!(watch.look(Some(phone), 2).is_some());
+        let unmarked = content(&[section("Team", &["!a"])], None);
+        assert!(watch.look(Some(unmarked), 2).is_some());
+        // Numbers grow, also when the clock does not.
+        assert_eq!(next_write(0, 1000), 1000);
+        assert_eq!(next_write(1000, 1000), 1001);
+        assert_eq!(next_write(1001, 900), 1002);
+    }
+
+    #[test]
+    fn a_signed_out_account_s_rooms_leave_the_sections() {
+        let mut own = OwnSections::new(vec![
+            section("Team", &["!a", "work/!b"]),
+            section("Clients", &["work/!d"]),
+        ]);
+        assert!(own.forget_account(&prefixes(), 1));
+        assert_eq!(own[..], [section("Team", &["!a"])]);
+        assert!(!own.forget_account(&prefixes(), 1));
+        assert!(own.forget_account(&prefixes(), 0));
+        assert!(own.is_empty());
+        // And what was folded for it is not folded for the next account
+        // of its name; other profiles keep theirs.
+        let keys = ["work:Team", "Team", "@work", "@workshop", "workshop:Team"];
+        let mut folds = Folds::new(keys.map(str::to_owned));
+        assert!(folds.forget_profile("work"));
+        assert_eq!(folds.keys(), ["@workshop", "Team", "workshop:Team"]);
+        assert!(!folds.forget_profile("work"));
+    }
+
+    #[test]
     fn a_section_moved_on_one_device_moves_on_the_other_and_both_fall_silent() {
         let one = vec![String::new()];
         let before = vec![section("X", &["!x"]), section("Y", &["!y"])];
         let device = || (OwnSections::new(before.clone()), one.clone());
         let mut world = World::new(before.clone(), vec![device(), device()]);
         assert_eq!(world.settle(), 0);
-        assert!(world.devices[0].0.move_section("Y", false));
+        assert!(world.devices[0].sections.move_section("Y", false));
         assert_eq!(world.settle(), 1, "the move, once");
         let order = [section("Y", &["!y"]), section("X", &["!x"])];
-        assert_eq!(world.devices[0].0[..], order);
-        assert_eq!(world.devices[1].0[..], order);
+        assert_eq!(world.devices[0].sections[..], order);
+        assert_eq!(world.devices[1].sections[..], order);
         // And back, from the other device.
-        assert!(world.devices[1].0.move_section("Y", true));
+        assert!(world.devices[1].sections.move_section("Y", true));
         assert_eq!(world.settle(), 1);
-        assert_eq!(world.devices[0].0[..], before[..]);
+        assert_eq!(world.devices[0].sections[..], before[..]);
     }
 
     #[test]
@@ -605,8 +992,8 @@ mod tests {
         );
         // What an older build stored (the parent, empty) is put right once.
         assert_eq!(world.settle(), 1);
-        assert_eq!(world.devices[0].0[..], both[..]);
-        assert_eq!(world.devices[1].0[..], [section("Team", &["!a"])]);
+        assert_eq!(world.devices[0].sections[..], both[..]);
+        assert_eq!(world.devices[1].sections[..], [section("Team", &["!a"])]);
     }
 
     #[test]
@@ -697,35 +1084,6 @@ mod tests {
         let sent = sync.to_send(&sections, &prefixes(), 0);
         assert_eq!(sent, Some(vec![section("Team", &["!a", "!b"])]));
         assert!(!sync.heard(&mut sections, &prefixes(), 0, sent));
-    }
-
-    #[test]
-    fn an_older_write_coming_back_does_not_undo_a_newer() {
-        let mut sync = Sync::default();
-        let mut sections = OwnSections::new(vec![section("Team", &["!a"])]);
-        sync.heard(&mut sections, &prefixes(), 0, None);
-        let first = sync.to_send(&sections, &prefixes(), 0).unwrap();
-        sections.assign("!b", Some("Team")).unwrap();
-        sync.to_send(&sections, &prefixes(), 0);
-        // The sync brings the first write back after the second was sent.
-        assert!(!sync.heard(&mut sections, &prefixes(), 0, Some(first)));
-        assert_eq!(sections[..], [section("Team", &["!a", "!b"])]);
-    }
-
-    #[test]
-    fn what_another_device_writes_is_no_echo_though_we_wrote_the_same_once() {
-        let mut sync = Sync::default();
-        let mut sections = OwnSections::new(vec![section("Team", &["!a"])]);
-        sync.heard(&mut sections, &prefixes(), 0, None);
-        let first = sync.to_send(&sections, &prefixes(), 0).unwrap();
-        sections.assign("!b", Some("Team")).unwrap();
-        let second = sync.to_send(&sections, &prefixes(), 0).unwrap();
-        // Both come back, in order.
-        assert!(!sync.heard(&mut sections, &prefixes(), 0, Some(first.clone())));
-        assert!(!sync.heard(&mut sections, &prefixes(), 0, Some(second)));
-        // Later the phone takes !b out again: the same as our first write.
-        assert!(sync.heard(&mut sections, &prefixes(), 0, Some(first.clone())));
-        assert_eq!(sections[..], first[..]);
     }
 
     #[test]
@@ -913,6 +1271,7 @@ mod tests {
     fn the_stored_form_is_plain_json() {
         let stored = Stored {
             sections: vec![section("Work/Clients", &["!a:example.org"])],
+            by: None,
         };
         let json = serde_json::to_value(&stored).unwrap();
         assert_eq!(json["sections"][0]["name"], "Work/Clients");

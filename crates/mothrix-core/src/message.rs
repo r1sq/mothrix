@@ -190,6 +190,14 @@ pub fn mentions_kept(text: &str, mentions: Vec<Member>) -> Vec<Member> {
     kept
 }
 
+/// Whether what is in the message box is a command, not a message being
+/// written. Spaces in front do not make " /recover KEY" a message: it is
+/// not told to the room as typing, not sent to a grammar server, and its
+/// words are not for the spell checker either.
+pub fn is_command(text: &str) -> bool {
+    text.trim_start().starts_with('/')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

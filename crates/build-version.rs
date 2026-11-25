@@ -4,7 +4,8 @@
 // sets MOTHRIX_VERSION, the version the user is shown. A release built at
 // its tag (`v0.2.0`, clean) is just "0.2.0"; any other build adds the
 // commit it was made from, "0.2.0 (ce613f6)", and "-dirty" when files
-// differ from it. Without git (a source archive) it is the bare version.
+// differ from it. Without git (a source archive) it is "0.2.0 (no git)":
+// nothing says such a build is the release, so it does not update itself.
 
 use std::{path::Path, process::Command};
 

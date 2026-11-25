@@ -250,7 +250,14 @@ impl ClientState {
             .as_ref()
             .and_then(|key| self.rooms.iter().find(|room| room.id == *key));
         let closed = open.is_some_and(|room| room.account == account) && self.close();
-        self.accounts.remove(account);
+        // What was known of it for notifying goes too: an account signed
+        // in under its profile's name later in this run is a new one,
+        // whose unread rooms are no news ([`ClientState::set_rooms`]).
+        let gone = self.accounts.remove(account);
+        self.accounts_seen.remove(&gone.profile);
+        for room in self.rooms.iter().filter(|room| room.account == account) {
+            self.last_unread.remove(&room.id);
+        }
         self.rooms.retain(|room| room.account != account);
         for room in &mut self.rooms {
             if room.account > account {
@@ -721,6 +728,30 @@ mod tests {
         // The first account's rooms still tell.
         all[0].unread += 1;
         assert_eq!(state.set_rooms(all).len(), 1);
+    }
+
+    #[test]
+    fn a_profile_name_used_again_in_one_run_brings_its_unread_rooms_without_news() {
+        let mut state = two_accounts();
+        let all = state.rooms.clone();
+        state.set_rooms(all.clone());
+        state.started = Instant::now() - NOTIFICATION_WARMUP;
+        // "work" is signed out, and another account signs in under that
+        // name: its rooms (the same room among them) come with what is
+        // unread in them.
+        let work = state.accounts[1].clone();
+        state.forget_account(1);
+        state.accounts.push(work);
+        let unread: Vec<RoomEntry> = all
+            .into_iter()
+            .map(|mut room| {
+                if room.account == 1 {
+                    room.unread = 3;
+                }
+                room
+            })
+            .collect();
+        assert!(state.set_rooms(unread).is_empty());
     }
 
     fn item(event_id: &str) -> Item {

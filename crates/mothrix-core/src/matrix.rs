@@ -139,7 +139,17 @@ pub fn signed_in_profiles() -> Vec<String> {
     profiles
 }
 
-/// The Matrix id a profile is signed in as, read from its session file.
+/// Whether a profile holds an account: its session file is there. Also
+/// one that cannot be read counts (damaged, or a later mothrix's): the
+/// store beside it holds that account's keys, and "no account here"
+/// would let a sign-in delete them.
+pub fn has_session(paths: &Paths) -> bool {
+    paths.session_file().exists()
+}
+
+/// The Matrix id a profile is signed in as, read from its session file;
+/// none also when the file cannot be read ([`has_session`] says whether
+/// there is an account).
 pub fn signed_in_as(paths: &Paths) -> Option<String> {
     let stored: StoredSession =
         serde_json::from_slice(&std::fs::read(paths.session_file()).ok()?).ok()?;
@@ -182,92 +192,128 @@ pub fn share_stores(holder: &str) {
     let _ = SHARED_AS.set(holder.to_owned());
 }
 
+/// The sections to keep in the account, with the number of the write
+/// ([`crate::sections::Written`]); for [`keep_sections`].
+type SectionsToKeep = Option<(u64, Vec<Section>)>;
+
 /// Tell the UI what the account stores of its sections: first as the
 /// server has it (or, offline, the local store), then each change a sync
-/// brings into the local store.
-async fn watch_sections(client: Client, tx: mpsc::UnboundedSender<Update>) {
+/// brings into the local store ([`crate::sections::Watch`] says which of
+/// them are news). `written`: the number of this device's newest write
+/// asked for.
+async fn watch_sections(
+    client: Client,
+    written: Arc<std::sync::atomic::AtomicU64>,
+    tx: mpsc::UnboundedSender<Update>,
+) {
     use matrix_sdk::ruma::events::GlobalAccountDataEventType;
     let kind = GlobalAccountDataEventType::from(crate::sections::EVENT_TYPE);
+    // In one spelling, whichever way it came: the server's answer and
+    // the store's copy of the same content are then the same text.
     let json = |raw: Option<Raw<matrix_sdk::ruma::events::AnyGlobalAccountDataEventContent>>| {
-        raw.map(|raw| raw.json().get().to_owned())
+        raw.map(
+            |raw| match serde_json::from_str::<Value>(raw.json().get()) {
+                Ok(value) => value.to_string(),
+                Err(_) => raw.json().get().to_owned(),
+            },
+        )
     };
-    let parse = |json: &Option<String>| {
-        json.as_deref()
-            .and_then(|json| serde_json::from_str::<crate::sections::Stored>(json).ok())
-            .map(|stored| stored.sections)
-    };
-    let first = match client.account().fetch_account_data(kind.clone()).await {
-        Ok(raw) => json(raw),
-        Err(_) => json(
+    let in_store = || async {
+        json(
             client
                 .account()
                 .account_data_raw(kind.clone())
                 .await
                 .ok()
                 .flatten(),
-        ),
+        )
     };
-    // What is there but cannot be read (a newer mothrix's form) is not
-    // "nothing stored": saying so would have this device write its own
-    // over it. Then the account does not speak, and nothing is sent to it.
-    let readable = |json: &Option<String>| json.is_none() || parse(json).is_some();
-    if readable(&first) {
-        let _ = tx.send(Update::Sections(parse(&first)));
+    let device = client
+        .device_id()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    // The store first: what it holds now is older than the server's
+    // answer, or the same.
+    let mut watch = crate::sections::Watch::new(&device, in_store().await);
+    let tell = |said| {
+        let _ = tx.send(Update::Sections(said));
+    };
+    match client.account().fetch_account_data(kind.clone()).await {
+        Ok(raw) => tell(watch.fetched(json(raw))),
+        Err(_) => {
+            if let Some(said) = watch.not_fetched() {
+                tell(said);
+            }
+        }
     }
-    let mut last = first;
     let mut tick = tokio::time::interval(Duration::from_secs(4));
+    // While the account has not spoken (no answer and an empty store),
+    // the server is asked again, further and further apart.
+    let (mut ticks, mut ask_at) = (0u32, 2u32);
     loop {
         tick.tick().await;
         if tx.is_closed() {
             break;
         }
-        let now = json(
-            client
-                .account()
-                .account_data_raw(kind.clone())
-                .await
-                .ok()
-                .flatten(),
-        );
-        if now.is_some() && now != last {
-            if readable(&now) {
-                let _ = tx.send(Update::Sections(parse(&now)));
+        let latest = written.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(said) = watch.look(in_store().await, latest) {
+            tell(said);
+        }
+        if watch.has_told() {
+            continue;
+        }
+        ticks += 1;
+        if ticks >= ask_at {
+            ticks = 0;
+            ask_at = (ask_at * 2).min(75);
+            if let Ok(raw) = client.account().fetch_account_data(kind.clone()).await {
+                tell(watch.fetched(json(raw)));
             }
-            last = now;
         }
     }
 }
 
+/// How long to wait before a write of the sections that failed `tries`
+/// times is tried once more: further apart, and then every quarter of an
+/// hour for as long as mothrix runs. Giving up would leave the change on
+/// this device alone, with nothing to send it again.
+fn sections_retry_after(tries: usize) -> Duration {
+    const WAITS: [u64; 5] = [5, 15, 60, 300, 900];
+    Duration::from_secs(WAITS[tries.min(WAITS.len() - 1)])
+}
+
+/// After how many failed tries the user is told (once per change).
+const SECTIONS_TRIES_SAID: usize = 5;
+
 /// Write the account's sections into its account data, one write at a
 /// time and always the newest asked for: two changes in quick succession
 /// cannot reach the server the wrong way round, and one that did not get
-/// there (no network) is tried again, a few times and further apart,
-/// until a newer one takes its place.
+/// there (no network) is tried again, further and further apart, until it
+/// is there or a newer one takes its place.
 async fn keep_sections(
     client: Client,
-    mut wanted: tokio::sync::watch::Receiver<Option<Vec<Section>>>,
+    mut wanted: tokio::sync::watch::Receiver<SectionsToKeep>,
     tx: mpsc::UnboundedSender<Update>,
 ) {
-    const WAITS: [u64; 5] = [5, 15, 60, 300, 900];
     while wanted.changed().await.is_ok() {
         let mut tries = 0;
         loop {
-            let Some(sections) = wanted.borrow_and_update().clone() else {
+            let Some((write, sections)) = wanted.borrow_and_update().clone() else {
                 break;
             };
-            let Err(error) = store_sections(&client, sections).await else {
-                break;
-            };
-            let Some(wait) = WAITS.get(tries) else {
-                let _ = tx.send(Update::Notice(format!(
-                    "Your sections could not be kept in the account: {error:#}"
-                )));
+            let Err(error) = store_sections(&client, sections, write).await else {
                 break;
             };
             tries += 1;
+            if tries == SECTIONS_TRIES_SAID {
+                let _ = tx.send(Update::Notice(format!(
+                    "Your sections are not kept in the account yet (mothrix goes on trying): \
+                     {error:#}"
+                )));
+            }
             // Again after a while, or at once with something newer.
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(*wait)) => {}
+                () = tokio::time::sleep(sections_retry_after(tries - 1)) => {}
                 changed = wanted.changed() => {
                     if changed.is_err() {
                         return;
@@ -279,10 +325,15 @@ async fn keep_sections(
     }
 }
 
-/// Keep `sections` (this account's share) in the account data.
-async fn store_sections(client: &Client, sections: Vec<Section>) -> Result<()> {
+/// Keep `sections` (this account's share) in the account data, as this
+/// device's write number `write`.
+async fn store_sections(client: &Client, sections: Vec<Section>, write: u64) -> Result<()> {
     use matrix_sdk::ruma::events::GlobalAccountDataEventType;
-    let content = serde_json::value::to_raw_value(&crate::sections::Stored { sections })?;
+    let by = client.device_id().map(|device| crate::sections::Written {
+        device: device.to_string(),
+        write,
+    });
+    let content = serde_json::value::to_raw_value(&crate::sections::Stored { sections, by })?;
     client
         .account()
         .set_account_data_raw(
@@ -333,6 +384,15 @@ fn release(paths: &Paths) {
     HELD.lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .retain(|(known, _)| *known != path);
+}
+
+/// Whether this process holds a profile ([`hold`]).
+fn holds(paths: &Paths) -> bool {
+    let path = paths.data_dir.join(LOCK);
+    HELD.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|(known, _)| *known == path)
 }
 
 /// Keep other mothrix processes away from a profile while this one uses
@@ -441,9 +501,21 @@ pub async fn restore(paths: &Paths) -> Result<Option<Client>> {
     if !file.exists() {
         return Ok(None);
     }
-    let stored: StoredSession =
-        serde_json::from_slice(&std::fs::read(&file)?).context("session file is corrupt")?;
+    let stored: StoredSession = serde_json::from_slice(&std::fs::read(&file)?)
+        .with_context(|| format!("the session file ({}) cannot be read", file.display()))?;
+    let held_before = holds(paths);
     hold(paths)?;
+    let restored = restore_held(paths, stored).await;
+    // An account that did not start is not in use here: another mothrix
+    // (one that reaches the keyring, say) may take it.
+    if restored.is_err() && !held_before {
+        release(paths);
+    }
+    restored.map(Some)
+}
+
+/// [`restore`], with the profile's lock held.
+async fn restore_held(paths: &Paths, stored: StoredSession) -> Result<Client> {
     let passphrase = match stored.store_key.as_deref() {
         Some(crate::store_key::IN_KEYRING) => {
             let data_dir = paths.data_dir.clone();
@@ -469,7 +541,7 @@ pub async fn restore(paths: &Paths) -> Result<Option<Client>> {
         .await
         .context("could not restore the saved session")?;
     share_encryption_store(&client).await?;
-    Ok(Some(client))
+    Ok(client)
 }
 
 /// Sign a running account out and delete what it kept on this computer.
@@ -493,12 +565,19 @@ pub async fn logout(paths: &Paths) -> Result<()> {
         return Ok(());
     }
     hold(paths)?;
-    if let Ok(Some(client)) = restore(paths).await {
-        let _ = client.matrix_auth().logout().await;
+    // An account whose session or store no longer opens (a damaged file,
+    // a passphrase the keyring lost) is only deleted here.
+    let stored = std::fs::read(paths.session_file())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StoredSession>(&bytes).ok());
+    if let Some(stored) = stored
+        && let Ok(client) = restore_held(paths, stored).await
+    {
+        let _ = tokio::time::timeout(Duration::from_secs(15), client.matrix_auth().logout()).await;
     }
-    forget(paths)?;
+    let forgotten = forget(paths);
     release(paths);
-    Ok(())
+    Ok(forgotten?)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,15 +678,41 @@ pub async fn sign_in(
     if server.trim().is_empty() {
         bail!("no homeserver given");
     }
+    refuse_over_an_account(paths)?;
     // Before anything is touched: another mothrix may be signing in here.
+    let held_before = holds(paths);
     hold(paths)?;
-    let signed_in = sign_in_held(paths, server, password_login, credentials, say).await;
+    // Again, now that nobody else can be at it.
+    let signed_in = match refuse_over_an_account(paths) {
+        Ok(()) => sign_in_held(paths, server, password_login, credentials, say).await,
+        Err(error) => {
+            if !held_before {
+                release(paths);
+            }
+            return Err(error);
+        }
+    };
     if signed_in.is_err() {
         // Nothing of a sign-in that failed stays, and the profile is free.
         let _ = forget(paths);
         release(paths);
     }
     signed_in
+}
+
+/// A sign-in starts with an empty folder and leaves one when it fails:
+/// where there is a session file there is an account, whose store must
+/// not go that way. Also when the file cannot be read: it says nothing
+/// of whether the keys beside it are still wanted.
+fn refuse_over_an_account(paths: &Paths) -> Result<()> {
+    if has_session(paths) {
+        bail!(
+            "there is already an account in {} (if its session file is damaged, remove \
+             the account first: `mothrix logout`)",
+            paths.data_dir.display()
+        );
+    }
+    Ok(())
 }
 
 async fn sign_in_held(
@@ -697,8 +802,17 @@ async fn sign_in_held(
             crate::store_key::IN_KEYRING.to_owned()
         }
     });
-    save_session(paths, &client, store_key)?;
-    share_encryption_store(&client).await?;
+    // The server has a new device now. If it cannot be kept here (a full
+    // disk, the store), it is signed out again: nothing on this computer
+    // would know it, and it would stay in the account's list for good.
+    let kept = match save_session(paths, &client, store_key) {
+        Ok(()) => share_encryption_store(&client).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = kept {
+        let _ = tokio::time::timeout(Duration::from_secs(15), client.matrix_auth().logout()).await;
+        return Err(error);
+    }
     // Signing in kicks off key uploads and cross-signing setup in the
     // background. Let them finish, so that quitting right after `mothrix login`
     // does not leave the new device half set up.
@@ -875,9 +989,9 @@ pub enum Update {
     },
     /// The message asked for with [`Command::Reveal`] is now loaded.
     Reveal(String),
-    /// What the account stores of the user's own sections ([`crate::sections`]);
-    /// `None`: nothing yet.
-    Sections(Option<Vec<Section>>),
+    /// What the account stores of the user's own sections
+    /// ([`crate::sections`]).
+    Sections(crate::sections::Said),
     /// An attachment asked for with [`Command::OpenMedia`] is on disk, for
     /// the app to show ([`hand_media_over`]).
     MediaFile {
@@ -1009,8 +1123,12 @@ pub enum Command {
     /// Back from the thread to the room's conversation.
     CloseThread,
     /// Text is sent as Markdown; `mentions` are the completed @-mentions.
+    /// `thread`: the thread of the room it was written in (its first
+    /// message), none for the room's own conversation. It is sent only
+    /// while that is the conversation followed.
     Send {
         room_id: String,
+        thread: Option<String>,
         text: String,
         mentions: Vec<Member>,
     },
@@ -1236,6 +1354,9 @@ impl Drop for EndsWith {
 
 struct OpenRoom {
     room_id: String,
+    /// The thread followed (its first message, or [`PINNED_VIEW`]); none
+    /// for the room's own conversation.
+    thread: Option<String>,
     room: Room,
     timeline: Arc<Timeline>,
     task: JoinHandle<()>,
@@ -1314,7 +1435,12 @@ async fn run(
     // (Ended with this backend: it holds a sender of the updates, and
     // whoever forwards them waits for the last sender to go, so a
     // signed-out account would else keep both tasks for good.)
-    let _watching = EndsWith(tokio::spawn(watch_sections(client.clone(), tx.clone())));
+    let sections_written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let _watching = EndsWith(tokio::spawn(watch_sections(
+        client.clone(),
+        Arc::clone(&sections_written),
+        tx.clone(),
+    )));
 
     let sync = SyncService::builder(client.clone())
         .with_offline_mode()
@@ -1415,6 +1541,8 @@ async fn run(
 
     let (account, account_commands) = mpsc::unbounded_channel();
     tokio::spawn(account_lane(client.clone(), account_commands, tx.clone()));
+    let (beside, beside_events) = mpsc::unbounded_channel();
+    tokio::spawn(beside_lane(beside_events, tx.clone()));
     let (sections, sections_to_keep) = tokio::sync::watch::channel(None);
     let _keeping = EndsWith(tokio::spawn(keep_sections(
         client.clone(),
@@ -1429,7 +1557,9 @@ async fn run(
         verifying: None,
         tx: tx.clone(),
         account,
+        beside,
         sections,
+        sections_written,
     };
 
     let mut gate = EmptyListGate::default();
@@ -1910,8 +2040,13 @@ struct Session {
     tx: mpsc::UnboundedSender<Update>,
     /// Commands for [`account_lane`].
     account: mpsc::UnboundedSender<Command>,
+    /// Events for [`beside_lane`].
+    beside: mpsc::UnboundedSender<Beside>,
     /// The sections to keep in the account, for [`keep_sections`].
-    sections: tokio::sync::watch::Sender<Option<Vec<Section>>>,
+    sections: tokio::sync::watch::Sender<SectionsToKeep>,
+    /// The number of the newest write of them asked for; the reader of
+    /// what the account stores ([`watch_sections`]) goes by it.
+    sections_written: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Session {
@@ -1939,7 +2074,9 @@ impl Session {
             verifying,
             tx,
             account,
+            beside,
             sections: sections_to_keep,
+            sections_written,
         } = self;
         let (client, sync, tx) = (&*client, &*sync, &*tx);
         let own_user_id = own_user_id.as_deref();
@@ -1987,13 +2124,29 @@ impl Session {
                 }
             }
             Command::OpenThread { event_id } => {
-                let current = open.take().ok_or_else(|| anyhow!("open a room first"))?;
-                current.task.abort();
+                let room_id = open.as_ref().map(|current| current.room_id.clone());
+                let room_id = room_id.ok_or_else(|| anyhow!("open a room first"))?;
                 let view = if event_id == PINNED_VIEW {
                     View::Pinned
                 } else {
-                    View::Thread(EventId::parse(&event_id)?)
+                    // Before the room is let go of: with an id that is
+                    // none, the room stays followed, and the UI is told
+                    // to go back to it.
+                    match EventId::parse(&event_id) {
+                        Ok(root) => View::Thread(root),
+                        Err(error) => {
+                            let _ = tx.send(Update::ThreadFailed {
+                                room_id,
+                                root: event_id,
+                            });
+                            return Err(anyhow!(error).context("could not open the thread"));
+                        }
+                    }
                 };
+                let Some(current) = open.take() else {
+                    return Ok(());
+                };
+                current.task.abort();
                 let room = current.room.clone();
                 *open = Some(match open_timeline(room, view, own_user_id, tx).await {
                     Ok(thread) => thread,
@@ -2017,11 +2170,19 @@ impl Session {
             }
             Command::Send {
                 room_id,
+                thread,
                 text,
                 mentions,
             } => {
-                let current = open.as_ref().filter(|current| current.room_id == room_id);
-                let current = current.ok_or_else(|| anyhow!("that room is no longer open"))?;
+                // The room and the view: a message written in a thread
+                // that then could not be opened must not go into the
+                // room's own conversation, which is followed in its place.
+                let current = open
+                    .as_ref()
+                    .filter(|current| current.room_id == room_id && current.thread == thread);
+                let current = current.ok_or_else(|| {
+                    anyhow!("The message was not sent: that conversation is no longer open.")
+                })?;
                 let message = MessageParts::new(&text, &mentions);
                 current
                     .timeline
@@ -2089,86 +2250,83 @@ impl Session {
                 });
             }
             Command::PasteImage => {
-                let timeline = timeline_of(open)?;
-                let (bytes, mime_type) = tokio::task::spawn_blocking(read_clipboard_image)
-                    .await
-                    .context("could not read the clipboard")??;
-                let extension = mime_type.rsplit('/').next().unwrap_or("png");
-                let seconds = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_secs())
-                    .unwrap_or_default();
-                let filename = format!("pasted-{seconds}.{extension}");
-                let mime: mime::Mime = mime_type.parse().unwrap_or(mime::IMAGE_PNG);
-                timeline
-                    .send_attachment(
-                        AttachmentSource::Data { bytes, filename },
-                        mime,
-                        AttachmentConfig::default(),
-                    )
-                    .use_send_queue()
-                    .await
-                    .context("could not send the picture")?;
+                // Beside the loop, like the two below: a clipboard tool
+                // waits for the program that owns the clipboard, which
+                // may never answer, and a verification's start waits for
+                // the server. The picture goes into the conversation that
+                // was followed when it was asked for.
+                let timeline = Arc::clone(timeline_of(open)?);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let pasted = async {
+                        let (bytes, mime_type) = from_clipboard(read_clipboard_image).await?;
+                        let extension = mime_type.rsplit('/').next().unwrap_or("png");
+                        let filename = format!("pasted-{}.{extension}", seconds_now());
+                        let mime: mime::Mime = mime_type.parse().unwrap_or(mime::IMAGE_PNG);
+                        timeline
+                            .send_attachment(
+                                AttachmentSource::Data { bytes, filename },
+                                mime,
+                                AttachmentConfig::default(),
+                            )
+                            .use_send_queue()
+                            .await
+                            .context("could not send the picture")?;
+                        anyhow::Ok(())
+                    };
+                    if let Err(error) = pasted.await {
+                        let _ = tx.send(Update::Notice(format!("{error:#}")));
+                    }
+                });
             }
             Command::ClipboardPaste => {
-                let clip = tokio::task::spawn_blocking(|| match read_clipboard_image() {
-                    Ok(image) => Ok(Ok(image)),
-                    Err(no_image) => read_clipboard_text().map(Err).ok_or(no_image),
-                })
-                .await
-                .context("could not read the clipboard")??;
-                match clip {
-                    Ok((bytes, mime_type)) => {
-                        let extension = mime_type.rsplit('/').next().unwrap_or("png");
-                        let seconds = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|elapsed| elapsed.as_secs())
-                            .unwrap_or_default();
-                        let dir = crate::folders::cache()
-                            .context("no cache directory on this system")?
-                            .join("pasted");
-                        crate::folders::private_dir(&dir)?;
-                        let file = dir.join(format!("pasted-{seconds}.{extension}"));
-                        crate::folders::write_private(&file, &bytes)?;
-                        let _ = tx.send(Update::PastedImage(file.display().to_string()));
-                    }
-                    Err(text) => {
-                        let _ = tx.send(Update::PastedText(text));
-                    }
-                }
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let pasted = async {
+                        let clip = from_clipboard(|| match read_clipboard_image() {
+                            Ok(image) => Ok(Ok(image)),
+                            Err(no_image) => read_clipboard_text().map(Err).ok_or(no_image),
+                        })
+                        .await?;
+                        Ok(match clip {
+                            Ok((bytes, mime_type)) => {
+                                let extension = mime_type.rsplit('/').next().unwrap_or("png");
+                                let dir = crate::folders::cache()
+                                    .context("no cache directory on this system")?
+                                    .join("pasted");
+                                crate::folders::private_dir(&dir)?;
+                                let file =
+                                    dir.join(format!("pasted-{}.{extension}", seconds_now()));
+                                crate::folders::write_private(&file, &bytes)?;
+                                Update::PastedImage(file.display().to_string())
+                            }
+                            Err(text) => Update::PastedText(text),
+                        })
+                    };
+                    let update = pasted.await.unwrap_or_else(|error: anyhow::Error| {
+                        Update::Notice(format!("{error:#}"))
+                    });
+                    let _ = tx.send(update);
+                });
             }
             Command::VerifyStart => {
                 if verifying.as_ref().is_some_and(|inputs| !inputs.is_closed()) {
                     bail!("a verification is already running");
                 }
-                let _ = tx.send(Update::Verify(Some(VerifyState::Waiting)));
-                match verify::request(client).await {
-                    Ok(request) => {
-                        *verifying = Some(spawn_verification(client, request, false, tx))
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Update::Verify(Some(VerifyState::Failed(format!(
-                            "{error:#}"
-                        )))));
-                    }
-                }
+                let asking = client.clone();
+                *verifying = Some(start_verification(client, tx, async move {
+                    verify::request(&asking).await
+                }));
             }
             Command::VerifyUser { user_id } => {
                 if verifying.as_ref().is_some_and(|inputs| !inputs.is_closed()) {
                     bail!("a verification is already running");
                 }
                 let user = parse_user(&user_id)?;
-                let _ = tx.send(Update::Verify(Some(VerifyState::Waiting)));
-                match verify::request_user(client, &user).await {
-                    Ok(request) => {
-                        *verifying = Some(spawn_verification(client, request, false, tx))
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Update::Verify(Some(VerifyState::Failed(format!(
-                            "{error:#}"
-                        )))));
-                    }
-                }
+                let asking = client.clone();
+                *verifying = Some(start_verification(client, tx, async move {
+                    verify::request_user(&asking, &user).await
+                }));
             }
             Command::Verify(input) => {
                 let delivered = verifying
@@ -2212,7 +2370,8 @@ impl Session {
                     PollFormat::Standard | PollFormat::Mixed => {
                         let (event_type, content) =
                             stable_polls::response_event(format, &poll_event_id, &answers);
-                        send_beside(timeline.room().clone(), event_type, content, "the vote", tx);
+                        let room = timeline.room().clone();
+                        let _ = beside.send((room, event_type.into(), content, "the vote"));
                     }
                 }
             }
@@ -2282,13 +2441,8 @@ impl Session {
                     PollFormat::Standard | PollFormat::Mixed => {
                         let (event_type, content) =
                             stable_polls::end_event(format, &poll_event_id, text);
-                        send_beside(
-                            timeline.room().clone(),
-                            event_type,
-                            content,
-                            "the poll's end",
-                            tx,
-                        );
+                        let room = timeline.room().clone();
+                        let _ = beside.send((room, event_type.into(), content, "the poll's end"));
                     }
                 }
             }
@@ -2453,7 +2607,14 @@ impl Session {
                 tokio::spawn(async move { read_newest(&room).await });
             }
             Command::SetSections(sections) => {
-                let _ = sections_to_keep.send(Some(sections));
+                use std::sync::atomic::Ordering;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis() as u64);
+                let write =
+                    crate::sections::next_write(sections_written.load(Ordering::Relaxed), now);
+                sections_written.store(write, Ordering::Relaxed);
+                let _ = sections_to_keep.send(Some((write, sections)));
             }
             Command::Leave { room_id } => {
                 if open
@@ -2858,6 +3019,54 @@ fn spawn_verification(
     }
 }
 
+/// Start a verification of our asking: `ask` sends the request (to our
+/// other devices, or to another person), in the verification's own task,
+/// since the server may take its time over it. What the user answers
+/// meanwhile (Esc) waits there for it.
+fn start_verification(
+    client: &Client,
+    tx: &mpsc::UnboundedSender<Update>,
+    ask: impl Future<Output = Result<VerificationRequest>> + Send + 'static,
+) -> Verifying {
+    let (inputs_tx, inputs) = mpsc::unbounded_channel();
+    let unanswered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (client, tx, waits) = (client.clone(), tx.clone(), Arc::clone(&unanswered));
+    let _ = tx.send(Update::Verify(Some(VerifyState::Waiting)));
+    tokio::spawn(async move {
+        let failed = match tokio::time::timeout(Duration::from_secs(60), ask).await {
+            Ok(Ok(request)) => {
+                return verify::run(client, request, false, tx, inputs, waits).await;
+            }
+            Ok(Err(error)) => format!("{error:#}"),
+            Err(_) => "The server did not answer the request.".to_owned(),
+        };
+        let _ = tx.send(Update::Verify(Some(VerifyState::Failed(failed))));
+    });
+    Verifying {
+        inputs: inputs_tx,
+        unanswered,
+    }
+}
+
+/// Read the clipboard with `read` (which runs a clipboard tool and waits
+/// for it), off the async threads and not for ever.
+async fn from_clipboard<T: Send + 'static>(
+    read: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    match tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(read)).await {
+        Ok(read) => read.context("could not read the clipboard")?,
+        Err(_) => bail!("the clipboard did not answer"),
+    }
+}
+
+/// The time in seconds, for the name of a pasted picture.
+fn seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
 /// Picture formats looked for on the clipboard, best first.
 const CLIPBOARD_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
@@ -3107,22 +3316,26 @@ impl MessageParts {
     }
 }
 
-/// Send an event that does not go through the timeline's queue, beside
-/// the backend's loop: the server may take its time (or ask to wait and
-/// try again), and what the user does next must not wait for it.
-fn send_beside(
-    room: Room,
-    event_type: impl Into<String>,
-    content: Value,
-    what: &'static str,
-    tx: &mpsc::UnboundedSender<Update>,
+/// An event that does not go through the timeline's queue (a vote or a
+/// poll's end in a format the SDK's types cannot say): the room, its
+/// type and content, and what to call it when it could not be sent.
+type Beside = (Room, String, Value, &'static str);
+
+/// Send what does not go through the timeline's queue, beside the
+/// backend's loop: the server may take its time (or ask to wait and try
+/// again), and what the user does next must not wait for it. One after
+/// the other, in the order they were asked for: of two votes in one poll
+/// the later one counts, and sent each on its own the first, tried
+/// again, could arrive last.
+async fn beside_lane(
+    mut events: mpsc::UnboundedReceiver<Beside>,
+    tx: mpsc::UnboundedSender<Update>,
 ) {
-    let (event_type, tx) = (event_type.into(), tx.clone());
-    tokio::spawn(async move {
+    while let Some((room, event_type, content, what)) = events.recv().await {
         if let Err(error) = room.send_raw(&event_type, content).await {
             let _ = tx.send(Update::Notice(format!("Could not send {what}: {error}")));
         }
-    });
+    }
 }
 
 fn timeline_of(open: &Option<OpenRoom>) -> Result<&Arc<Timeline>> {
@@ -3237,9 +3450,6 @@ fn play_audio(path: &Path) -> bool {
     }
 }
 
-/// Download an attachment and open it. Returns where it was saved, and
-/// whether it is being played here (audio, with mpv) rather than handed
-/// to the desktop.
 /// A name for a downloaded file that stays inside the folder it is put
 /// in, whatever the sender called it.
 fn safe_file_name(name: &str) -> String {
@@ -3255,7 +3465,7 @@ fn safe_file_name(name: &str) -> String {
         .collect();
     let safe = match safe.trim_matches(|c| c == '.' || c == ' ') {
         "" => "attachment".to_owned(),
-        safe => safe.to_owned(),
+        safe => shortened(safe),
     };
     // Windows keeps these names for devices, with any ending.
     let stem = safe.split('.').next().unwrap_or_default().to_uppercase();
@@ -3264,6 +3474,30 @@ fn safe_file_name(name: &str) -> String {
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.ends_with(|c: char| c.is_ascii_digit()));
     if device { format!("_{safe}") } else { safe }
+}
+
+/// The longest name a downloaded file gets, in bytes. File systems take
+/// 255; the name is saved with a mark in front, perhaps an ending added,
+/// and under a longer name first while it is written.
+const MAX_FILE_NAME: usize = 150;
+
+/// `name` cut down to [`MAX_FILE_NAME`], keeping its ending: that is what
+/// says how the file is opened.
+fn shortened(name: &str) -> String {
+    if name.len() <= MAX_FILE_NAME {
+        return name.to_owned();
+    }
+    // An "ending" longer than any real one is part of the name.
+    let ending = match name.rsplit_once('.') {
+        Some((_, ending)) if ending.len() <= 16 => format!(".{ending}"),
+        _ => String::new(),
+    };
+    let mut cut = MAX_FILE_NAME - ending.len();
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = name[..cut].trim_end_matches(['.', ' ']);
+    format!("{stem}{ending}")
 }
 
 /// What became of a downloaded attachment.
@@ -3384,6 +3618,9 @@ fn way_to_open(name: &str, sound: Option<bool>, hand_over: bool) -> Opened {
     }
 }
 
+/// Download an attachment and open it. Returns where it was saved, and
+/// whether it is being played here (audio, with mpv) rather than handed
+/// to the desktop.
 async fn open_media(
     client: &Client,
     timeline: &Timeline,
@@ -3503,6 +3740,7 @@ async fn open_timeline(
     ));
     Ok(OpenRoom {
         room_id: room.room_id().to_string(),
+        thread,
         room,
         timeline,
         task,
@@ -3520,9 +3758,12 @@ async fn timeline_loop(
     mut nudges: mpsc::UnboundedReceiver<Nudge>,
 ) {
     let room_id = room.room_id().to_string();
-    let mut watch = RoomWatch::new(thread.is_none());
+    let mut watch = RoomWatch::new(match thread.as_deref() {
+        None => crate::room_watch::Shown::Room,
+        Some(PINNED_VIEW) => crate::room_watch::Shown::Pinned,
+        Some(_) => crate::room_watch::Shown::Thread,
+    });
     let (poll_loaded_tx, mut poll_loaded) = mpsc::unbounded_channel::<PollLoaded>();
-    let mut polls_as_of: HashMap<String, std::time::Instant> = HashMap::new();
     let (receipt_failed_tx, mut receipt_failed) = mpsc::unbounded_channel::<bool>();
     let (mut items, stream) = timeline.subscribe().await;
     let mut stream = Box::pin(stream);
@@ -3635,15 +3876,12 @@ async fn timeline_loop(
                     apply(diff, &mut items);
                 }
             }
-            Some((poll_id, started, events)) = poll_loaded.recv() => {
-                // An older reading that took longer must not put its
-                // tally back over a newer one's.
-                if polls_as_of.get(&poll_id).is_some_and(|as_of| *as_of > started) {
-                    continue;
-                }
-                polls_as_of.insert(poll_id.clone(), started);
+            Some((poll_id, events)) = poll_loaded.recv() => {
                 tracing::info!(poll_id, related_events = events.len(), "poll answers read");
-                watch.poll_loaded(&poll_id, &events);
+                // It changed while it was read: once more.
+                if watch.poll_loaded(&poll_id, &events) {
+                    tokio::spawn(load_poll_events(room.clone(), poll_id, poll_loaded_tx.clone()));
+                }
             }
             Ok(users) = typing.recv() => {
                 learn_names(&room, users.iter().map(ToString::to_string), &mut names).await;
@@ -3656,7 +3894,7 @@ async fn timeline_loop(
             // The member list is in: names not found before may be now.
             Some(()) = members_loaded.recv() => {}
             Some(nudge) = nudges.recv() => match nudge {
-                Nudge::PollChanged(poll_id) if watch.tracks(&poll_id) => {
+                Nudge::PollChanged(poll_id) if watch.poll_changed(&poll_id) => {
                     tokio::spawn(load_poll_events(room.clone(), poll_id, poll_loaded_tx.clone()));
                 }
                 // The loop goes round and publishes again.
@@ -3672,14 +3910,16 @@ fn seen_in(
     items: &Vector<Arc<TimelineItem>>,
     watch: &RoomWatch,
 ) -> (Seen, HashMap<String, MediaSource>) {
-    let mut seen = Seen::default();
+    let mut seen = Seen {
+        now: MilliSecondsSinceUnixEpoch::now().get().into(),
+        ..Seen::default()
+    };
     let mut pictures = HashMap::new();
     for event in items.iter().filter_map(|item| item.as_event()) {
         let event_id = event.event_id().map(ToString::to_string);
         if let Some(id) = &event_id {
             seen.newest = Some(id.clone());
-            seen.with_threads
-                .push((event.timestamp().get().into(), id.clone()));
+            seen.times.push(event.timestamp().get().into());
         }
         // The newest reply of a thread that starts here.
         if let TimelineItemContent::MsgLike(content) = event.content()
@@ -3687,7 +3927,7 @@ fn seen_in(
             && let TimelineDetails::Ready(reply) = &summary.latest_event
             && let TimelineEventItemId::EventId(id) = &reply.identifier
         {
-            seen.with_threads
+            seen.replies
                 .push((reply.timestamp.get().into(), id.to_string()));
         }
         let Some(id) = event_id else {
@@ -3764,12 +4004,38 @@ fn is_standard_poll_start(event: &AnySyncTimelineEvent) -> bool {
 }
 
 /// Read every event that refers to a poll (its responses and end) from the
-/// server and hand them to the timeline task as raw JSON.
+/// server and hand them to the timeline task as raw JSON. A reading that
+/// did not get them all (no network, a server that says to wait, more
+/// pages than are read in one go) is no reading: it is made again after a
+/// pause, and again, until one is whole or the room is no longer followed.
+/// [`RoomWatch`] sees to it that one poll has one of these at a time.
 async fn load_poll_events(room: Room, poll_id: String, done: mpsc::UnboundedSender<PollLoaded>) {
     let Ok(event_id) = EventId::parse(&poll_id) else {
         return;
     };
-    let started = std::time::Instant::now();
+    let mut tries = 0;
+    loop {
+        if let Some(events) = read_poll_events(&room, &event_id).await {
+            let _ = done.send((poll_id, events));
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(poll_retry_after(tries)) => {}
+            () = done.closed() => return,
+        }
+        tries += 1;
+    }
+}
+
+/// How long to wait before a poll's answers are read once more, after
+/// `tries` readings that failed.
+fn poll_retry_after(tries: usize) -> Duration {
+    const WAITS: [u64; 4] = [5, 15, 60, 300];
+    Duration::from_secs(WAITS[tries.min(WAITS.len() - 1)])
+}
+
+/// One reading of a poll's answers; none unless it got them all.
+async fn read_poll_events(room: &Room, event_id: &EventId) -> Option<Vec<Value>> {
     let mut events = Vec::new();
     let mut from = None;
     // Polls with thousands of votes are not a thing; cap the paging anyway.
@@ -3783,9 +4049,7 @@ async fn load_poll_events(room: Room, poll_id: String, done: mpsc::UnboundedSend
         };
         // Half an answer is none: counting only what came before the
         // network failed would show a poll with votes missing or none.
-        let Ok(page) = room.relations(event_id.clone(), options).await else {
-            return;
-        };
+        let page = room.relations(event_id.to_owned(), options).await.ok()?;
         for event in &page.chunk {
             if let Ok(value) = serde_json::from_str::<Value>(event.raw().json().get()) {
                 events.push(value);
@@ -3793,15 +4057,16 @@ async fn load_poll_events(room: Room, poll_id: String, done: mpsc::UnboundedSend
         }
         match page.next_batch_token {
             Some(token) => from = Some(token),
-            None => break,
+            None => return Some(events),
         }
     }
-    let _ = done.send((poll_id, started, events));
+    // Cut off with pages still to come: not all of them either.
+    tracing::warn!(poll_id = %event_id, "a poll has more answers than are read at once");
+    None
 }
 
-/// A poll's answers as read from the server, and when the reading began:
-/// of two readings under way, the later begun counts.
-type PollLoaded = (String, std::time::Instant, Vec<Value>);
+/// A poll's answers as read from the server, all of them.
+type PollLoaded = (String, Vec<Value>);
 
 async fn fetch_preview(
     client: Client,
@@ -4303,6 +4568,20 @@ mod tests {
     }
 
     #[test]
+    fn a_long_attachment_name_is_cut_to_one_that_can_be_saved() {
+        // Longer than a file name may be (255 bytes), in letters of two
+        // bytes each.
+        let long = format!("{}.pdf", "ä".repeat(200));
+        let saved = super::saved_name(&long, "$event", None, false);
+        assert!(saved.len() < 200, "{}", saved.len());
+        assert!(saved.ends_with(".pdf"));
+        assert!(super::opened_by_itself(&saved));
+        // A name without an ending, and one that fits, as it is.
+        assert_eq!(safe_file_name(&"x".repeat(400)).len(), super::MAX_FILE_NAME);
+        assert_eq!(safe_file_name("notes.txt"), "notes.txt");
+    }
+
+    #[test]
     fn a_downloaded_file_s_name_cannot_leave_its_folder() {
         assert_eq!(safe_file_name("cat picture-1.png"), "cat picture-1.png");
         assert_eq!(safe_file_name("../../etc/passwd"), "_.._etc_passwd");
@@ -4423,6 +4702,79 @@ mod lock_tests {
             other.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn profile(name: &str) -> (std::path::PathBuf, Paths) {
+        let dir = std::env::temp_dir().join(format!("mothrix-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = Paths {
+            config_file: dir.join("config.toml"),
+            data_dir: dir.join("work"),
+        };
+        std::fs::create_dir_all(paths.store_dir()).unwrap();
+        (dir, paths)
+    }
+
+    #[tokio::test]
+    async fn a_damaged_session_file_is_still_an_account_and_its_store_is_not_deleted() {
+        let (dir, paths) = profile("damaged");
+        // The file was cut short (a full disk, an editor); the store
+        // beside it holds the device's keys.
+        std::fs::write(paths.session_file(), r#"{"homeserver": "https://exa"#).unwrap();
+        let keys = paths.store_dir().join("keys");
+        std::fs::write(&keys, "secret").unwrap();
+        assert!(super::has_session(&paths));
+        assert_eq!(super::signed_in_as(&paths), None);
+        // Starting says what is wrong, and signing in under that name is
+        // refused: neither deletes anything.
+        let error = super::restore(&paths).await.expect_err("not restored");
+        assert!(format!("{error:#}").contains("session"), "{error:#}");
+        let signed_in = super::sign_in(
+            &paths,
+            "example.invalid",
+            true,
+            || Ok(("amy".to_owned(), "pw".to_owned())),
+            |_| {},
+        )
+        .await;
+        let error = signed_in.expect_err("refused");
+        assert!(error.to_string().contains("already an account"), "{error}");
+        assert_eq!(std::fs::read(&keys).unwrap(), b"secret");
+        assert!(paths.session_file().exists());
+        assert!(!super::holds(&paths));
+        // `mothrix logout` (and removing a left-out account in an app)
+        // is how it goes.
+        super::logout(&paths).await.unwrap();
+        assert!(!paths.session_file().exists() && !paths.store_dir().exists());
+        assert!(!super::holds(&paths));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_account_that_does_not_start_lets_go_of_its_profile() {
+        let (dir, paths) = profile("unstarted");
+        // Its store is locked in a way this mothrix cannot open (the
+        // keyring's answer failing goes the same way).
+        let session = serde_json::json!({
+            "homeserver": "https://example.invalid",
+            "session": {
+                "user_id": "@amy:example.invalid",
+                "device_id": "DEVICE",
+                "access_token": "token",
+            },
+            "store_key": "elsewhere",
+        });
+        std::fs::write(paths.session_file(), session.to_string()).unwrap();
+        let error = super::restore(&paths).await.expect_err("not restored");
+        assert!(error.to_string().contains("does not know"), "{error:#}");
+        // Another mothrix, which may be able to open it, is not kept out.
+        assert!(!super::holds(&paths));
+        let lock = std::fs::File::options()
+            .write(true)
+            .open(paths.data_dir.join(super::LOCK))
+            .unwrap();
+        assert!(lock.try_lock().is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -74,7 +74,7 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `folders.rs` | where mothrix keeps its files; an app (iOS) names one folder for all (`set_root`) |
 | `toast.rs` | notifications on Windows (toasts) for both front ends, and registering mothrix's app id for them |
 | `art.rs` | the text moth (the start screen when pictures are off or there is no room), and which part of it takes which colour |
-| `sections.rs` | own sections: `OwnSections`, every change to them and their rules; in each account's account data (`de.tmrk.mothrix.sections`): an account's share, merging, `Sync` (used by `Accounts`) |
+| `sections.rs` | own sections: `OwnSections`, every change to them and their rules; in each account's account data (`de.tmrk.mothrix.sections`): an account's share, merging, `Sync` (used by `Accounts`), `Watch` (what of the store's content is news), `Said` (what an account says it stores) |
 | `update.rs` | updates of the terminal client from GitHub releases: looking, checking the signed `release.json` against the built-in key (`release_key.pub`), downloading, putting the new program in place; `Build` says what a build may do |
 | `search.rs`, `spell.rs`, `languagetool.rs` | what their names say |
 
@@ -237,9 +237,13 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   watched in the store) into it, and `Accounts::sync_sections` (called
   in every round of the UIs' loops) sends an account its changed share
   (`Command::SetSections`). Nothing is sent before an account has said
-  what it stores; echoes of older writes are ignored. Snapshot mode
-  only reads. The config file keeps a copy; fold state stays per
-  device.
+  what it stores (`sections::Said`; content this build cannot read makes
+  it silent again). What is written carries who wrote it (`by`: device
+  and a time that only grows), which is how `sections::Watch` tells our
+  own writes coming back from another device's. Snapshot mode only
+  reads. The config file keeps a copy; fold state stays per device.
+  Signing an account out takes its rooms out of the sections and its
+  fold state away.
 - **Unread counts** are the larger of the server's and the SDK's own
   (it counts from the events it saw, and misses some in rooms it does
   not follow; the server cannot see mentions in encrypted messages),

@@ -19,9 +19,31 @@ pub trait Speller: Send + Sync {
 /// so writing in two languages does not light everything up.
 pub struct Dictionaries {
     loaded: Vec<(String, spellbook::Dictionary)>,
+    /// What is wrong with each dictionary that is installed but could not
+    /// be used.
+    problems: Vec<String>,
 }
 
+/// Why [`load`] loaded nothing: none of the languages has a dictionary
+/// installed. (Nothing to tell the user at every start; a dictionary that
+/// is there and broken is.)
+#[derive(Debug)]
+pub struct NoneInstalled(String);
+
+impl std::fmt::Display for NoneInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no dictionary found for {}", self.0)
+    }
+}
+
+impl std::error::Error for NoneInstalled {}
+
 impl Dictionaries {
+    /// The dictionaries left out, each with what is wrong with it.
+    pub fn problems(&self) -> &[String] {
+        &self.problems
+    }
+
     pub fn languages(&self) -> Vec<String> {
         self.loaded
             .iter()
@@ -150,23 +172,33 @@ fn read_text(path: &Path) -> Result<String> {
 }
 
 /// Load the dictionaries for `languages`, skipping those that are not
-/// installed. Fails only when none could be loaded.
+/// installed. One that is there and cannot be used is left out and named
+/// ([`Dictionaries::problems`]): the others still check. Fails only when
+/// none could be loaded; with [`NoneInstalled`] when there was none.
 pub fn load(languages: &[String], dirs: &[PathBuf]) -> Result<Dictionaries> {
     let mut loaded = Vec::new();
+    let mut problems = Vec::new();
     for language in languages {
         let Some((aff, dic)) = find(language, dirs) else {
             continue;
         };
-        let dictionary =
-            spellbook::Dictionary::new(&read_text(&aff)?, &read_text(&dic)?).map_err(|error| {
+        let dictionary = read_text(&aff).and_then(|aff_text| {
+            spellbook::Dictionary::new(&aff_text, &read_text(&dic)?).map_err(|error| {
                 anyhow::anyhow!("{} is not a usable dictionary: {error}", aff.display())
-            })?;
-        loaded.push((language.clone(), dictionary));
+            })
+        });
+        match dictionary {
+            Ok(dictionary) => loaded.push((language.clone(), dictionary)),
+            Err(error) => problems.push(format!("{error:#}")),
+        }
     }
     if loaded.is_empty() {
-        bail!("no dictionary found for {}", languages.join(", "));
+        if problems.is_empty() {
+            bail!(NoneInstalled(languages.join(", ")));
+        }
+        bail!("{}", problems.join("; "));
     }
-    Ok(Dictionaries { loaded })
+    Ok(Dictionaries { loaded, problems })
 }
 
 /// Dictionaries `mothrix dictionary` can fetch: language and the path of its
@@ -210,9 +242,11 @@ pub fn misspelled(
 ) -> Vec<(usize, usize)> {
     let chars: Vec<char> = text.chars().collect();
     let mut start_at = 0;
-    if text.starts_with('/') {
-        match text.strip_prefix("/me ") {
-            Some(_) => start_at = 4,
+    // A command also after spaces, as it is when sent.
+    if crate::message::is_command(text) {
+        let command = text.trim_start();
+        match command.strip_prefix("/me ") {
+            Some(_) => start_at = chars.len() - command.chars().count() + 4,
             None => return Vec::new(),
         }
     }
@@ -337,6 +371,36 @@ mod tests {
         );
         assert!(flagged("/file ~/Dokumnte/x.txt", 0).is_empty());
         assert_eq!(flagged("/me wavse", 0), ["wavse"]);
+        // A command is one after spaces too, as it is when sent.
+        assert!(flagged("  /recover EsTa Dokumnte", 0).is_empty());
+        assert_eq!(flagged("  /me wavse", 0), ["wavse"]);
+    }
+
+    #[test]
+    fn a_broken_dictionary_is_named_and_the_others_still_check() {
+        let dir = std::env::temp_dir().join(format!("mothrix-spell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("xx_XX.aff"), "SET UTF-8\n").unwrap();
+        std::fs::write(dir.join("xx_XX.dic"), "1\nhello\n").unwrap();
+        // Its word list is not text a dictionary can be made of.
+        std::fs::write(dir.join("yy_YY.aff"), "SET UTF-8\n").unwrap();
+        std::fs::write(dir.join("yy_YY.dic"), "not a number\nhello\n").unwrap();
+        let dirs = [dir.clone()];
+        let languages = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        let both: Vec<String> = languages(&["yy_YY", "xx_XX", "zz_ZZ"]);
+        let dictionaries = load(&both, &dirs).expect("the good one loads");
+        assert_eq!(dictionaries.languages(), ["xx_XX"]);
+        assert!(dictionaries.check("hello"));
+        assert_eq!(dictionaries.problems().len(), 1);
+        assert!(dictionaries.problems()[0].contains("yy_YY"));
+        // Only the broken one: that is what is wrong, not "none found".
+        let only: Vec<String> = languages(&["yy_YY"]);
+        let error = load(&only, &dirs).err().expect("nothing loads");
+        assert!(!error.is::<NoneInstalled>(), "{error}");
+        let none: Vec<String> = languages(&["zz_ZZ"]);
+        assert!(load(&none, &dirs).err().unwrap().is::<NoneInstalled>());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

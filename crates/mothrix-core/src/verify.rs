@@ -112,8 +112,9 @@ pub async fn run(
 }
 
 fn show(tx: &mpsc::UnboundedSender<Update>, state: VerifyState) {
-    // Not at a level the log keeps by default: the emoji are in it.
-    tracing::debug!(?state, "verification progress");
+    // Its name only: the state itself holds the emoji, and the name of
+    // the other device.
+    tracing::debug!(state = shown_step(&state), "verification progress");
     let _ = tx.send(Update::Verify(Some(state)));
 }
 
@@ -228,7 +229,10 @@ async fn drive(
         tokio::select! {
             next = changes.next() => {
                 state = next.context("the request went away")?;
-                tracing::info!(?state, "verification request changed");
+                // Its name only: once it moved on to the comparison, the
+                // state holds that (its emoji), and before that the other
+                // device's keys.
+                tracing::info!(state = request_step(&state), "verification request changed");
                 nudge(client, request).await;
             }
             input = inputs.recv() => if matches!(input, Some(VerifyInput::Cancel) | None) {
@@ -324,6 +328,30 @@ fn step(state: &SasState) -> &'static str {
     }
 }
 
+/// Where a verification request stands, for the log.
+fn request_step(state: &VerificationRequestState) -> &'static str {
+    match state {
+        VerificationRequestState::Created { .. } => "created",
+        VerificationRequestState::Requested { .. } => "requested",
+        VerificationRequestState::Ready { .. } => "ready",
+        VerificationRequestState::Transitioned { .. } => "comparing",
+        VerificationRequestState::Done => "done",
+        VerificationRequestState::Cancelled(_) => "cancelled",
+    }
+}
+
+/// What the dialog shows, for the log.
+fn shown_step(state: &VerifyState) -> &'static str {
+    match state {
+        VerifyState::Incoming { .. } => "incoming",
+        VerifyState::Waiting => "waiting",
+        VerifyState::Emojis(_) => "emojis",
+        VerifyState::Confirming => "confirming",
+        VerifyState::Done => "done",
+        VerifyState::Failed(_) => "failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +365,9 @@ mod tests {
         assert_eq!(step(&state), "keys exchanged");
         // What the log line had before: the numbers (and the emoji).
         assert!(format!("{state:?}").contains("5678"));
+        // Nor what the dialog shows.
+        let shown = VerifyState::Emojis(vec![("🐶".into(), "Dog".into())]);
+        assert_eq!(shown_step(&shown), "emojis");
+        assert_eq!(request_step(&VerificationRequestState::Done), "done");
     }
 }

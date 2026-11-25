@@ -7,10 +7,16 @@
 //! passphrase elsewhere, a copy of the files alone (a backup, a disk
 //! taken out) does not give them away.
 //!
+//! Not protected by it: `session.json` beside the store, which holds the
+//! access token (it has to be read before the store is opened), and with
+//! it drafts, the log and opened attachments. Those rest on the file
+//! permissions alone (docs/configuration.md).
+//!
 //! An account gets one when it signs in, if a keyring can be reached
 //! then; its session file says so ([`IN_KEYRING`]). One signed in without
-//! (an earlier version, a machine without a keyring, the iPhone app)
-//! stays as it is until it signs in again.
+//! (an earlier version, a machine without a keyring) stays as it is until
+//! it signs in again. The iPhone app makes one passphrase for all its
+//! accounts, keeps it in its Keychain and hands it over ([`FROM_APP`]).
 
 use std::path::Path;
 

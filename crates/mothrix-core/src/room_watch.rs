@@ -15,14 +15,30 @@ use crate::{convert::StablePolls, stable_polls::StablePoll};
 /// Pictures larger than this are not fetched for the conversation.
 pub const MAX_PREVIEW_BYTES: u64 = 15 * 1024 * 1024;
 
+/// What of a room the conversation followed shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shown {
+    /// The room's own conversation.
+    Room,
+    /// One thread of it.
+    Thread,
+    /// Its pinned messages: old ones, picked out. Looking at them reads
+    /// nothing.
+    Pinned,
+}
+
 /// What one snapshot of the timeline holds that matters here.
 #[derive(Default)]
 pub struct Seen {
     /// The newest event of the conversation shown.
     pub newest: Option<String>,
-    /// (time, event id) of every message, and of the newest reply of each
-    /// thread that starts here.
-    pub with_threads: Vec<(u64, String)>,
+    /// The time each message of the conversation says it was sent at.
+    pub times: Vec<u64>,
+    /// (time, event id) of the newest reply of each thread that starts
+    /// here.
+    pub replies: Vec<(u64, String)>,
+    /// The time now, as the times above count it (milliseconds).
+    pub now: u64,
     /// Polls the SDK tallies itself: (event id, how the SDK shows it now
     /// (`convert::poll_mark`), our own tally to start from).
     pub sdk_polls: Vec<(String, usize, StablePoll)>,
@@ -51,24 +67,33 @@ pub struct ToDo {
 
 /// The state kept between snapshots of one open room.
 pub struct RoomWatch {
-    /// The room's own conversation (not a thread or the pinned view).
-    live: bool,
+    shown: Shown,
     last_read: Option<String>,
     read_with_threads: Option<String>,
-    /// Polls with the answers read so far, in every format.
+    /// Polls with the answers read so far, in every format: what is
+    /// shown of them.
     polls: StablePolls,
+    /// Polls the SDK tallies too, whose answers we have not read yet.
+    /// Until then the SDK's word is all there is, also on whether the
+    /// poll has ended: an empty tally of ours would say it has not.
+    unread: StablePolls,
+    /// Polls being read: one reading per poll at a time. `true`: it
+    /// changed since that reading began, and is read again after it.
+    reading: HashMap<String, bool>,
     /// How the SDK last showed each poll it tallies itself.
     sdk_marks: HashMap<String, usize>,
     pictures_asked: HashSet<String>,
 }
 
 impl RoomWatch {
-    pub fn new(live: bool) -> Self {
+    pub fn new(shown: Shown) -> Self {
         Self {
-            live,
+            shown,
             last_read: None,
             read_with_threads: None,
             polls: StablePolls::new(),
+            unread: StablePolls::new(),
+            reading: HashMap::new(),
             sdk_marks: HashMap::new(),
             pictures_asked: HashSet::new(),
         }
@@ -76,16 +101,41 @@ impl RoomWatch {
 
     /// Whether this poll is followed already (no need to parse its start).
     pub fn tracks(&self, poll: &str) -> bool {
-        self.polls.contains_key(poll)
+        self.polls.contains_key(poll) || self.unread.contains_key(poll)
     }
 
+    /// Our own tallies, to show: of the standard-format polls, and of
+    /// those the SDK tallies too once their answers were read.
     pub fn polls(&self) -> &StablePolls {
         &self.polls
+    }
+
+    /// The poll's answers are to be read (again). Returns whether to
+    /// start a reading now; while one is under way the next waits for it
+    /// ([`RoomWatch::poll_loaded`]).
+    fn read_poll(&mut self, poll: &str) -> bool {
+        match self.reading.get_mut(poll) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                self.reading.insert(poll.to_owned(), false);
+                true
+            }
+        }
+    }
+
+    /// A poll got a new answer or was ended. Returns whether to start
+    /// reading its answers now.
+    pub fn poll_changed(&mut self, poll: &str) -> bool {
+        self.tracks(poll) && self.read_poll(poll)
     }
 
     /// Take in a snapshot of the timeline.
     pub fn see(&mut self, seen: Seen) -> ToDo {
         let mut todo = ToDo::default();
+        let with_threads = newest_with_threads(&seen);
 
         // Polls the SDK tallies: other clients may answer them in another
         // format, which the SDK ignores. Read all answers ourselves, again
@@ -94,15 +144,21 @@ impl RoomWatch {
             if self.sdk_marks.insert(id.clone(), mark) == Some(mark) {
                 continue;
             }
-            self.polls.entry(id.clone()).or_insert(own);
-            todo.load_polls.push(id);
+            if !self.polls.contains_key(&id) {
+                self.unread.entry(id.clone()).or_insert(own);
+            }
+            if self.read_poll(&id) {
+                todo.load_polls.push(id);
+            }
         }
         for (id, poll) in seen.new_standard_polls {
-            if self.polls.contains_key(&id) {
+            if self.tracks(&id) {
                 continue;
             }
             self.polls.insert(id.clone(), poll);
-            todo.load_polls.push(id);
+            if self.read_poll(&id) {
+                todo.load_polls.push(id);
+            }
         }
 
         for (id, size) in seen.pictures {
@@ -112,11 +168,14 @@ impl RoomWatch {
             }
         }
 
-        // The room is on screen, so what arrived counts as read.
-        if let Some(newest) = seen.newest
-            && self.last_read.as_ref() != Some(&newest)
+        // The room is on screen, so what arrived counts as read. Not
+        // among the pinned messages: the newest of them is an old message,
+        // and a receipt for it would be one for the room.
+        if self.shown != Shown::Pinned
+            && let Some(newest) = &seen.newest
+            && self.last_read.as_ref() != Some(newest)
         {
-            self.last_read = Some(newest);
+            self.last_read = Some(newest.clone());
             todo.mark_read = true;
         }
         // That receipt is for the conversation shown. Replies inside
@@ -124,18 +183,12 @@ impl RoomWatch {
         // client may have marked the room as unread by hand; neither would
         // ever clear. So also say "read up to here, threads included" for
         // the newest message known, wherever it is.
-        if self.live {
-            let mut newest: Option<&(u64, String)> = None;
-            for candidate in &seen.with_threads {
-                if newest.is_none_or(|known| candidate.0 >= known.0) {
-                    newest = Some(candidate);
-                }
-            }
-            if let Some((_, id)) = newest
-                && self.read_with_threads.as_ref() != Some(id)
+        if self.shown == Shown::Room {
+            if let Some(id) = with_threads
+                && self.read_with_threads.as_ref() != Some(&id)
             {
                 self.read_with_threads = Some(id.clone());
-                todo.read_with_threads = Some(id.clone());
+                todo.read_with_threads = Some(id);
             }
             todo.clear_unread_flag = true;
         }
@@ -154,8 +207,13 @@ impl RoomWatch {
         self.read_with_threads = None;
     }
 
-    /// The answers of a poll were read: count them anew.
-    pub fn poll_loaded(&mut self, poll: &str, events: &[Value]) {
+    /// The answers of a poll were read, all of them: count them anew.
+    /// Returns whether to read them once more now, because the poll
+    /// changed while they were read.
+    pub fn poll_loaded(&mut self, poll: &str, events: &[Value]) -> bool {
+        if let Some(tally) = self.unread.remove(poll) {
+            self.polls.insert(poll.to_owned(), tally);
+        }
         if let Some(poll) = self.polls.get_mut(poll) {
             poll.reset();
             for event in events {
@@ -167,6 +225,34 @@ impl RoomWatch {
                 );
             }
         }
+        match self.reading.remove(poll) {
+            Some(true) => self.read_poll(poll),
+            _ => false,
+        }
+    }
+}
+
+/// The event the threads-included receipt is for: the newest of the
+/// conversation, or the reply in a thread that is newer still. The
+/// conversation's newest is the last in it, whatever time it claims; a
+/// reply is compared by the time it says it was sent at, and one that
+/// says it comes from the future is not believed. Going by the largest
+/// time alone, one message dated next year would be "the newest" for a
+/// year, and no receipt would follow it.
+fn newest_with_threads(seen: &Seen) -> Option<String> {
+    let believed = |at: &u64| *at <= seen.now;
+    let newest_at = seen.times.iter().copied().filter(believed).max();
+    let reply = seen
+        .replies
+        .iter()
+        .filter(|(at, _)| believed(at))
+        .max_by_key(|(at, _)| *at);
+    match (&seen.newest, reply) {
+        (Some(_), Some((at, id))) if newest_at.is_none_or(|newest| *at > newest) => {
+            Some(id.clone())
+        }
+        (Some(newest), _) => Some(newest.clone()),
+        (None, reply) => reply.map(|(_, id)| id.clone()),
     }
 }
 
@@ -174,21 +260,25 @@ impl RoomWatch {
 mod tests {
     use super::*;
 
-    fn seen(newest: &str, with_threads: &[(u64, &str)]) -> Seen {
+    /// A conversation of these (time, id) messages, with these newest
+    /// replies in its threads, looked at when it is 100 o'clock.
+    fn seen(messages: &[(u64, &str)], replies: &[(u64, &str)]) -> Seen {
         Seen {
-            newest: Some(newest.into()),
-            with_threads: with_threads
+            newest: messages.last().map(|(_, id)| (*id).to_owned()),
+            times: messages.iter().map(|(at, _)| *at).collect(),
+            replies: replies
                 .iter()
                 .map(|(at, id)| (*at, (*id).to_owned()))
                 .collect(),
+            now: 100,
             ..Seen::default()
         }
     }
 
     #[test]
     fn a_receipt_that_did_not_go_out_is_sent_again() {
-        let mut watch = RoomWatch::new(true);
-        let snapshot = || seen("$2", &[(1, "$1"), (2, "$2")]);
+        let mut watch = RoomWatch::new(Shown::Room);
+        let snapshot = || seen(&[(1, "$1"), (2, "$2")], &[]);
         assert!(watch.see(snapshot()).mark_read);
         watch.read_failed();
         let todo = watch.see(snapshot());
@@ -201,39 +291,68 @@ mod tests {
 
     #[test]
     fn receipts_go_out_once_per_newer_message() {
-        let mut watch = RoomWatch::new(true);
-        let todo = watch.see(seen("$2", &[(1, "$1"), (2, "$2")]));
+        let mut watch = RoomWatch::new(Shown::Room);
+        let todo = watch.see(seen(&[(1, "$1"), (2, "$2")], &[]));
         assert!(todo.mark_read);
         assert_eq!(todo.read_with_threads.as_deref(), Some("$2"));
         assert!(todo.clear_unread_flag);
         // The same snapshot again: nothing new to say.
-        let todo = watch.see(seen("$2", &[(1, "$1"), (2, "$2")]));
+        let todo = watch.see(seen(&[(1, "$1"), (2, "$2")], &[]));
         assert!(!todo.mark_read && todo.read_with_threads.is_none());
     }
 
     #[test]
     fn a_newer_thread_reply_gets_the_threads_included_receipt() {
-        let mut watch = RoomWatch::new(true);
-        watch.see(seen("$2", &[(1, "$1"), (2, "$2")]));
+        let mut watch = RoomWatch::new(Shown::Room);
+        watch.see(seen(&[(1, "$1"), (2, "$2")], &[]));
         // A reply in the thread of $1 arrived; the conversation itself
         // did not change.
-        let todo = watch.see(seen("$2", &[(1, "$1"), (2, "$2"), (3, "$reply")]));
+        let todo = watch.see(seen(&[(1, "$1"), (2, "$2")], &[(3, "$reply")]));
         assert!(!todo.mark_read);
         assert_eq!(todo.read_with_threads.as_deref(), Some("$reply"));
+        // An older reply is behind the conversation's newest.
+        let mut watch = RoomWatch::new(Shown::Room);
+        let todo = watch.see(seen(&[(1, "$1"), (5, "$2")], &[(3, "$reply")]));
+        assert_eq!(todo.read_with_threads.as_deref(), Some("$2"));
+    }
+
+    #[test]
+    fn a_message_dated_in_the_future_does_not_stop_the_receipts() {
+        // It is 100; "$late" says it was sent at 5000.
+        let mut watch = RoomWatch::new(Shown::Room);
+        let todo = watch.see(seen(&[(1, "$1"), (5000, "$late")], &[]));
+        assert_eq!(todo.read_with_threads.as_deref(), Some("$late"));
+        // What comes after it is the newest, though its time is smaller.
+        let after = [(1, "$1"), (5000, "$late"), (50, "$3")];
+        let todo = watch.see(seen(&after, &[]));
+        assert_eq!(todo.read_with_threads.as_deref(), Some("$3"));
+        // Nor does a reply from the future stay the newest for ever.
+        let todo = watch.see(seen(&after, &[(9000, "$reply")]));
+        assert_eq!(todo.read_with_threads, None);
+        let more = [(1, "$1"), (5000, "$late"), (50, "$3"), (60, "$4")];
+        let todo = watch.see(seen(&more, &[(9000, "$reply"), (55, "$other")]));
+        assert_eq!(todo.read_with_threads.as_deref(), Some("$4"));
     }
 
     #[test]
     fn a_thread_view_leaves_the_room_wide_receipt_alone() {
-        let mut watch = RoomWatch::new(false);
-        let todo = watch.see(seen("$r2", &[(5, "$r2")]));
+        let mut watch = RoomWatch::new(Shown::Thread);
+        let todo = watch.see(seen(&[(5, "$r2")], &[]));
         assert!(todo.mark_read);
         assert_eq!(todo.read_with_threads, None);
         assert!(!todo.clear_unread_flag);
     }
 
     #[test]
+    fn looking_at_the_pinned_messages_reads_nothing() {
+        let mut watch = RoomWatch::new(Shown::Pinned);
+        let todo = watch.see(seen(&[(1, "$old"), (2, "$pinned")], &[]));
+        assert_eq!(todo, ToDo::default());
+    }
+
+    #[test]
     fn pictures_are_fetched_once_and_not_when_too_big() {
-        let mut watch = RoomWatch::new(true);
+        let mut watch = RoomWatch::new(Shown::Room);
         let pictures = || Seen {
             pictures: vec![
                 ("$small".into(), Some(1000)),
@@ -248,13 +367,14 @@ mod tests {
 
     #[test]
     fn polls_are_read_when_new_and_when_the_sdk_view_changes() {
-        let mut watch = RoomWatch::new(true);
+        let mut watch = RoomWatch::new(Shown::Room);
         let sdk = |mark| Seen {
             sdk_polls: vec![("$p".into(), mark, StablePoll::default())],
             ..Seen::default()
         };
         assert_eq!(watch.see(sdk(1)).load_polls, ["$p"]);
         assert!(watch.see(sdk(1)).load_polls.is_empty());
+        assert!(!watch.poll_loaded("$p", &[]));
         assert_eq!(watch.see(sdk(2)).load_polls, ["$p"]);
         assert!(watch.tracks("$p"));
 
@@ -264,5 +384,53 @@ mod tests {
         };
         assert_eq!(watch.see(standard).load_polls, ["$s"]);
         assert!(watch.tracks("$s"));
+    }
+
+    #[test]
+    fn the_sdk_s_word_on_a_poll_counts_until_our_own_reading_went_through() {
+        let mut watch = RoomWatch::new(Shown::Room);
+        let sdk = |mark| Seen {
+            sdk_polls: vec![("$p".into(), mark, StablePoll::default())],
+            ..Seen::default()
+        };
+        assert_eq!(watch.see(sdk(1)).load_polls, ["$p"]);
+        // No reading yet (no network, or the server said to wait): there
+        // is no tally of ours to show, which would say "not ended" over
+        // the SDK's "ended".
+        assert!(watch.tracks("$p"));
+        assert!(!watch.polls().contains_key("$p"));
+        watch.see(sdk(2));
+        assert!(!watch.polls().contains_key("$p"));
+        // Once read, ours is shown.
+        watch.poll_loaded("$p", &[]);
+        assert!(watch.polls().contains_key("$p"));
+        // A standard-format poll has no other tally: shown from the start.
+        let standard = Seen {
+            new_standard_polls: vec![("$s".into(), StablePoll::default())],
+            ..Seen::default()
+        };
+        watch.see(standard);
+        assert!(watch.polls().contains_key("$s"));
+    }
+
+    #[test]
+    fn one_reading_per_poll_at_a_time_and_again_after_it_when_the_poll_changed() {
+        let mut watch = RoomWatch::new(Shown::Room);
+        let sdk = |mark| Seen {
+            sdk_polls: vec![("$p".into(), mark, StablePoll::default())],
+            ..Seen::default()
+        };
+        assert_eq!(watch.see(sdk(1)).load_polls, ["$p"]);
+        // Three votes arrive while the answers are being read: no reading
+        // each, but one more when this one is done.
+        assert!(!watch.poll_changed("$p"));
+        assert!(!watch.poll_changed("$p"));
+        assert!(watch.see(sdk(2)).load_polls.is_empty());
+        assert!(watch.poll_loaded("$p", &[]));
+        // That one found the poll at rest.
+        assert!(!watch.poll_loaded("$p", &[]));
+        assert!(watch.poll_changed("$p"));
+        // A poll that is not followed is not read.
+        assert!(!watch.poll_changed("$unknown"));
     }
 }

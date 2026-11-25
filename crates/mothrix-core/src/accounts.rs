@@ -67,30 +67,34 @@ pub fn prefix_for(profile: &str) -> String {
     }
 }
 
-/// The account a room key belongs to, and the room id in it.
-pub fn split<'a>(prefixes: &[String], key: &'a str) -> (usize, &'a str) {
+/// The account a room key belongs to, and the room id in it; none for a
+/// key of no account here: one with the prefix of a profile that is not
+/// running (signed out, left out at this start), or a plain room id when
+/// the account without a prefix is not among them. Such a key is nobody
+/// else's: answering a notification of the account that is gone must not
+/// go out as another one that happens to be in the same room.
+pub fn split<'a>(prefixes: &[String], key: &'a str) -> Option<(usize, &'a str)> {
     for (index, prefix) in prefixes.iter().enumerate() {
         if !prefix.is_empty()
             && let Some(room_id) = key.strip_prefix(prefix.as_str())
         {
-            return (index, room_id);
+            return Some((index, room_id));
         }
     }
-    let unprefixed = prefixes.iter().position(String::is_empty).unwrap_or(0);
-    (unprefixed, key)
+    // A room id as it is belongs to the account without a prefix only.
+    let unprefixed = prefixes.iter().position(String::is_empty)?;
+    key.starts_with('!').then_some((unprefixed, key))
 }
 
 /// The profile of `profiles` a room key belongs to, and the room id in it,
 /// for what has only the profiles on disk (the iPhone's extensions). A
 /// key without a profile's prefix is the default profile's.
 pub fn split_by_profile<'a>(profiles: &[String], key: &'a str) -> (String, &'a str) {
-    let mut names = profiles.to_vec();
-    if !names.iter().any(|name| name == "default") {
-        names.push("default".to_owned());
-    }
-    let prefixes: Vec<String> = names.iter().map(|name| prefix_for(name)).collect();
-    let (index, room_id) = split(&prefixes, key);
-    (names[index].clone(), room_id)
+    profiles
+        .iter()
+        .filter(|name| *name != "default")
+        .find_map(|name| Some((name.clone(), key.strip_prefix(prefix_for(name).as_str())?)))
+        .unwrap_or_else(|| ("default".to_owned(), key))
 }
 
 /// A profile name made from a server address: "https://matrix.example.org"
@@ -143,6 +147,35 @@ pub fn pick_profile(typed: &str, server: &str, taken: &[String]) -> Result<Strin
         .unwrap_or(profile))
 }
 
+/// The profile a sign-in really goes to: `profile` as the form picked it
+/// among the running accounts, unless an account is on disk under that
+/// name (`on_disk` says) without running: one left out at this start
+/// (its store did not open, another mothrix has it), or one this mothrix
+/// was not started with. A name made from the server (`typed` false)
+/// then gets the next free number, instead of a refusal the user can do
+/// nothing about; a name the user typed is theirs to change.
+pub fn free_profile(
+    profile: &str,
+    typed: bool,
+    on_disk: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    if !on_disk(profile) {
+        return Ok(profile.to_owned());
+    }
+    if typed {
+        return Err(format!(
+            "There is already an account called '{profile}' on this device (it is not \
+             running); choose another name."
+        ));
+    }
+    let base = profile.trim_end_matches(|c: char| c.is_ascii_digit());
+    let base = if base.is_empty() { profile } else { base };
+    Ok((2..)
+        .map(|number| format!("{base}{number}"))
+        .find(|name| !on_disk(name))
+        .unwrap_or_else(|| profile.to_owned()))
+}
+
 /// A sign-in a front end asks for ([`start_sign_in`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct SignIn {
@@ -187,6 +220,9 @@ impl SignIn {
     /// of the accounts there are. The name may be empty (the profile is
     /// then made from the server), and so may the user where the server
     /// is a full Matrix id, which then is the user too.
+    ///
+    /// (The form knows the accounts that run. One that is on disk and
+    /// does not run is seen when the sign-in starts: [`free_profile`].)
     pub fn from_form(
         server: &str,
         user: &str,
@@ -245,11 +281,23 @@ pub fn start_sign_in(
             user,
             password,
         } = request;
-        let result = sign_in(&profile, &server, user, password, browser, tell.clone()).await;
+        // The name typed is the label; without one the profile was made
+        // from the server.
+        let free = free_profile(&profile, !label.is_empty(), |name| {
+            matrix::Paths::for_profile(name).is_ok_and(|paths| matrix::has_session(&paths))
+        });
+        let (profile, result) = match free {
+            Ok(profile) => {
+                let signed_in =
+                    sign_in(&profile, &server, user, password, browser, tell.clone()).await;
+                (profile, signed_in.map_err(|error| format!("{error:#}")))
+            }
+            Err(taken) => (profile, Err(taken)),
+        };
         tell(SignInEvent::Done {
             profile,
             label,
-            result: result.map_err(|error| format!("{error:#}")),
+            result,
         });
     });
 }
@@ -263,8 +311,9 @@ async fn sign_in(
     tell: impl Fn(SignInEvent) + Clone + Send + Sync + 'static,
 ) -> anyhow::Result<Client> {
     let paths = matrix::Paths::for_profile(profile)?;
-    // Before anything is written: what is there is that account's.
-    if matrix::signed_in_as(&paths).is_some() {
+    // Before anything is written: what is there is that account's, also
+    // when its session file cannot be read (`matrix::sign_in` refuses).
+    if matrix::has_session(&paths) {
         anyhow::bail!("there is already an account called '{profile}'");
     }
     let password_login = !browser || !password.is_empty();
@@ -305,6 +354,10 @@ pub async fn restore_all(
     (clients, problems)
 }
 
+/// Said when something is asked for a room whose key names no running
+/// account ([`split`]).
+const NO_ACCOUNT: &str = "That room's account is not signed in here.";
+
 /// What [`Accounts`] keeps of one account.
 struct Slot {
     /// What its updates are marked with. Positions shift when an account
@@ -321,6 +374,10 @@ struct Slot {
     found: Vec<SearchHit>,
     /// What it stores of the own sections ([`crate::sections`]).
     sections: crate::sections::Sync,
+    /// Signed in during this run, and not looked at yet: what the UI
+    /// keeps under its profile's name is an earlier account's (see
+    /// `Accounts::welcome`).
+    fresh: bool,
 }
 
 pub struct Accounts {
@@ -374,15 +431,96 @@ impl Accounts {
     /// under the name typed for it, if any. The front end lists it.
     pub fn signed_in(&mut self, profile: String, label: String, client: Client) -> Account {
         let mut account = self.add(profile, client);
+        self.newly_signed_in();
         if !label.is_empty() {
             account.label = label;
         }
         account
     }
 
+    /// The account added last was signed in just now, not restored: it
+    /// starts with nothing here (see `welcome`).
+    pub fn newly_signed_in(&mut self) {
+        if let Some(slot) = self.slots.last_mut() {
+            slot.fresh = true;
+        }
+    }
+
+    /// Whether an account of this profile runs here.
+    pub fn is_running(&self, profile: &str) -> bool {
+        let prefix = prefix_for(profile);
+        self.slots.iter().any(|slot| slot.prefix == prefix)
+    }
+
+    /// Remove an account that is on disk but does not run: one left out
+    /// at the start (the second list of [`restore_all`]: its store could
+    /// not be opened, its session file is damaged), which is not in the
+    /// list [`Accounts::sign_out`] goes by. It is signed out on the server
+    /// where its session still opens, and deleted here; its name is then
+    /// free for a new sign-in. An error says why not (another mothrix
+    /// runs with it), for the user to read.
+    pub fn remove_left_out(
+        &self,
+        profile: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+        let running = self.is_running(profile);
+        let profile = profile.to_owned();
+        async move {
+            if running {
+                anyhow::bail!("'{profile}' is running here: sign it out instead");
+            }
+            if profile.is_empty() || clean_profile(&profile) != profile {
+                anyhow::bail!("'{profile}' is no account's name");
+            }
+            matrix::logout(&matrix::Paths::for_profile(&profile)?).await
+        }
+    }
+
+    /// An account signed in during this run starts with nothing here: the
+    /// sections and fold state the UI still holds under its profile's name
+    /// (from the config file, of an account signed out with
+    /// `mothrix logout` or deleted by hand) are another account's rooms,
+    /// and would go up to the new one as its share. Before anything of
+    /// the new account is heard or sent.
+    fn welcome(&mut self, app: &mut impl Frontend) {
+        if !self.slots.iter().any(|slot| slot.fresh) {
+            return;
+        }
+        let prefixes = self.prefixes();
+        for (account, slot) in self.slots.iter_mut().enumerate() {
+            if std::mem::take(&mut slot.fresh) {
+                Self::forget_sections(app, &prefixes, account);
+            }
+        }
+    }
+
+    /// Take the rooms of the account at `account` out of the UI's
+    /// sections, and what was folded for it.
+    fn forget_sections(app: &mut impl Frontend, prefixes: &[String], account: usize) {
+        let state = app.state_mut();
+        let mut changed = state.sections.forget_account(prefixes, account);
+        if let Some(profile) = state
+            .accounts
+            .get(account)
+            .map(|known| known.profile.clone())
+        {
+            changed |= state.folded.forget_profile(&profile);
+        }
+        state.config_dirty |= changed;
+    }
+
     /// Sign an account out: off the server and off the disk (in a task of
     /// its own), out of the UI at once. Returns its profile.
+    ///
+    /// Its rooms leave the sections and its fold state goes: the profile's
+    /// name is free again, and another account signed in under it would
+    /// else take them for its own. (What the account stores of its
+    /// sections stays with it, for its other devices and the next
+    /// sign-in.)
     pub fn sign_out(&mut self, app: &mut impl Frontend, account: usize) -> Option<String> {
+        if account < self.slots.len() {
+            Self::forget_sections(app, &self.prefixes(), account);
+        }
         let (profile, client) = self.remove(app, account)?;
         if let Some(client) = client
             && let Ok(paths) = matrix::Paths::for_profile(&profile)
@@ -406,9 +544,13 @@ impl Accounts {
         tokio::spawn(async move {
             while let Some(update) = backend.updates.recv().await {
                 if tx.send((id, update)).is_err() {
-                    break;
+                    return;
                 }
             }
+            // The backend ended (it could not go on, or was signed out):
+            // a verification with it ended too. Nothing else would say
+            // so, and the one dialog would stay this account's.
+            let _ = tx.send((id, Update::Verify(None)));
         });
         self.slots.push(Slot {
             id,
@@ -418,6 +560,7 @@ impl Accounts {
             rooms: Vec::new(),
             found: Vec::new(),
             sections: Default::default(),
+            fresh: false,
         });
         Account {
             label: profile.clone(),
@@ -489,18 +632,18 @@ impl Accounts {
         }
     }
 
-    /// What goes in front of the room ids of each account.
     /// The running client of the account a room (by its key) belongs to,
     /// and the room's id there: for what is done to a room outside the
     /// conversation followed (answering from a notification). A second
     /// client on the same store beside the running one must never be
     /// made: both would encrypt with keys the other has moved on from.
     pub fn client_of(&self, key: &str) -> Option<(Client, String)> {
-        let (account, room_id) = split(&self.prefixes(), key);
+        let (account, room_id) = split(&self.prefixes(), key)?;
         let client = self.slots.get(account)?.client.clone()?;
         Some((client, room_id.to_owned()))
     }
 
+    /// What goes in front of the room ids of each account.
     fn prefixes(&self) -> Vec<String> {
         self.slots.iter().map(|slot| slot.prefix.clone()).collect()
     }
@@ -515,19 +658,20 @@ impl Accounts {
         // says nothing about the commands this leads to (a link to
         // preview, a receipt).
         app.state_mut().named_account = None;
+        self.welcome(app);
         // Inside the UI a room is known by its key.
         let prefix = &self.slots[account].prefix;
         for room_id in update.room_ids_mut() {
             *room_id = format!("{prefix}{room_id}");
         }
         match update {
-            Update::Sections(stored) => {
+            Update::Sections(said) => {
                 let prefixes = self.prefixes();
-                if self.slots[account].sections.heard(
+                if self.slots[account].sections.said(
                     &mut app.state_mut().sections,
                     &prefixes,
                     account,
-                    stored,
+                    said,
                 ) {
                     app.state_mut().config_dirty = true;
                 }
@@ -566,7 +710,10 @@ impl Accounts {
                 content,
                 encrypted_file,
             } => {
-                let (target, room_id) = split(&self.prefixes(), &to);
+                let Some((target, room_id)) = split(&self.prefixes(), &to) else {
+                    app.on_update(Update::Notice(NO_ACCOUNT.to_owned()));
+                    return;
+                };
                 let clients = (
                     self.slots[account].client.clone(),
                     self.slots.get(target).and_then(|slot| slot.client.clone()),
@@ -612,7 +759,15 @@ impl Accounts {
                 // One at a time: there is one dialog, and a request for
                 // another account would take it, and the keys meant for
                 // the first, away. That request is turned down.
-                Some(_) if self.verifying && self.verify != account => {
+                Some(state) if self.verifying && self.verify != account => {
+                    // Its end is the answer to our turning it down: said
+                    // once already.
+                    if matches!(
+                        state,
+                        crate::model::VerifyState::Done | crate::model::VerifyState::Failed(_)
+                    ) {
+                        return;
+                    }
                     let _ = self.slots[account]
                         .commands
                         .send(Command::Verify(crate::verify::VerifyInput::Cancel));
@@ -650,6 +805,7 @@ impl Accounts {
     /// user, here): it keeps them for its other devices. Cheap when nothing
     /// changed; the UIs call it after every round of their loop.
     pub fn sync_sections(&mut self, app: &mut impl Frontend) {
+        self.welcome(app);
         let prefixes = self.prefixes();
         let sections = &app.state_mut().sections;
         for (account, slot) in self.slots.iter_mut().enumerate() {
@@ -682,12 +838,25 @@ impl Accounts {
             }
             return;
         }
-        // About a room: goes to the account the room's key names.
-        let owner = command.room_id_mut().map(|key| {
-            let (account, room_id) = split(&self.prefixes(), key);
-            *key = room_id.to_owned();
-            account
-        });
+        // About a room: goes to the account the room's key names, and to
+        // nobody when that account is not running.
+        let prefixes = self.prefixes();
+        let owner = match command.room_id_mut() {
+            Some(key) => {
+                let Some((account, room_id)) = split(&prefixes, key) else {
+                    tracing::warn!("a command for a room of no running account was dropped");
+                    if let Some(slot) = self.slots.first() {
+                        let _ = self
+                            .merged
+                            .send((slot.id, Update::Notice(NO_ACCOUNT.to_owned())));
+                    }
+                    return;
+                };
+                *key = room_id.to_owned();
+                Some(account)
+            }
+            None => None,
+        };
         let account = match (&command, owner) {
             // Only one room is open at a time; the account that showed
             // the last one can let go of it.
@@ -758,6 +927,21 @@ mod tests {
         assert_eq!(form("@amy:work.example", "amy", "").unwrap().user, "amy");
         // The password is not in what a log would show.
         assert!(!format!("{id:?}").contains("pw"));
+    }
+
+    #[test]
+    fn a_name_made_from_the_server_passes_over_accounts_that_do_not_run() {
+        // "work" runs, so the form made "work2"; that one is on disk too,
+        // left out at this start.
+        let on_disk = |name: &str| ["default", "work", "work2"].contains(&name);
+        assert_eq!(free_profile("work2", false, on_disk), Ok("work3".into()));
+        assert_eq!(free_profile("club", false, on_disk), Ok("club".into()));
+        // A name the user typed is not changed for them.
+        assert!(free_profile("work2", true, on_disk).is_err());
+        assert_eq!(free_profile("club", true, on_disk), Ok("club".into()));
+        // The first of its kind.
+        let on_disk = |name: &str| name == "matrix";
+        assert_eq!(free_profile("matrix", false, on_disk), Ok("matrix2".into()));
     }
 
     #[test]

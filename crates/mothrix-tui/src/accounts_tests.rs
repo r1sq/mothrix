@@ -212,17 +212,133 @@ fn room_keys_carry_the_profile_except_for_the_default_one() {
         .map(|profile| prefix_for(profile))
         .collect();
     assert_eq!(prefixes, ["", "work/", "school/"]);
-    assert_eq!(split(&prefixes, "!a:x.org"), (0, "!a:x.org"));
-    assert_eq!(split(&prefixes, "work/!a:x.org"), (1, "!a:x.org"));
-    assert_eq!(split(&prefixes, "school/!b:y.org"), (2, "!b:y.org"));
+    assert_eq!(split(&prefixes, "!a:x.org"), Some((0, "!a:x.org")));
+    assert_eq!(split(&prefixes, "work/!a:x.org"), Some((1, "!a:x.org")));
+    assert_eq!(split(&prefixes, "school/!b:y.org"), Some((2, "!b:y.org")));
+    // A profile that is not running, and what is no room's key.
+    assert_eq!(split(&prefixes, "gone/!a:x.org"), None);
+    assert_eq!(split(&prefixes, ""), None);
 }
 
 #[test]
-fn a_single_named_profile_gets_everything() {
+fn a_key_of_an_account_that_is_not_running_is_nobody_else_s() {
     let prefixes = vec![prefix_for("work")];
-    assert_eq!(split(&prefixes, "work/!a:x.org"), (0, "!a:x.org"));
-    // Not ours by its key, but there is nobody else to ask.
-    assert_eq!(split(&prefixes, "!a:x.org"), (0, "!a:x.org"));
+    assert_eq!(split(&prefixes, "work/!a:x.org"), Some((0, "!a:x.org")));
+    // The default account's room (it did not start, or was signed out):
+    // not the only running account's, though that may be in the room too.
+    assert_eq!(split(&prefixes, "!a:x.org"), None);
+}
+
+#[tokio::test]
+async fn a_command_for_a_room_of_an_account_that_is_gone_goes_to_no_other() {
+    // "default" and "work" are both in !r; a notification of "default"
+    // is still there when "default" is signed out.
+    let (mut accounts, mut app, _home, mut work) = two_accounts();
+    accounts.remove(&mut app, 0);
+    assert!(accounts.client_of("!r").is_none());
+    accounts.send(
+        &app,
+        Command::Send {
+            room_id: "!r".into(),
+            thread: None,
+            text: "on my way".into(),
+            mentions: Vec::new(),
+        },
+    );
+    accounts.send(
+        &app,
+        Command::MarkRead {
+            room_id: "!r".into(),
+        },
+    );
+    assert!(work.sent().is_empty());
+    // Its own rooms still reach it.
+    accounts.send(
+        &app,
+        Command::MarkRead {
+            room_id: "work/!r".into(),
+        },
+    );
+    assert_eq!(work.sent(), [r#"MarkRead { room_id: "!r" }"#]);
+    // And the user is told.
+    pump(&mut accounts, &mut app).await;
+    assert!(
+        app.notice
+            .as_deref()
+            .is_some_and(|said| said.contains("not signed in"))
+    );
+}
+
+#[tokio::test]
+async fn a_signed_out_account_s_rooms_and_folds_do_not_wait_for_the_next_of_its_name() {
+    let (mut accounts, mut app, _home, mut work) = two_accounts();
+    let section = |name: &str, rooms: &[&str]| crate::model::Section {
+        name: name.into(),
+        rooms: rooms.iter().map(|room| (*room).into()).collect(),
+    };
+    work.updates
+        .send(Update::Sections(crate::sections::Said::Sections(vec![
+            section("Clients", &["!c"]),
+        ])))
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    app.state.sections.assign("!a", Some("Clients")).unwrap();
+    app.state.folded =
+        crate::sidebar::Folds::new(["work:Clients", "@work", "Clients"].map(str::to_owned));
+    accounts.sync_sections(&mut app);
+    work.sent();
+    app.state.config_dirty = false;
+
+    assert_eq!(accounts.sign_out(&mut app, 1).as_deref(), Some("work"));
+    assert_eq!(app.state.sections[..], [section("Clients", &["!a"])]);
+    assert_eq!(app.state.folded.keys(), ["Clients"]);
+    assert!(app.state.config_dirty);
+
+    // Another account signs in as "work". What the config file still
+    // held for that name (a sign-out by `mothrix logout`) is not its.
+    app.state.sections =
+        crate::sections::OwnSections::new(vec![section("Clients", &["!a", "work/!old"])]);
+    let (other, mut other_fake) = fake("@someone:else");
+    app.state
+        .accounts
+        .push(accounts.add_backend("work".into(), other, None));
+    accounts.newly_signed_in();
+    other_fake
+        .updates
+        .send(Update::Sections(crate::sections::Said::Nothing))
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    accounts.sync_sections(&mut app);
+    assert_eq!(app.state.sections[..], [section("Clients", &["!a"])]);
+    assert!(
+        other_fake.sent().is_empty(),
+        "nothing of the old account goes up"
+    );
+}
+
+#[tokio::test]
+async fn a_backend_that_ended_takes_its_verification_along() {
+    let (mut accounts, mut app, home, work) = two_accounts();
+    work.updates
+        .send(Update::Verify(Some(VerifyState::Waiting)))
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    assert!(app.overlays.is_open::<VerifyState>());
+    // Work's backend stops (its sync could not go on).
+    drop(work);
+    pump(&mut accounts, &mut app).await;
+    assert!(!app.overlays.is_open::<VerifyState>());
+    // The other account can verify now, instead of being turned down.
+    home.updates
+        .send(Update::Verify(Some(VerifyState::Incoming {
+            device: "Phone".into(),
+        })))
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    assert!(matches!(
+        app.overlays.get::<VerifyState>(),
+        Some(VerifyState::Incoming { .. })
+    ));
 }
 
 #[tokio::test]
@@ -260,13 +376,17 @@ async fn sections_come_from_each_account_and_changes_here_go_back_to_it() {
     assert!(home.sent().is_empty());
 
     // Home stores nothing yet: this device's sections go up to it.
-    home.updates.send(Update::Sections(None)).unwrap();
+    home.updates
+        .send(Update::Sections(crate::sections::Said::Nothing))
+        .unwrap();
     // Work stores a section of its own: it is merged in, under keys.
     work.updates
-        .send(Update::Sections(Some(vec![crate::model::Section {
-            name: "Clients".into(),
-            rooms: vec!["!c".into()],
-        }])))
+        .send(Update::Sections(crate::sections::Said::Sections(vec![
+            crate::model::Section {
+                name: "Clients".into(),
+                rooms: vec!["!c".into()],
+            },
+        ])))
         .unwrap();
     pump(&mut accounts, &mut app).await;
     assert_eq!(app.state.sections.len(), 2);
@@ -388,7 +508,9 @@ async fn swapped_accounts_take_their_rooms_commands_and_sections_along() {
     assert!(work.sent().is_empty());
 
     // Home's share of the sections still goes to home.
-    home.updates.send(Update::Sections(None)).unwrap();
+    home.updates
+        .send(Update::Sections(crate::sections::Said::Nothing))
+        .unwrap();
     pump(&mut accounts, &mut app).await;
     app.state.sections.assign("!a", Some("Mine")).unwrap();
     accounts.sync_sections(&mut app);
@@ -416,6 +538,17 @@ async fn one_verification_at_a_time_and_the_other_account_s_is_turned_down() {
     ));
     assert!(work.sent().iter().any(|sent| sent.contains("Cancel")));
     assert!(home.sent().is_empty());
+    // Work's end of it (the answer to being turned down) is not said
+    // again, and asks for no second cancel.
+    app.notice = None;
+    work.updates
+        .send(Update::Verify(Some(VerifyState::Failed(
+            "Cancelled".into(),
+        ))))
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    assert_eq!(app.notice, None);
+    assert!(work.sent().is_empty());
     // Once the first is done, the other account can verify.
     home.updates
         .send(Update::Verify(Some(VerifyState::Done)))

@@ -64,8 +64,14 @@ pub fn private_dir(dir: &Path) -> std::io::Result<()> {
 /// Write a file only the user can read, whole or not at all: under
 /// another name first (private from the start), then moved over `path`.
 /// A full disk or a kill half way leaves the old file as it was.
+///
+/// Where `path` is a link (a `config.toml` kept with one's dotfiles), the
+/// file it leads to is written, beside itself: moving the new file over
+/// the link would leave a plain file in its place and the linked one as
+/// it was.
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    let path = &linked_to(path);
     let mut name = path.as_os_str().to_owned();
     name.push(format!(".{}.tmp", std::process::id()));
     let temporary = PathBuf::from(name);
@@ -87,6 +93,24 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     written
+}
+
+/// The file `path` leads to, through links (also one whose file is not
+/// there yet); `path` itself where it is none.
+fn linked_to(path: &Path) -> PathBuf {
+    let mut at = path.to_owned();
+    // Not for ever, should links lead in a circle.
+    for _ in 0..16 {
+        let Ok(target) = std::fs::read_link(&at) else {
+            break;
+        };
+        // A relative link counts from the folder it is in.
+        at = match at.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+    }
+    at
 }
 
 /// Remove the files in `dir` last changed more than `age` ago (opened
@@ -132,6 +156,41 @@ mod tests {
         assert!(file.exists(), "new files stay");
         sweep(&dir, std::time::Duration::ZERO);
         assert!(!file.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_file_is_written_through_its_link() {
+        let dir = std::env::temp_dir().join(format!("mothrix-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (dotfiles, config) = (dir.join("dotfiles"), dir.join("config"));
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        // The config is kept elsewhere, and linked to: once by its whole
+        // path, once from the folder next door.
+        let real = dotfiles.join("mothrix.toml");
+        std::fs::write(&real, "old").unwrap();
+        let link = config.join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let relative = config.join("relative.toml");
+        std::os::unix::fs::symlink("../dotfiles/mothrix.toml", &relative).unwrap();
+        for (path, text) in [(&link, "new"), (&relative, "newer")] {
+            write_private(path, text.as_bytes()).unwrap();
+            assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read_to_string(&real).unwrap(), text);
+        }
+        // Nothing is left beside either of them.
+        assert_eq!(std::fs::read_dir(&dotfiles).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&config).unwrap().count(), 2);
+        // A link to a file that is not there yet makes that file.
+        let fresh = config.join("fresh.toml");
+        std::os::unix::fs::symlink(dotfiles.join("fresh.toml"), &fresh).unwrap();
+        write_private(&fresh, b"first").unwrap();
+        assert_eq!(
+            std::fs::read(dotfiles.join("fresh.toml")).unwrap(),
+            b"first"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

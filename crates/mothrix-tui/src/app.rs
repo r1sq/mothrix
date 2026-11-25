@@ -1853,6 +1853,7 @@ impl App {
         match std::mem::replace(&mut self.compose, Compose::Message) {
             Compose::Message => commands.push(Command::Send {
                 room_id,
+                thread: self.state.open_thread.clone(),
                 text,
                 mentions,
             }),
@@ -2112,12 +2113,10 @@ pub fn dropped_file(text: &str) -> Option<String> {
     (path.starts_with('/') && std::path::Path::new(&path).is_file()).then_some(path)
 }
 
-/// Whether what is in the message box is a command, not a message being
-/// written. As `submit` reads it: spaces in front do not make
-/// " /recover KEY" a message, so it is not told to the room as typing
-/// and not sent to a grammar server either.
+/// Whether what is in the message box is a command, as `submit` reads
+/// it ([`crate::message::is_command`]).
 pub(crate) fn is_command(text: &str) -> bool {
-    text.trim_start().starts_with('/')
+    crate::message::is_command(text)
 }
 
 fn percent_decode(text: &str) -> String {

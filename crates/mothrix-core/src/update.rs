@@ -264,8 +264,9 @@ pub struct Installed {
 
 impl Installed {
     /// Where the new program now is: the path the old one had. The
-    /// running process cannot ask for it any more: on Linux its own path
-    /// (`current_exe`) follows the old program to where it was moved.
+    /// running process cannot ask for it any more: the new program was
+    /// moved over the name it was started under, and on Linux its own
+    /// path (`current_exe`) then reads "… (deleted)".
     pub fn program(&self) -> &Path {
         &self.exe
     }
@@ -294,23 +295,49 @@ pub fn install(exe: &Path, data: &[u8]) -> Result<Installed> {
 /// say) would take the old one's place and then not start: there would be
 /// no mothrix left to put it right with.
 pub fn install_tried(exe: &Path, data: &[u8], version: &str) -> Result<Installed> {
-    install_if(exe, data, |new| {
-        let said = std::process::Command::new(new)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_default();
-        if said
-            .trim()
-            .strip_prefix("mothrix ")
-            .is_some_and(|rest| rest.starts_with(version))
-        {
-            Ok(())
-        } else {
-            bail!("the new mothrix does not start on this system; the old one stays")
+    install_if(exe, data, |new| says_version(new, version, TRIAL))
+}
+
+/// How long the new program gets to say its version.
+const TRIAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Start `new` with `--version` and see that it says it is mothrix
+/// `version`, within `limit`: a program that hangs instead (waiting for
+/// a library, a terminal, anything) must not keep the running mothrix
+/// waiting for ever, and is not one to put in the old one's place.
+fn says_version(new: &Path, version: &str, limit: std::time::Duration) -> Result<()> {
+    use std::process::Stdio;
+    let refused = || anyhow!("the new mothrix does not start on this system; the old one stays");
+    let mut child = std::process::Command::new(new)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| refused())?;
+    // (One line fits the pipe: nothing has to be read while it runs.)
+    let started = std::time::Instant::now();
+    while matches!(child.try_wait(), Ok(None)) {
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(refused());
         }
-    })
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let said = child
+        .wait_with_output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    if said
+        .trim()
+        .strip_prefix("mothrix ")
+        .is_some_and(|rest| rest.starts_with(version))
+    {
+        Ok(())
+    } else {
+        Err(refused())
+    }
 }
 
 fn install_if(
@@ -318,7 +345,9 @@ fn install_if(
     data: &[u8],
     good: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<Installed> {
-    let new = with_suffix(exe, "new");
+    // Under a name of this process's own: `/update` here and
+    // `mothrix update` in another terminal would else write one file.
+    let new = with_suffix(exe, &format!("{NEW}.{}", std::process::id()));
     let old = with_suffix(exe, "old");
     if let Err(error) = write_program(&new, data) {
         let _ = std::fs::remove_file(&new);
@@ -361,11 +390,53 @@ fn install_if(
     })
 }
 
-/// Remove what an earlier update left. Failing is harmless: the next start
-/// tries again.
+/// What a new program is called while it is written and tried, with the
+/// installing process's id after it (`mothrix.new.1234`).
+const NEW: &str = "new";
+
+/// A new program still there after this long was left by an install that
+/// did not end (a crash, a kill): one under way takes seconds from
+/// writing the file to moving it into place.
+const LEFT_OVER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Remove what an earlier update left: the old program, and new ones
+/// that never got into place. Not a new one written lately: another
+/// mothrix may be installing right now, and would find its file gone.
+/// (Going by the file's age needs nothing of the system; which process
+/// wrote it, and whether that one still lives, would.) Failing is
+/// harmless: the next start tries again.
 pub fn cleanup(exe: &Path) {
+    cleanup_older(exe, LEFT_OVER);
+}
+
+fn cleanup_older(exe: &Path, left_over: std::time::Duration) {
     let _ = std::fs::remove_file(with_suffix(exe, "old"));
-    let _ = std::fs::remove_file(with_suffix(exe, "new"));
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+        return;
+    };
+    let new = format!("{}.{NEW}", name.to_string_lossy());
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let ours = entry
+            .file_name()
+            .to_string_lossy()
+            .strip_prefix(&new)
+            // `mothrix.new` (as it was called before) or `mothrix.new.<pid>`.
+            .is_some_and(|rest| {
+                rest.is_empty()
+                    || rest
+                        .strip_prefix('.')
+                        .is_some_and(|pid| pid.parse::<u32>().is_ok())
+            });
+        let old = entry
+            .metadata()
+            .and_then(|data| data.modified())
+            .ok()
+            .and_then(|changed| changed.elapsed().ok())
+            .is_some_and(|since| since >= left_over);
+        if ours && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -584,6 +655,57 @@ mod tests {
         cleanup(&exe);
         assert!(!with_suffix(&exe, "old").exists());
         assert_eq!(std::fs::read(&exe).unwrap(), b"newer");
+        // Nothing of the installs is left beside it.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_start_leaves_another_mothrix_s_install_alone_and_removes_what_a_crash_left() {
+        let dir = std::env::temp_dir().join(format!("mothrix-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("mothrix");
+        std::fs::write(&exe, b"this one").unwrap();
+        // Another mothrix is installing: its new program is written, and
+        // not in place yet.
+        let theirs = dir.join("mothrix.new.4242");
+        std::fs::write(&theirs, b"being installed").unwrap();
+        // Files of the user's, whatever they are called.
+        let users = [dir.join("mothrix.newsletter"), dir.join("mothrix.new.txt")];
+        for file in &users {
+            std::fs::write(file, b"mine").unwrap();
+        }
+        cleanup(&exe);
+        assert!(theirs.exists(), "an install under way keeps its file");
+        // Once it is old, a crash left it there (also under the name
+        // earlier versions wrote).
+        let before = dir.join("mothrix.new");
+        std::fs::write(&before, b"left over").unwrap();
+        cleanup_older(&exe, std::time::Duration::ZERO);
+        assert!(!theirs.exists() && !before.exists());
+        assert!(users.iter().all(|file| file.exists()));
+        assert_eq!(std::fs::read(&exe).unwrap(), b"this one");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_program_that_hangs_is_not_waited_for() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mothrix-trial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("mothrix.new");
+        // It would say the right thing, after a minute.
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+        let limit = std::time::Duration::from_millis(300);
+        assert!(says_version(&program, "9.0.0", limit).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        std::fs::write(&program, "#!/bin/sh\necho mothrix 9.0.0\n").unwrap();
+        says_version(&program, "9.0.0", std::time::Duration::from_secs(10)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -108,7 +108,15 @@ account the open room belongs to, and the status bar shows who that is.
 
 An account is used by one mothrix at a time: a second one started with
 the same account says so and leaves it out, since both would write the
-same encryption keys.
+same encryption keys. An account that cannot start (its session file is
+damaged, the keyring does not give out its passphrase) is left out the
+same way and named in the status bar; nothing of it is deleted, and
+`mothrix logout --profile NAME` removes it when it is not coming back.
+
+Signing an account out takes its rooms out of your sections on this
+computer (the account keeps its sections for its other devices and for
+signing in again), so that another account signed in under the same name
+does not start with them.
 
 ## Spell checking
 

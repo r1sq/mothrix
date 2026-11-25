@@ -435,7 +435,22 @@ async fn main() -> Result<()> {
     std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 
+/// Where this program is, as asked at the start.
+static PROGRAM: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Where this program is, for putting a new release in its place. Asked
+/// once, at the start: after another mothrix installed an update, this
+/// one still runs from the file that was replaced, and on Linux its path
+/// then reads "… (deleted)", where nothing can be written.
+fn program() -> Result<std::path::PathBuf> {
+    PROGRAM
+        .get_or_init(|| std::env::current_exe().ok())
+        .clone()
+        .context("mothrix could not find out where its program is")
+}
+
 async fn run() -> Result<()> {
+    let _ = program();
     let Some(args) = parse_args()? else {
         return Ok(());
     };
@@ -445,6 +460,7 @@ async fn run() -> Result<()> {
     match args.mode {
         Mode::Logout => {
             matrix::logout(&paths).await?;
+            forget_in_config(&paths, &primary);
             println!("Signed out; local data for profile '{primary}' removed.");
             Ok(())
         }
@@ -473,6 +489,7 @@ async fn run() -> Result<()> {
                 );
             }
             let client = matrix::login(&paths, options).await?;
+            forget_in_config(&paths, &primary);
             println!(
                 "Signed in as {}. Start mothrix to chat.",
                 plain(app::short_id(&user_of(&client), 48))
@@ -494,7 +511,7 @@ async fn run() -> Result<()> {
             pushers_command(&client, action).await
         }
         Mode::Run => {
-            let mut clients = restore_accounts(&args.profile).await?;
+            let (mut clients, left_out) = restore_accounts(&args.profile).await?;
             if clients.is_empty() {
                 println!("Not signed in yet.");
                 let client = matrix::login(
@@ -506,6 +523,7 @@ async fn run() -> Result<()> {
                     },
                 )
                 .await?;
+                forget_in_config(&paths, &primary);
                 clients.push((primary, client));
             }
             init_logging(&paths);
@@ -513,11 +531,11 @@ async fn run() -> Result<()> {
             // Only a build that installs updates has left such files;
             // any other would delete a file of the user's by that name.
             if build() == update::Build::Release
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = program()
             {
                 update::cleanup(&exe);
             }
-            run_tui(clients, &paths).await
+            run_tui(clients, &paths, left_out).await
         }
         Mode::Snapshot {
             seconds,
@@ -526,7 +544,7 @@ async fn run() -> Result<()> {
             width,
             height,
         } => {
-            let clients = restore_accounts(&args.profile).await?;
+            let (clients, _) = restore_accounts(&args.profile).await?;
             if clients.is_empty() {
                 bail!("not signed in; run `mothrix login` first");
             }
@@ -536,10 +554,26 @@ async fn run() -> Result<()> {
     }
 }
 
+/// A profile was signed out, or a new account signed in under its name:
+/// the sections and fold state the config file keeps for that name were
+/// another account's, and the next account of the name would take those
+/// rooms for its own (and store them). A mothrix running meanwhile writes
+/// the file as it knows it; a config with a mistake is left alone.
+fn forget_in_config(paths: &Paths, profile: &str) {
+    if let Ok(mut config) = Config::read(&paths.config_file)
+        && config.forget_profile(profile)
+    {
+        let _ = config.save(&paths.config_file);
+    }
+}
+
 /// The accounts to run with: the named profile, or all that are signed in.
 /// One that cannot be restored is reported and left out, as long as
-/// another works.
-async fn restore_accounts(named: &Option<String>) -> Result<Vec<(String, Client)>> {
+/// another works; the second value is a line about it for the status
+/// bar (what is printed here is gone once the screen is taken).
+async fn restore_accounts(
+    named: &Option<String>,
+) -> Result<(Vec<(String, Client)>, Option<String>)> {
     let profiles = match named {
         Some(profile) => vec![profile.clone()],
         None => {
@@ -553,16 +587,21 @@ async fn restore_accounts(named: &Option<String>) -> Result<Vec<(String, Client)
     };
     let (clients, problems) = accounts::restore_all(profiles).await;
     let mut failure = None;
+    let mut said = None;
     for (profile, error) in problems {
         eprintln!(
             "mothrix: account '{profile}' left out: {}",
             plain(format!("{error:#}"))
         );
+        said = Some(format!(
+            "Account '{profile}' was left out: {error:#}. `mothrix logout --profile {profile}` \
+             removes it."
+        ));
         failure = Some(error.context(format!("account '{profile}'")));
     }
     match failure {
         Some(error) if clients.is_empty() => Err(error),
-        _ => Ok(clients),
+        _ => Ok((clients, said)),
     }
 }
 
@@ -906,7 +945,6 @@ fn finish_sign_in(app: &mut App, backend: &mut accounts::Accounts, event: SignIn
     }
 }
 
-/// Put the terminal back, also when mothrix panics.
 /// What came of looking for a release, or of installing one.
 enum ReleaseNews {
     Checked {
@@ -937,7 +975,9 @@ async fn install_release(
     available: &update::Available,
 ) -> Result<update::Installed> {
     let data = update::download(fetch, available).await?;
-    update::install_tried(&std::env::current_exe()?, &data, &available.version)
+    let (exe, version) = (program()?, available.version.clone());
+    // Off the async threads: the new program is started once to try it.
+    tokio::task::spawn_blocking(move || update::install_tried(&exe, &data, &version)).await?
 }
 
 /// `mothrix update`: install a newer release, if this build may.
@@ -972,7 +1012,7 @@ async fn update_command(paths: &Paths) -> Result<()> {
     }
     println!("Downloading mothrix {}…", available.version);
     let data = update::download(&fetch, &available).await?;
-    update::install_tried(&std::env::current_exe()?, &data, &available.version)?;
+    update::install_tried(&program()?, &data, &available.version)?;
     println!(
         "mothrix {} is installed; start it again.",
         available.version
@@ -1063,6 +1103,7 @@ impl EndSignals {
     }
 }
 
+/// Put the terminal back, also when mothrix panics.
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -1074,9 +1115,17 @@ fn restore_terminal() {
     );
 }
 
-async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
+async fn run_tui(
+    clients: Vec<(String, Client)>,
+    paths: &Paths,
+    left_out: Option<String>,
+) -> Result<()> {
     let (mut backend, accounts) = accounts::spawn(clients);
     let mut app = new_app(paths, accounts);
+    // (What is wrong with the config comes first.)
+    if app.notice.is_none() {
+        app.notice = left_out;
+    }
     load_state(&mut app);
 
     // Dictionaries can take a moment to load (German is large); do it in
@@ -1090,9 +1139,14 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
     let grammar_variants = languagetool::preferred_variants(&languages);
     let mut grammar_due: Option<(String, tokio::time::Instant)> = None;
     tokio::task::spawn_blocking(move || {
-        if let Ok(dictionaries) = spell::load(&languages, &spell::dictionary_dirs()) {
-            let _ = speller_tx.send(dictionaries);
-        }
+        // None installed is nothing to say at every start; one that is
+        // there and cannot be used is.
+        let loaded = spell::load(&languages, &spell::dictionary_dirs());
+        let _ = speller_tx.send(match loaded {
+            Ok(dictionaries) => Ok(dictionaries),
+            Err(error) if error.is::<spell::NoneInstalled>() => return,
+            Err(error) => Err(format!("{error:#}")),
+        });
     });
 
     // Signing in from the accounts dialog: progress lines, then the result.
@@ -1278,9 +1332,17 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
                     }
                     Vec::new()
                 }
-                Some(dictionaries) = speller_rx.recv() => {
-                    let languages = dictionaries.languages();
-                    app.set_speller(std::sync::Arc::new(dictionaries), languages);
+                Some(loaded) = speller_rx.recv() => {
+                    match loaded {
+                        Ok(dictionaries) => {
+                            if let Some(problem) = dictionaries.problems().first() {
+                                app.notice = Some(format!("Spell check: {problem}"));
+                            }
+                            let languages = dictionaries.languages();
+                            app.set_speller(std::sync::Arc::new(dictionaries), languages);
+                        }
+                        Err(problem) => app.notice = Some(format!("Spell check: {problem}")),
+                    }
                     Vec::new()
                 }
                 update = backend.updates.recv() => {
@@ -1496,6 +1558,7 @@ async fn snapshot(
                         &app,
                         Command::Send {
                             room_id,
+                            thread: None,
                             text,
                             mentions: Vec::new(),
                         },

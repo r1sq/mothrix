@@ -227,6 +227,25 @@ impl Config {
             .filter(|_| accounts.len() > 1)
     }
 
+    /// Take out what is kept for the account of `profile`: its rooms in
+    /// the sections, and what was folded for it. For when the profile is
+    /// signed out or another account signs in under its name, outside a
+    /// running front end. Returns whether there was anything.
+    pub fn forget_profile(&mut self, profile: &str) -> bool {
+        let mut sections = crate::sections::OwnSections::new(self.sections.clone());
+        let prefixes = [crate::accounts::prefix_for(profile)];
+        let mut changed = sections.forget_account(&prefixes, 0);
+        if changed {
+            self.sections = sections.to_vec();
+        }
+        let mut folded = Folds::new(self.folded.iter().cloned());
+        if folded.forget_profile(profile) {
+            self.folded = folded.keys();
+            changed = true;
+        }
+        changed
+    }
+
     /// This config with what is shown now. What only the file holds, or
     /// only the other front end uses, stays: the theme, key bindings, own
     /// themes, dictionaries, and what is known of accounts that are not
@@ -535,6 +554,29 @@ mod tests {
         // No client for the homeserver, rather than one that goes direct.
         let config: Config = toml::from_str(r#"proxy = "http://user:secret@""#).unwrap();
         assert!(config.matrix_http_client().is_err());
+    }
+
+    #[test]
+    fn a_profile_s_sections_and_folds_leave_the_file_with_it() {
+        let section = |name: &str, rooms: &[&str]| Section {
+            name: name.into(),
+            rooms: rooms.iter().map(|room| (*room).into()).collect(),
+        };
+        let mut config = Config {
+            sections: vec![
+                section("Team", &["!a", "work/!b"]),
+                section("Clients", &["work/!c"]),
+            ],
+            folded: vec!["@work".into(), "work:Team".into(), "Team".into()],
+            ..Config::default()
+        };
+        assert!(config.forget_profile("work"));
+        assert_eq!(config.sections, [section("Team", &["!a"])]);
+        assert_eq!(config.folded, ["Team"]);
+        assert!(!config.forget_profile("work"));
+        // The default profile's rooms are the ones without a prefix.
+        assert!(config.forget_profile("default"));
+        assert!(config.sections.is_empty());
     }
 
     #[test]

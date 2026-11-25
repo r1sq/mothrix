@@ -97,6 +97,18 @@ impl Folds {
             self.0.remove(&key);
         }
     }
+
+    /// An account is gone (signed out), or its profile's name goes to
+    /// another one: what was folded for it is not folded for the next
+    /// account of that name. Returns whether anything was.
+    pub fn forget_profile(&mut self, profile: &str) -> bool {
+        let before = self.0.len();
+        let sections = Self::section_key(Some(profile), "");
+        let account = Self::account_key(profile);
+        self.0
+            .retain(|key| *key != account && !key.starts_with(&sections));
+        self.0.len() != before
+    }
 }
 
 /// One line of the room list.

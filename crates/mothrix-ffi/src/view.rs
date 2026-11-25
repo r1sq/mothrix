@@ -730,6 +730,7 @@ impl View {
                         return vec![
                             Command::Send {
                                 room_id: room.clone(),
+                                thread: self.state.open_thread.clone(),
                                 text: text.to_owned(),
                                 mentions: message::mentions_kept(text, mentions),
                             },
