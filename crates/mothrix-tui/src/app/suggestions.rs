@@ -150,6 +150,16 @@ impl App {
             {
                 return false;
             }
+            // "/file report.pdf" with report.pdf.sig beside it: the row
+            // is the file as typed, nothing is left to complete, and
+            // Enter sends it.
+            KeyCode::Enter
+                if matches!(&suggestions, Suggestions::Paths(paths)
+                    if paths.get(index).map(|(_, completed)| completed.as_str())
+                        == self.path_query()) =>
+            {
+                return false;
+            }
             KeyCode::Tab | KeyCode::Enter => {
                 self.accept(suggestions, index);
             }
@@ -380,9 +390,15 @@ impl App {
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let hidden = name.starts_with('.') && !prefix.starts_with('.');
+                if hidden || !name.to_lowercase().starts_with(&wanted) {
+                    return None;
+                }
+                // Asked only of the names that fit: in a folder of
+                // thousands (on a network drive) each one is a question
+                // to the disk.
                 let is_folder =
                     entry.file_type().is_ok_and(|kind| kind.is_dir()) || entry.path().is_dir();
-                (!hidden && name.to_lowercase().starts_with(&wanted)).then_some((is_folder, name))
+                Some((is_folder, name))
             })
             .collect();
         // A file called just what is typed comes first: Enter then sends
@@ -417,6 +433,36 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn enter_sends_a_file_named_in_full_though_other_names_go_on_from_it() {
+        let dir = std::env::temp_dir().join(format!("mothrix-file-enter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["report.pdf", "report.pdf.sig"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let mut app = App::new(theme::THEMES[0], "@me:x".into());
+        app.on_update(Update::Rooms(vec![crate::model::RoomEntry {
+            id: "!a".into(),
+            name: "Lunch".into(),
+            ..Default::default()
+        }]));
+        app.on_event(key(KeyCode::Enter));
+        let path = format!("{}/report.pdf", dir.display());
+        app.composer.set(&format!("/file {path}"));
+        assert_eq!(app.popup().rows.len(), 2, "both names are offered");
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::SendFile { path: sent, .. }] if *sent == path),
+            "{commands:?}"
+        );
+        // The other name, chosen with the arrow key, is completed first.
+        app.composer.set(&format!("/file {path}"));
+        app.on_event(key(KeyCode::Down));
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.composer.text(), format!("/file {path}.sig"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -161,6 +161,15 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   `app/overlay.rs`); the top one gets every key, paste and click. A new
   dialog is a new variant: the compiler then asks for its keys, paste and
   drawing. Reach its state with `app.overlays.get_mut::<T>()`.
+- **A dialog nobody sees answers nothing.** Where a terminal is too
+  small for the dialog on top, or for all it asks about (the seven
+  emoji), drawing says so (`ui::unseen`, which `ui::dialog` calls) and
+  sets `app.overlay_unseen`; `overlay_key` then hands it only Esc. A
+  dialog drawn without `dialog()` has to call `unseen` itself.
+- **Invitations** are joined by opening them, so `ClientState::open`
+  asks first (`Opening::Invitation`) and joins on the next open soon
+  after; both front ends get the rule by calling it. A room a command
+  asked for (`Update::GoTo`) opens without asking.
 - **A new key** goes into the help too (`app/help.rs`): rebindable
   shortcuts (`keys::ACTIONS`) and slash commands (`COMMANDS`) appear by
   themselves, with a test that each has its text; the room list,
@@ -304,7 +313,8 @@ target/debug/mothrix --snapshot 16 --room lunch \
 In a key script, words are typed and names in angle brackets are keys:
 `<enter> <tab> <esc> <up> <down> <space> <f1> <f2> <f3> <f4> <f5> <f6> <c-f>`; `<wait>` pauses
 two seconds. Keys start two seconds after the room opened, one every 150
-ms. `--room` matches a room's name or key. Leave enough `<wait>`s and
+ms. `--room` matches a room's name or key; `--say` is refused without
+it (the first room of the list would get the message). Leave enough `<wait>`s and
 seconds for the server to answer: a result that is "not there" is often
 just not there yet. The status line (last line) shows errors.
 

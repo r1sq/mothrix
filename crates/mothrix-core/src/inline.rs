@@ -119,10 +119,17 @@ fn address_at(chars: &[char], at: usize) -> Option<usize> {
     while end < chars.len() && !chars[end].is_whitespace() && !matches!(chars[end], '<' | '>' | '"')
     {
         end += 1;
+        // No address is that long; and one that is no link is read once
+        // from each "http://" in it, which must not be to its far end.
+        if end - at > MAX_ADDRESS {
+            return None;
+        }
     }
+    // Looked for once: what is taken off the end below is never a "(".
+    let opened = chars[at..end].contains(&'(');
     while end > at {
         let last = chars[end - 1];
-        let unbalanced = last == ')' && !chars[at..end - 1].contains(&'(');
+        let unbalanced = last == ')' && !opened;
         if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '_') || unbalanced {
             end -= 1;
         } else {
@@ -234,6 +241,20 @@ fn starts_with(chars: &[char], at: usize, marker: &[char]) -> bool {
     chars.len() >= at + marker.len() && chars[at..at + marker.len()] == *marker
 }
 
+/// Where one kind of marker was looked for in vain: no place in
+/// `from..to` closes a span of it, and at `to` there is a blank line
+/// (`blank`) or just the end of what was read. Where a span can close
+/// depends on the place alone, not on where it opened, so the next
+/// opening marker need not read that stretch again: a message of nothing
+/// but opening marks ("*a *a *a …") would else be read `MAX_SPAN` far
+/// from each of them.
+#[derive(Clone, Copy, Default)]
+struct Searched {
+    from: usize,
+    to: usize,
+    blank: bool,
+}
+
 /// A span opened by `marker` at `at`: the range of its inside and where
 /// the text goes on after it. `whole_words` is for `_`, which only counts
 /// around words (so that snake_case is left alone).
@@ -242,6 +263,7 @@ fn span(
     at: usize,
     marker: &[char],
     whole_words: bool,
+    searched: &mut Searched,
 ) -> Option<(usize, usize, usize)> {
     let inside = at + marker.len();
     if !starts_with(chars, at, marker) || chars.get(inside).is_none_or(|c| c.is_whitespace()) {
@@ -251,11 +273,25 @@ fn span(
         return None;
     }
     let mut close = inside + 1;
+    let from = if (searched.from..searched.to).contains(&close) {
+        // Read before, and nothing closes there.
+        if searched.blank {
+            return None;
+        }
+        close = searched.to;
+        searched.from
+    } else {
+        close
+    };
+    let mut gave_up = |to: usize, blank: bool| {
+        *searched = Searched { from, to, blank };
+        None
+    };
     // Nor further than a marked stretch ever is (see `MAX_LINK_TEXT`).
     while close + marker.len() <= chars.len() && close < inside + MAX_SPAN {
         // A span does not run across a blank line.
         if chars[close] == '\n' && chars.get(close + 1) == Some(&'\n') {
-            return None;
+            return gave_up(close, true);
         }
         let after = close + marker.len();
         if starts_with(chars, close, marker)
@@ -268,7 +304,7 @@ fn span(
         }
         close += 1;
     }
-    None
+    gave_up(close, false)
 }
 
 fn walk(chars: &[char], flags: u8, out: &mut Vec<Styled>, links: &mut Vec<String>) {
@@ -279,6 +315,7 @@ fn walk(chars: &[char], flags: u8, out: &mut Vec<Styled>, links: &mut Vec<String
         (&['*'], ITALIC, false),
         (&['_'], ITALIC, true),
     ];
+    let mut searched = [Searched::default(); SPANS.len()];
     let mut i = 0;
     'text: while i < chars.len() {
         let c = chars[i];
@@ -337,12 +374,12 @@ fn walk(chars: &[char], flags: u8, out: &mut Vec<Styled>, links: &mut Vec<String
                 continue;
             }
         }
-        for (marker, flag, whole_words) in SPANS {
+        for ((marker, flag, whole_words), searched) in SPANS.into_iter().zip(&mut searched) {
             // A single marker never opens where a double one stands.
             if marker.len() == 1 && chars.get(i + 1) == Some(&marker[0]) {
                 continue;
             }
-            if let Some((inside, close, after)) = span(chars, i, marker, whole_words) {
+            if let Some((inside, close, after)) = span(chars, i, marker, whole_words, searched) {
                 walk(&chars[inside..close], flags | flag, out, links);
                 i = after;
                 continue 'text;
@@ -353,11 +390,29 @@ fn walk(chars: &[char], flags: u8, out: &mut Vec<Styled>, links: &mut Vec<String
     }
 }
 
+/// How many spaces stand for a tab on the screen (as in code blocks).
+pub const TAB: usize = 4;
+
 /// Word-wrap tagged text to `width` cells, keeping its own line breaks and
-/// the indentation at the start of a line.
+/// the indentation at the start of a line. A tab becomes spaces: the
+/// terminal library draws no control character, and "Name\tAge" would
+/// show as "NameAge".
 pub fn wrap(chars: &[Styled], width: usize) -> Vec<Vec<Styled>> {
     let width = width.max(4);
     let cells = |c: &Styled| cells(c.0);
+    let spaced: Vec<Styled>;
+    let chars = if chars.iter().any(|(c, _)| *c == '\t') {
+        spaced = chars
+            .iter()
+            .flat_map(|(c, flags)| {
+                let (c, times) = if *c == '\t' { (' ', TAB) } else { (*c, 1) };
+                std::iter::repeat_n((c, *flags), times)
+            })
+            .collect();
+        &spaced[..]
+    } else {
+        chars
+    };
     let mut lines = Vec::new();
     for paragraph in chars.split(|(c, _)| *c == '\n') {
         let mut line: Vec<Styled> = Vec::new();
@@ -578,6 +633,55 @@ mod tests {
         let (styled, links) = parse_links("[x](javascript:alert) `https://in.code/x`");
         assert!(links.is_empty());
         assert_eq!(text(&styled, LINK), "");
+    }
+
+    #[test]
+    fn a_tab_is_laid_out_as_spaces() {
+        assert_eq!(lines("Name\tAge", 40), ["Name    Age"]);
+        // And counted: the line breaks where the screen ends.
+        assert_eq!(lines("ab\tcd\tef", 9), ["ab    cd", "ef"]);
+    }
+
+    #[test]
+    fn opening_marks_without_end_and_brackets_after_an_address_are_read_quickly() {
+        let started = std::time::Instant::now();
+        // Each of these was read far ahead from every mark in it.
+        let stars = "*a ".repeat(400_000);
+        assert_eq!(parse_links(&stars).0.len(), stars.len());
+        for brackets in [1_000, 600_000] {
+            let text = format!("https://a.example/x{}", ")".repeat(brackets));
+            let (_, links) = parse_links(&text);
+            // Longer than any address: not read as one.
+            let expected: &[&str] = if brackets < MAX_ADDRESS {
+                &["https://a.example/x"]
+            } else {
+                &[]
+            };
+            assert_eq!(links, expected);
+        }
+        // No address (a backslash in it), from every "http://" anew.
+        let no_address = "http://a\\".repeat(60_000);
+        assert!(parse_links(&no_address).1.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_span_still_closes_where_an_earlier_mark_found_no_end() {
+        // The first star's search gives up at the blank line; the one
+        // after it has its own end.
+        assert_eq!(shown("*a b\n\n*c* d"), "*a b\n\n[2:c] d");
+        // Read past the first search's end.
+        let far = format!("*a {} *b*", "x".repeat(MAX_SPAN));
+        assert!(shown(&far).ends_with("[2:b]"));
+        assert_eq!(shown("*a\n\n*b *c* d"), "*a\n\n[2:b *c] d");
+        assert_eq!(
+            shown("_a\n\n*b\n\n_c_ *d* **e**"),
+            "_a\n\n*b\n\n[2:c] [2:d] [1:e]"
+        );
     }
 
     #[test]

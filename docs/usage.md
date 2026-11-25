@@ -18,14 +18,15 @@ there is to find is in [features.md](features.md); the config file in
 | `F4` | only unread chats, or all |
 | `F5` | emoji picker: search and pick an emoji for the message box |
 | `F6` | format menu: bold, italic, strikethrough, code, code block, heading, quote, lists, link, for the word or line at the cursor |
-| `Alt+↑` `Alt+↓` | previous / next room |
+| `Alt+↑` `Alt+↓` | previous / next room (invitations are passed over) |
 | `PgUp` `PgDn` | scroll the conversation |
 | `Ctrl+T` | next theme |
-| `Ctrl+Q` | quit |
+| `Ctrl+Q` or `Ctrl+C` | quit |
 
 **In the room list:** `↑` `↓` / `j` `k` move, `Enter` opens, `p` pins or
 unpins, `l` toggles low priority, `i` shows the room's info, `M` changes
-its notifications, `s` changes the sort order, `a` goes through the
+its notifications, `s` changes the sort order, `U` lists only unread
+chats (or all again), `a` goes through the
 accounts, `m` mixes rooms and people into one list, `g` chooses its
 section, `G` manages the sections, `z` folds the current section, `Z`
 unfolds all.
@@ -37,7 +38,8 @@ pin, `f` forward, `u` first new message, `t` open its thread (or start
 one), `y` copy code, `x` unfold or fold a long message and the names of
 who reacted or read it, `d` delete, `o` open attachment, `Esc` back.
 
-**While typing:** `Alt+Enter` starts a new line. `@name` opens the member
+**While typing:** `Alt+Enter` starts a new line (`Shift+Enter` too, in
+terminals that tell it from `Enter`). `@name` opens the member
 suggestions (`↑` `↓` choose, `Tab` or `Enter` completes, `Esc` closes);
 `:name` does the same for emoji. Clicking into the text places the cursor.
 `F6` or the `+ format` button opens the format menu: a letter (`b` bold,
@@ -65,17 +67,18 @@ Typing `/` in the message box lists the commands; `Tab` completes one,
 |---|---|
 | `/me <action>` | an emote |
 | `/poll Question \| Answer 1 \| Answer 2 [--multi] [--hidden]` | a poll |
-| `/file <path> [\| caption]`, `/paste` | send a file, the clipboard's picture |
+| `/file <path> [\| caption]` (or `/upload`), `/paste` | send a file, the clipboard's picture |
 | `/search [words]` | search messages |
 | `/info`, `/pins` | the room's info, its pinned messages |
 | `/invite <who>`, `/dm <who>`, `/room <name>`, `/join <#room:server>`, `/leave` | rooms and people |
 | `/verify [who]`, `/recover <key>`, `/backup [new]`, `/reset-identity` | encryption |
 | `/update` | install a new release of mothrix ([updates.md](updates.md)) |
-| `/settings`, `/accounts`, `/theme <name>`, `/stop`, `/quit` | the rest |
+| `/settings`, `/accounts`, `/theme <name>`, `/stop`, `/quit` (or `/q`) | the rest |
 
 `<who>` is a Matrix ID, or a name completed with `@`. A message that is to
 begin with a slash starts with two (`//usr/bin` sends `/usr/bin`); what is
-no command stays in the message box.
+no command stays in the message box, and so does what needs a room while
+none is open.
 
 ## Several accounts
 

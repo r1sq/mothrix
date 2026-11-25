@@ -24,6 +24,11 @@ use crate::{
 /// no notifications for that.
 pub const NOTIFICATION_WARMUP: Duration = Duration::from_secs(12);
 
+/// How long after an invitation was asked about opening it again joins
+/// it: the second Enter or tap of someone who means it comes soon, and a
+/// slip an hour later is asked again.
+pub const INVITATION_ASKED: Duration = Duration::from_secs(60);
+
 /// A room with new messages, to tell the user about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notification {
@@ -36,6 +41,10 @@ pub struct Notification {
 pub enum Opening {
     /// It is not listed (yet): nothing happened.
     NotListed,
+    /// It is an invitation (of this name), and opening it would accept
+    /// it: nothing happened but that the user is to be asked. Opening it
+    /// again soon ([`INVITATION_ASKED`]) joins.
+    Invitation { name: String },
     /// It was open already; `left_thread`: a thread of it was shown, and
     /// the room is now.
     Again { left_thread: bool },
@@ -50,7 +59,9 @@ impl Opening {
     /// What the account is to do about it.
     pub fn commands(&self) -> Vec<Command> {
         match self {
-            Self::NotListed | Self::Again { left_thread: false } => Vec::new(),
+            Self::NotListed | Self::Invitation { .. } | Self::Again { left_thread: false } => {
+                Vec::new()
+            }
             Self::Again { left_thread: true } => vec![Command::CloseThread],
             Self::Opened { room, .. } => vec![Command::Open(room.clone())],
         }
@@ -131,6 +142,13 @@ pub struct ClientState {
     pub config_dirty: bool,
     /// Unread counts as last seen, by room key.
     last_unread: HashMap<String, u64>,
+    /// The invitation the user was just asked about, and when (see
+    /// [`ClientState::open`]).
+    invite_asked: Option<(String, Instant)>,
+    /// A room a command of the user asked for (joined, made, a chat
+    /// started): should the list still call it an invitation when it
+    /// opens, there is nothing left to ask.
+    wanted: Option<String>,
 }
 
 impl Default for ClientState {
@@ -157,6 +175,8 @@ impl Default for ClientState {
             named_account: None,
             config_dirty: false,
             last_unread: HashMap::new(),
+            invite_asked: None,
+            wanted: None,
         }
     }
 }
@@ -249,9 +269,24 @@ impl ClientState {
 
     /// Show a room (by its key), if it is listed; the open one again
     /// leads out of its thread.
+    ///
+    /// An invitation is accepted by opening it ([`Command::Open`] joins),
+    /// so the first time only says so ([`Opening::Invitation`]) and
+    /// opening it again soon joins: a slip of the hand, or a tap on the
+    /// notification "X invited you", would else join a stranger's room.
     pub fn open(&mut self, room: &str) -> Opening {
-        if !self.rooms.iter().any(|known| known.id == room) {
+        let Some(known) = self.rooms.iter().find(|known| known.id == room) else {
             return Opening::NotListed;
+        };
+        let asked = self
+            .invite_asked
+            .take()
+            .is_some_and(|(asked, at)| asked == room && at.elapsed() < INVITATION_ASKED);
+        let wanted = self.wanted.take_if(|wanted| wanted == room).is_some();
+        if known.is_invite && !asked && !wanted {
+            let name = known.name.clone();
+            self.invite_asked = Some((room.to_owned(), Instant::now()));
+            return Opening::Invitation { name };
         }
         if self.open_room.as_deref() == Some(room) {
             return Opening::Again {
@@ -267,6 +302,18 @@ impl ClientState {
             room: room.to_owned(),
             previous,
         }
+    }
+
+    /// When an invitation was asked about, if one was and has not been
+    /// opened again yet.
+    pub fn invitation_asked(&self) -> Option<Instant> {
+        self.invite_asked.as_ref().map(|(_, at)| *at)
+    }
+
+    /// The user went on to something else: opening the invitation asked
+    /// about asks again.
+    pub fn forget_invitation(&mut self) {
+        self.invite_asked = None;
     }
 
     /// Show no room. Returns whether one was shown.
@@ -312,6 +359,7 @@ impl ClientState {
                 }
             }
             Update::GoTo(room) => {
+                self.wanted = Some(room.clone());
                 self.goto = Some(room);
                 self.take_goto().map_or(Taken::Nothing, Taken::Show)
             }
@@ -547,6 +595,62 @@ mod tests {
             }
         );
         assert!(state.members.is_empty());
+    }
+
+    /// The rooms of `two_accounts`, and an invitation "!party".
+    fn invited() -> ClientState {
+        let mut state = two_accounts();
+        let mut rooms = state.rooms.clone();
+        rooms.push(RoomEntry {
+            is_invite: true,
+            ..room("!party", 0)
+        });
+        state.set_rooms(rooms);
+        state
+    }
+
+    #[test]
+    fn an_invitation_is_asked_about_first_and_joined_when_opened_again_soon() {
+        let mut state = invited();
+        state.open("!a");
+        let first = state.open("!party");
+        assert_eq!(
+            first,
+            Opening::Invitation {
+                name: "!PARTY".into()
+            }
+        );
+        assert!(first.commands().is_empty());
+        assert_eq!(state.open_room.as_deref(), Some("!a"));
+        assert!(state.invitation_asked().is_some());
+        // Again: joined.
+        let second = state.open("!party");
+        assert!(matches!(&second.commands()[..], [Command::Open(room)] if room == "!party"));
+        assert_eq!(state.invitation_asked(), None);
+
+        // Another room opened in between, the front end saying the user
+        // went on, or a long while: asked again.
+        let mut state = invited();
+        state.open("!party");
+        state.open("!a");
+        assert!(matches!(state.open("!party"), Opening::Invitation { .. }));
+        state.forget_invitation();
+        assert!(matches!(state.open("!party"), Opening::Invitation { .. }));
+        state.invite_asked = Some(("!party".into(), Instant::now() - INVITATION_ASKED));
+        assert!(matches!(state.open("!party"), Opening::Invitation { .. }));
+        assert_eq!(state.open_room.as_deref(), Some("!a"));
+    }
+
+    #[test]
+    fn a_room_a_command_asked_for_opens_without_asking_though_listed_as_an_invitation() {
+        // "/join" of a room one was invited to: the list may still call
+        // it an invitation when the account says to go there.
+        let mut state = invited();
+        assert!(matches!(
+            state.take(Update::GoTo("!party".into())),
+            Taken::Show(room) if room == "!party"
+        ));
+        assert!(matches!(state.open("!party"), Opening::Opened { .. }));
     }
 
     #[test]

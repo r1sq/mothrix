@@ -87,13 +87,21 @@ pub const COMMANDS: [(&str, &str, bool); 23] = [
         "Question | Answer 1 | Answer 2 [--multi] [--hidden]",
         true,
     ),
-    ("file", "<path> [| caption]  send a file", true),
+    (
+        "file",
+        "<path> [| caption]  send a file (also /upload)",
+        true,
+    ),
     ("paste", "send the picture on the clipboard", false),
     ("search", "[words]  search messages", true),
     ("settings", "open the settings", false),
     ("help", "every key and command", false),
     ("accounts", "add, rename or sign out accounts", false),
-    ("verify", "verify this device with another of yours", false),
+    (
+        "verify",
+        "[who]  verify this device with another of yours, or a person",
+        false,
+    ),
     (
         "recover",
         "<recovery key>  read older encrypted messages",
@@ -127,7 +135,7 @@ pub const COMMANDS: [(&str, &str, bool); 23] = [
     ("room", "<name>  make a new private room", true),
     ("join", "<#room:server>  join a room", true),
     ("leave", "leave this room", false),
-    ("quit", "leave mothrix", false),
+    ("quit", "leave mothrix (also /q)", false),
 ];
 
 /// A Matrix id cut in the middle to at most `max` characters; some
@@ -282,7 +290,19 @@ pub struct Hit {
 pub struct Forward {
     pub event_id: String,
     pub filter: Input,
-    pub cursor: usize,
+    /// The room the cursor is on (its key), not its row: the list is in
+    /// the order of the newest messages, and one arriving anywhere moves
+    /// the rows before Enter lands.
+    pub on: Option<String>,
+}
+
+/// A message being written, set aside while an earlier one is edited:
+/// its text, who is mentioned in it, and the message it answers.
+#[derive(Clone, Debug)]
+struct SetAside {
+    text: String,
+    mentions: Vec<Member>,
+    answering: Option<Compose>,
 }
 
 pub struct App {
@@ -299,13 +319,17 @@ pub struct App {
     settles: Option<std::time::Instant>,
     /// What was in the message box when an edit of an earlier message
     /// began; back there when the edit is sent or given up.
-    set_aside: Option<String>,
+    set_aside: Option<SetAside>,
     /// How long that is.
     pub(crate) key_guard: std::time::Duration,
     /// What is to be done outside, in order (see [`Effect`]).
     effects: Vec<Effect>,
     /// The dialogs and menus open over the main screen.
     pub overlays: Overlays,
+    /// The last frame could not show the dialog on top, or not all of
+    /// what it asks about (a terminal too small; set while drawing, as
+    /// the click targets are): it takes no key but Esc.
+    pub overlay_unseen: bool,
     pub theme: Theme,
     /// Long messages the user unfolded.
     pub expanded: HashSet<String>,
@@ -319,8 +343,6 @@ pub struct App {
     pub drafts: HashMap<String, String>,
     /// The room to open again once it is listed (the one open last time).
     reopen: Option<String>,
-    /// The invitation the user was just asked about (see `open`).
-    invite_asked: Option<String>,
     /// Drafts or the open room changed; the main loop saves them.
     pub state_dirty: bool,
     /// Room id the sidebar cursor is on (keyboard navigation).
@@ -413,6 +435,7 @@ impl App {
             // Tests press their keys at once.
             key_guard: std::time::Duration::from_millis(if cfg!(test) { 0 } else { 900 }),
             overlays: Overlays::default(),
+            overlay_unseen: false,
             viewport: Viewport::default(),
             effects: Vec::new(),
             theme,
@@ -422,7 +445,6 @@ impl App {
             typing_told: String::new(),
             drafts: HashMap::new(),
             reopen: None,
-            invite_asked: None,
             state_dirty: false,
             cursor_room: None,
             sidebar_cursor_seen: None,
@@ -517,26 +539,6 @@ impl App {
     }
 
     fn open(&mut self, room_id: String, commands: &mut Vec<Command>) {
-        // An invitation: opening it accepts it, so the first time only
-        // asks. A slip of the hand on an invitation from a stranger would
-        // else join their room.
-        let invite = self
-            .state
-            .rooms
-            .iter()
-            .find(|room| room.id == room_id && room.is_invite)
-            .map(|room| room.name.clone());
-        if let Some(name) = invite
-            && self.invite_asked.as_deref() != Some(room_id.as_str())
-        {
-            self.notice = Some(format!(
-                "{name} is an invitation: Enter or a click again joins it; its menu (right click, m) has \"Leave\" to turn it down."
-            ));
-            self.cursor_room = Some(room_id.clone());
-            self.invite_asked = Some(room_id);
-            return;
-        }
-        self.invite_asked = None;
         let opening = self.state.open(&room_id);
         // Whoever was told we are writing in the room we leave hears that
         // we stopped, before the backend turns to the other room.
@@ -547,6 +549,15 @@ impl App {
         commands.extend(opening.commands());
         let previous = match opening {
             Opening::NotListed => return,
+            // Opening it would accept it: the first time only asks (the
+            // rule is the client state's).
+            Opening::Invitation { name } => {
+                self.notice = Some(format!(
+                    "{name} is an invitation: Enter or a click again joins it; its menu (right click, m) has \"Leave\" to turn it down."
+                ));
+                self.cursor_room = Some(room_id);
+                return;
+            }
             Opening::Opened { previous, .. } => previous,
             // Clicking the room again leads out of a thread.
             Opening::Again { left_thread } => {
@@ -561,6 +572,11 @@ impl App {
         self.effects.push(Effect::RoomOpened(room_id.clone()));
         // Pictures of the room we are leaving are no longer needed.
         self.drop_pictures();
+        // An edit of an earlier message is given up; what was set aside
+        // for it is the draft again.
+        if matches!(self.compose, Compose::Edit { .. }) {
+            self.cancel_compose();
+        }
         // Who was mentioned in what is being written, and what it answers,
         // stay with the draft (until mothrix ends).
         let mentions = std::mem::take(&mut self.composer_mentions);
@@ -607,9 +623,13 @@ impl App {
     }
 
     fn keep_draft(&mut self, room_id: &str) {
-        // While a message is edited, the draft is what was set aside.
-        let text = match (&self.compose, self.set_aside.take()) {
-            (Compose::Edit { .. }, aside) => aside.unwrap_or_default(),
+        // While a message is edited, the draft is what was set aside
+        // (which stays there: this is also asked at every save).
+        let text = match (&self.compose, &self.set_aside) {
+            (Compose::Edit { .. }, aside) => aside
+                .as_ref()
+                .map(|aside| aside.text.clone())
+                .unwrap_or_default(),
             _ => self.composer.text().to_owned(),
         };
         // Nothing with a secret in it goes into the drafts' file.
@@ -633,6 +653,30 @@ impl App {
     pub fn restore_session(&mut self, last_room: Option<String>, drafts: HashMap<String, String>) {
         self.drafts = drafts;
         self.reopen = last_room.filter(|id| !id.is_empty());
+    }
+
+    /// Whether the user is writing a message or has a dialog open: no
+    /// room opens by itself then.
+    fn busy(&self) -> bool {
+        !self.composer.is_empty() || self.dialog_open()
+    }
+
+    /// A room a command asked for (joined, a chat started) is listed,
+    /// right away or some lists later. It opens, but not under the hands
+    /// of someone who went on writing or opened a dialog meanwhile: the
+    /// rest of the sentence would go into the new room.
+    fn show_asked_for(&mut self, room: String) {
+        if !self.busy() {
+            return self.open_later(room);
+        }
+        let name = self
+            .state
+            .rooms
+            .iter()
+            .find(|entry| entry.id == room)
+            .map_or_else(|| "The room".to_owned(), |entry| entry.name.clone());
+        self.cursor_room = Some(room);
+        self.notice = Some(format!("{name} is there: marked in the list."));
     }
 
     /// Open a room outside a key press or click.
@@ -696,25 +740,43 @@ impl App {
         }
     }
 
+    /// The row of the forward dialog the cursor is on: where its room is
+    /// listed now. None when that room is no longer offered.
+    pub fn forward_cursor(&self) -> Option<usize> {
+        let on = self.overlays.get::<Forward>()?.on.as_deref()?;
+        self.forward_targets().iter().position(|room| room.id == on)
+    }
+
+    /// Put the forward dialog's cursor on this row of what it lists now.
+    fn forward_choose(&mut self, row: usize) {
+        let on = self.forward_targets().get(row).map(|room| room.id.clone());
+        if let Some(forward) = self.overlays.get_mut::<Forward>() {
+            forward.on = on;
+        }
+    }
+
     fn on_forward_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
-        let count = self.forward_targets().len();
+        let cursor = self.forward_cursor();
         let Some(forward) = self.overlays.get_mut::<Forward>() else {
             return;
         };
         match key.code {
             KeyCode::Esc => self.overlays.close::<Forward>(),
+            // The room the cursor was put on, wherever it is listed now;
+            // if it went, nothing is forwarded to another in its row.
             KeyCode::Enter => {
-                let index = forward.cursor;
-                if let Some(room) = self.forward_targets().get(index) {
-                    let room_id = room.id.clone();
+                if let Some(room_id) = forward.on.clone().filter(|_| cursor.is_some()) {
                     self.forward_to(room_id, commands);
                 }
             }
-            KeyCode::Up => forward.cursor = forward.cursor.saturating_sub(1),
-            KeyCode::Down if count > 0 => forward.cursor = (forward.cursor + 1).min(count - 1),
+            KeyCode::Up => self.forward_choose(cursor.map_or(0, |row| row.saturating_sub(1))),
+            KeyCode::Down => {
+                let last = self.forward_targets().len().saturating_sub(1);
+                self.forward_choose(cursor.map_or(0, |row| (row + 1).min(last)));
+            }
             _ => {
                 if forward.filter.edit(key) {
-                    forward.cursor = 0;
+                    self.forward_choose(0);
                 }
             }
         }
@@ -802,8 +864,17 @@ impl App {
     }
 
     /// Open the room before/after the open one in sidebar order.
+    /// Invitations are passed over: the open room stays the same while
+    /// one only asks, so the same key again would join it.
     fn open_neighbour(&mut self, delta: isize, commands: &mut Vec<Command>) {
-        let ids = self.visible_room_ids();
+        let mut ids = self.visible_room_ids();
+        ids.retain(|id| {
+            !self
+                .state
+                .rooms
+                .iter()
+                .any(|room| room.id == *id && room.is_invite)
+        });
         if ids.is_empty() {
             return;
         }
@@ -954,10 +1025,20 @@ impl App {
                 self.bar = Bar::Actions;
             }
             BarAction::Edit => {
-                // What is being written waits until the edit is done.
-                if !matches!(self.compose, Compose::Edit { .. }) && !self.composer.is_empty() {
-                    self.set_aside = Some(self.composer.text().to_owned());
+                // What is being written waits until the edit is done,
+                // with its mentions and the message it answers.
+                let answering =
+                    matches!(self.compose, Compose::Reply { .. }).then(|| self.compose.clone());
+                if !matches!(self.compose, Compose::Edit { .. })
+                    && (!self.composer.is_empty() || answering.is_some())
+                {
+                    self.set_aside = Some(SetAside {
+                        text: self.composer.text().to_owned(),
+                        mentions: std::mem::take(&mut self.composer_mentions),
+                        answering,
+                    });
                 }
+                self.composer_mentions.clear();
                 self.composer.set(&item.body);
                 self.compose = Compose::Edit {
                     event_id: item.event_id,
@@ -999,8 +1080,9 @@ impl App {
                 self.overlays.open(Forward {
                     event_id: item.event_id.clone(),
                     filter: Input::default(),
-                    cursor: 0,
+                    on: None,
                 });
+                self.forward_choose(0);
             }
             BarAction::Copy => {
                 self.effects
@@ -1051,10 +1133,18 @@ impl App {
         self.settles = Some(std::time::Instant::now() + self.key_guard);
     }
 
-    /// Whether such a dialog only just came up.
-    pub(crate) fn unsettled(&self) -> bool {
-        self.settles
-            .is_some_and(|until| std::time::Instant::now() < until)
+    /// Whether such a dialog only just came up, or keys have kept coming
+    /// since: each key it does not take starts the wait anew, so that
+    /// someone who goes on writing for a while answers nothing, however
+    /// long the sentence.
+    pub(crate) fn unsettled(&mut self) -> bool {
+        let unsettled = self
+            .settles
+            .is_some_and(|until| std::time::Instant::now() < until);
+        if unsettled {
+            self.settle();
+        }
+        unsettled
     }
 
     fn on_verify_key(&mut self, key: KeyEvent, commands: &mut Vec<Command>) {
@@ -1074,11 +1164,13 @@ impl App {
     }
 
     fn cancel_compose(&mut self) {
-        if matches!(self.compose, Compose::Edit { .. }) {
+        let editing = matches!(self.compose, Compose::Edit { .. });
+        self.compose = Compose::Message;
+        if editing {
             self.composer.clear();
+            self.composer_mentions.clear();
             self.take_up_again();
         }
-        self.compose = Compose::Message;
     }
 
     // -- backend updates ----------------------------------------------------
@@ -1097,6 +1189,14 @@ impl App {
     }
 
     pub fn on_update(&mut self, update: Update) {
+        self.take_update(update);
+        // An update can put other text into the message box (a room
+        // opens with its draft, a pasted picture's path): the marks and
+        // the corrections offered are for the text that is there.
+        self.refresh_spelling();
+    }
+
+    fn take_update(&mut self, update: Update) {
         self.updates_taken += 1;
         let update = match self.state.take(update) {
             Taken::Rooms { news, show } => {
@@ -1112,34 +1212,21 @@ impl App {
                     self.overlays.close::<RoomMenu>();
                 }
                 // A room we were told to go to; else back into the one
-                // that was open last time.
-                let reopen = self.reopen.clone().filter(|id| {
+                // that was open last time (which waits, like the other,
+                // for hands that are free: its draft would take the
+                // place of what is being typed).
+                if let Some(room) = show {
+                    self.show_asked_for(room);
+                } else if let Some(room) = self.reopen.clone().filter(|id| {
                     self.state.open_room.is_none()
+                        && !self.busy()
                         && self.state.rooms.iter().any(|room| room.id == *id)
-                });
-                if let Some(room) = show.or(reopen) {
+                }) {
                     self.open_later(room);
                 }
                 return;
             }
-            // A room a command asked for (joined, a chat started) has
-            // come. Not under the hands of someone who went on writing
-            // or opened a dialog meanwhile: the rest of the sentence
-            // would go into the new room.
-            Taken::Show(room) => {
-                if self.composer.is_empty() && !self.dialog_open() {
-                    return self.open_later(room);
-                }
-                let name = self
-                    .state
-                    .rooms
-                    .iter()
-                    .find(|entry| entry.id == room)
-                    .map_or_else(|| "The room".to_owned(), |entry| entry.name.clone());
-                self.cursor_room = Some(room);
-                self.notice = Some(format!("{name} is there: marked in the list."));
-                return;
-            }
+            Taken::Show(room) => return self.show_asked_for(room),
             Taken::Items => {
                 // The selected message may have been deleted meanwhile.
                 if self.selected.is_some() && self.selected_item().is_none() {
@@ -1226,9 +1313,29 @@ impl App {
     // -- terminal events ----------------------------------------------------
 
     pub fn on_event(&mut self, event: Event) -> Vec<Command> {
-        let mut commands = Vec::new();
         // Which account an earlier action named is no word about this one.
         self.state.named_account = None;
+        // An invitation asked about is joined by the very next key or
+        // click, if that opens it again; any other one takes the
+        // question back.
+        let pressed = match &event {
+            Event::Key(key) => key.kind != KeyEventKind::Release,
+            Event::Mouse(mouse) => matches!(mouse.kind, MouseEventKind::Down(_)),
+            _ => false,
+        };
+        if pressed && let Some(asked) = self.state.invitation_asked() {
+            let commands = self.on_event_asked(event);
+            if self.state.invitation_asked() == Some(asked) {
+                self.state.forget_invitation();
+            }
+            return commands;
+        }
+        self.on_event_asked(event)
+    }
+
+    /// `on_event`, whatever was asked about an invitation before.
+    fn on_event_asked(&mut self, event: Event) -> Vec<Command> {
+        let mut commands = Vec::new();
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key, &mut commands),
             Event::Mouse(mouse) => self.on_mouse(mouse, &mut commands),
@@ -1571,7 +1678,7 @@ impl App {
         let typed = self.composer.text().trim_start();
         let sends = !typed.starts_with('/')
             || typed.starts_with("//")
-            || ["/me ", "/file ", "/poll ", "/paste"]
+            || ["/me ", "/file ", "/upload ", "/poll ", "/paste"]
                 .iter()
                 .any(|command| typed.starts_with(command));
         if pinned_view && sends {
@@ -1583,6 +1690,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        let typed = text;
         // A message being edited is text, whatever it starts with; and
         // "//" starts a message that begins with a slash.
         let editing = matches!(self.compose, Compose::Edit { .. });
@@ -1603,14 +1711,12 @@ impl App {
                 }),
                 "reset-identity" => self.overlays.open(ResetPrompt::default()),
                 "stop" => commands.push(Command::StopAudio),
-                "pins" if self.state.open_room.is_none() => {
-                    self.notice = Some("Open a room first.".to_owned());
-                }
+                "pins" if self.state.open_room.is_none() => self.no_room(text),
                 "pins" => {
                     self.enter_thread(crate::matrix::PINNED_VIEW.to_owned(), commands);
                 }
                 "info" | "invite" | "leave" if self.state.open_room.is_none() => {
-                    self.notice = Some("Open a room first.".to_owned());
+                    self.no_room(text);
                 }
                 "info" => {
                     let room_id = self.state.open_room.clone().unwrap_or_default();
@@ -1656,9 +1762,7 @@ impl App {
                     }
                 },
                 "poll" => match parse_poll(argument) {
-                    Ok(_) if self.state.open_room.is_none() => {
-                        self.notice = Some("Open a room first.".to_owned());
-                    }
+                    Ok(_) if self.state.open_room.is_none() => self.no_room(text),
                     Ok((question, answers, multiple, hidden)) => {
                         self.viewport.follow_newest();
                         commands.push(Command::CreatePoll {
@@ -1676,7 +1780,7 @@ impl App {
                 },
                 "file" | "upload" if !argument.trim().is_empty() => {
                     if self.state.open_room.is_none() {
-                        self.notice = Some("Open a room first.".to_owned());
+                        self.no_room(text);
                     } else {
                         self.viewport.follow_newest();
                         // "/file picture.png | what it shows"
@@ -1692,7 +1796,7 @@ impl App {
                 }
                 "paste" => {
                     if self.state.open_room.is_none() {
-                        self.notice = Some("Open a room first.".to_owned());
+                        self.no_room(text);
                     } else {
                         self.viewport.follow_newest();
                         self.notice = Some("Sending the picture from the clipboard…".to_owned());
@@ -1724,18 +1828,22 @@ impl App {
                     // Not a command: perhaps a message (a path, a typing
                     // mistake in a long line). It stays to be put right.
                     self.composer.set(text);
-                    self.notice = Some(
-                        "No such command (a message that starts with a slash: type //). Commands: /me, /poll Q | A | B [--multi] [--hidden], /file <path>, /paste, /search, /settings, /accounts, /info, /invite, /dm, /room, /join, /leave, /verify, /recover <key>, /theme, /quit"
-                            .to_owned(),
-                    );
+                    let names: Vec<String> = COMMANDS
+                        .iter()
+                        .map(|(name, _, _)| format!("/{name}"))
+                        .collect();
+                    self.notice = Some(format!(
+                        "No such command (a message that starts with a slash: type //). There are: {}. F1 says what each does.",
+                        names.join(", ")
+                    ));
                 }
             }
             return;
         }
 
         let Some(room_id) = self.state.open_room.clone() else {
-            self.notice = Some("Open a room first.".to_owned());
-            return;
+            // As typed, with the slashes "//" took one of.
+            return self.no_room(typed);
         };
         self.viewport.follow_newest();
         let text = text.to_owned();
@@ -1764,10 +1872,22 @@ impl App {
         }
     }
 
-    /// The edit is over: what was being written before it is back.
+    /// Enter where it needs a room and none is open: what was typed stays
+    /// in the message box for when one is.
+    fn no_room(&mut self, typed: &str) {
+        self.composer.set(typed);
+        self.notice = Some("Open a room first.".to_owned());
+    }
+
+    /// The edit is over: what was being written before it is back, as a
+    /// reply if it was one, with its mentions.
     fn take_up_again(&mut self) {
-        if let Some(text) = self.set_aside.take() {
-            self.composer.set(&text);
+        if let Some(aside) = self.set_aside.take() {
+            self.composer.set(&aside.text);
+            self.composer_mentions = aside.mentions;
+            if let Some(answering) = aside.answering {
+                self.compose = answering;
+            }
         }
     }
 
@@ -2477,6 +2597,56 @@ mod tests {
         assert_eq!(app.state.open_room.as_deref(), Some("!party"));
     }
 
+    /// `chat()` with an invitation "Party" in the list, the cursor on it.
+    fn invited() -> App {
+        let mut app = chat();
+        let mut rooms = app.state.rooms.clone();
+        rooms.push(RoomEntry {
+            id: "!party".into(),
+            name: "Party".into(),
+            is_invite: true,
+            ..RoomEntry::default()
+        });
+        app.on_update(Update::Rooms(rooms));
+        app.focus = Focus::Sidebar;
+        app.cursor_room = Some("!party".into());
+        app
+    }
+
+    #[test]
+    fn any_other_key_takes_the_question_about_an_invitation_back() {
+        let mut app = invited();
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert!(app.state.invitation_asked().is_some());
+        // Away and back: Enter asks again.
+        app.on_event(key(KeyCode::Down));
+        assert!(app.state.invitation_asked().is_none());
+        app.on_event(key(KeyCode::Up));
+        assert_eq!(app.cursor_room.as_deref(), Some("!party"));
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.state.open_room.as_deref(), Some("!a"));
+        // Enter right again joins.
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::Open(room)] if room == "!party"),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn the_keys_for_the_next_room_pass_over_invitations() {
+        let mut app = invited();
+        let alt = |code| Event::Key(KeyEvent::new(code, KeyModifiers::ALT));
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            app.on_event(alt(KeyCode::Down));
+            seen.push(app.state.open_room.clone().unwrap_or_default());
+        }
+        assert!(seen.iter().all(|room| room != "!party"), "{seen:?}");
+        assert!(seen.contains(&"!b".to_owned()), "{seen:?}");
+        assert!(app.state.invitation_asked().is_none());
+    }
+
     #[test]
     fn a_room_that_comes_later_does_not_open_under_someone_writing() {
         let mut app = chat();
@@ -2492,6 +2662,35 @@ mod tests {
         app.composer.clear();
         app.on_update(Update::GoTo("!b".into()));
         assert_eq!(app.state.open_room.as_deref(), Some("!b"));
+    }
+
+    #[test]
+    fn a_room_listed_after_its_command_does_not_open_under_someone_writing_either() {
+        // "/join": the account says to go there before the room is listed.
+        let mut app = chat();
+        app.on_update(Update::GoTo("!new".into()));
+        type_text(&mut app, "still writing here");
+        let mut rooms = app.state.rooms.clone();
+        rooms.push(room("!new", "Book Club", false));
+        app.on_update(Update::Rooms(rooms.clone()));
+        assert_eq!(app.state.open_room.as_deref(), Some("!a"));
+        assert_eq!(app.composer.text(), "still writing here");
+        assert_eq!(app.cursor_room.as_deref(), Some("!new"));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Book Club is there: marked in the list.")
+        );
+        // The room open last time waits for free hands as well.
+        let mut app = App::new(theme::THEMES[0], "@me:x".into());
+        app.restore_session(Some("!new".into()), HashMap::new());
+        app.focus = Focus::Composer;
+        type_text(&mut app, "/the");
+        app.on_update(Update::Rooms(rooms.clone()));
+        assert_eq!(app.state.open_room, None);
+        assert_eq!(app.composer.text(), "/the");
+        app.composer.clear();
+        app.on_update(Update::Rooms(rooms));
+        assert_eq!(app.state.open_room.as_deref(), Some("!new"));
     }
 
     #[test]
@@ -2571,6 +2770,38 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_means_the_room_the_cursor_was_put_on_when_the_list_moves() {
+        let mut app = chat();
+        app.on_event(key(KeyCode::Up));
+        app.on_event(key(KeyCode::Char('f')));
+        app.on_event(key(KeyCode::Down));
+        let on = app.forward_targets()[1].id.clone();
+        assert_eq!(app.forward_cursor(), Some(1));
+        // A message arrives somewhere: the list is in another order.
+        let mut rooms = app.state.rooms.clone();
+        rooms.rotate_left(1);
+        app.on_update(Update::Rooms(rooms.clone()));
+        assert_eq!(app.forward_cursor(), Some(0));
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::Forward { room_id, .. }] if *room_id == on),
+            "{commands:?}"
+        );
+        // The room chosen went: Enter forwards to no other in its row.
+        app.on_event(key(KeyCode::Up));
+        app.on_event(key(KeyCode::Char('f')));
+        let on = app.forward_targets()[0].id.clone();
+        rooms.retain(|room| room.id != on);
+        app.on_update(Update::Rooms(rooms));
+        assert_eq!(app.forward_cursor(), None);
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert!(app.overlays.is_open::<Forward>());
+        // The arrow keys choose anew.
+        app.on_event(key(KeyCode::Down));
+        assert_eq!(app.forward_cursor(), Some(0));
+    }
+
+    #[test]
     fn the_pinned_view_is_for_reading() {
         let mut app = chat();
         type_text(&mut app, "/pins");
@@ -2582,6 +2813,12 @@ mod tests {
         type_text(&mut app, "hello");
         assert!(app.on_event(key(KeyCode::Enter)).is_empty());
         assert_eq!(app.composer.text(), "hello");
+        // Both names of the command that sends a file.
+        for command in ["/file /tmp/x.png", "/upload /tmp/x.png"] {
+            app.composer.set(command);
+            assert!(app.on_event(key(KeyCode::Enter)).is_empty(), "{command}");
+            assert_eq!(app.composer.text(), command);
+        }
         app.composer.clear();
         let commands = app.on_event(key(KeyCode::Esc));
         assert!(matches!(&commands[..], [Command::CloseThread]));
@@ -3501,6 +3738,24 @@ mod tests {
     }
 
     #[test]
+    fn keys_that_keep_coming_keep_such_a_dialog_from_taking_one() {
+        let mut app = chat();
+        let hour = std::time::Duration::from_secs(3600);
+        app.key_guard = 2 * hour;
+        app.on_update(Update::Verify(Some(VerifyState::Incoming {
+            device: "Phone".into(),
+        })));
+        // Nearly over, and the user is still writing their sentence:
+        let nearly = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        app.settles = Some(nearly);
+        assert!(app.on_event(key(KeyCode::Char('x'))).is_empty());
+        // the wait starts anew.
+        assert!(app.settles.is_some_and(|until| until > nearly + hour));
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert!(app.overlays.is_open::<VerifyState>());
+    }
+
+    #[test]
     fn what_is_not_a_command_stays_and_two_slashes_start_a_message() {
         let mut app = chat();
         type_text(&mut app, "/usr/bin/foo is broken");
@@ -3539,6 +3794,88 @@ mod tests {
         app.on_bar(BarAction::Edit, &mut Vec::new());
         app.on_event(key(KeyCode::Esc));
         assert_eq!(app.composer.text(), "half a thought");
+    }
+
+    #[test]
+    fn editing_an_earlier_message_keeps_the_draft_s_mentions_and_what_it_answers() {
+        let mut app = chat();
+        let amy = Member {
+            user_id: "@amy:x".into(),
+            name: "Amy".into(),
+        };
+        app.select("$1".into());
+        app.on_bar(BarAction::Reply, &mut Vec::new());
+        type_text(&mut app, "yes @Amy ");
+        app.composer_mentions.push(amy.clone());
+        app.select("$2".into());
+        app.on_bar(BarAction::Edit, &mut Vec::new());
+        // The state is saved while the edit goes on (any time): the
+        // draft is what was set aside, and it stays set aside.
+        let (_, drafts) = app.session_state();
+        assert_eq!(drafts.get("!a").map(String::as_str), Some("yes @Amy "));
+        let (_, drafts) = app.session_state();
+        assert_eq!(drafts.get("!a").map(String::as_str), Some("yes @Amy "));
+        app.composer.set("mine, corrected");
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::Edit { mentions, .. }] if mentions.is_empty()),
+            "{commands:?}"
+        );
+        // Back in the reply, with its mention.
+        assert_eq!(app.composer.text(), "yes @Amy ");
+        assert!(matches!(&app.compose, Compose::Reply { event_id, .. } if event_id == "$1"));
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::Reply { event_id, mentions, .. }]
+                if event_id == "$1" && *mentions == [amy.clone()]),
+            "{commands:?}"
+        );
+
+        // An edit given up, and one ended by going to another room.
+        app.select("$1".into());
+        app.on_bar(BarAction::Reply, &mut Vec::new());
+        type_text(&mut app, "no");
+        app.select("$2".into());
+        app.on_bar(BarAction::Edit, &mut Vec::new());
+        app.on_event(key(KeyCode::Esc));
+        assert_eq!(app.composer.text(), "no");
+        assert!(matches!(app.compose, Compose::Reply { .. }));
+        app.select("$2".into());
+        app.on_bar(BarAction::Edit, &mut Vec::new());
+        app.open("!b".into(), &mut Vec::new());
+        assert_eq!(app.composer.text(), "");
+        app.open("!a".into(), &mut Vec::new());
+        assert_eq!(app.composer.text(), "no");
+        assert!(matches!(app.compose, Compose::Reply { .. }));
+    }
+
+    #[test]
+    fn enter_without_a_room_keeps_what_was_typed() {
+        let mut app = app();
+        app.focus = Focus::Composer;
+        for typed in [
+            "a long message written too early",
+            "//usr/bin is a path",
+            "/poll Lunch? | Yes | No",
+            "/file /tmp/picture.png | look",
+            "/invite @amy:x",
+        ] {
+            app.composer.set(typed);
+            assert!(app.on_event(key(KeyCode::Enter)).is_empty(), "{typed}");
+            assert_eq!(app.composer.text(), typed);
+            assert_eq!(app.notice.as_deref(), Some("Open a room first."));
+        }
+    }
+
+    #[test]
+    fn what_is_no_command_is_answered_with_all_there_are() {
+        let mut app = chat();
+        type_text(&mut app, "/nonsense now");
+        app.on_event(key(KeyCode::Enter));
+        let notice = app.notice.clone().unwrap_or_default();
+        for (name, _, _) in COMMANDS {
+            assert!(notice.contains(&format!("/{name}")), "/{name}: {notice}");
+        }
     }
 
     #[test]

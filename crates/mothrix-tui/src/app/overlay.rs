@@ -84,7 +84,9 @@ impl Overlay {
             }
             Self::Forward(forward) => {
                 forward.filter.insert_str(text);
-                forward.cursor = 0;
+                // `App::overlay_paste` puts the cursor on the first room
+                // of what is listed now.
+                forward.on = None;
             }
             Self::ResetPrompt(prompt) => prompt.0.insert_str(text),
             Self::SectionManager(manager) => {
@@ -237,6 +239,16 @@ impl App {
         let Some(top) = self.overlays.top() else {
             return false;
         };
+        // A dialog the last frame could not show (whole) is answered by
+        // nobody who saw it: only Esc reaches it, which backs out.
+        if self.overlay_unseen && key.code != KeyCode::Esc {
+            self.notice = Some(crate::ui::TOO_SMALL.trim().to_owned());
+            return true;
+        }
+        // Shown again (the terminal was enlarged): that line has had its say.
+        if self.notice.as_deref() == Some(crate::ui::TOO_SMALL.trim()) {
+            self.notice = None;
+        }
         let handler: KeyHandler = match top {
             Overlay::Settings(_) => |app, key, _| app.on_settings_key(key),
             Overlay::Accounts(_) => |app, key, _| app.on_accounts_key(key),
@@ -262,6 +274,9 @@ impl App {
         match self.overlays.0.last_mut() {
             Some(top) => {
                 top.paste(text);
+                if matches!(top, Overlay::Forward(_)) {
+                    self.forward_choose(0);
+                }
                 true
             }
             None => false,
@@ -353,7 +368,7 @@ mod tests {
             Forward {
                 event_id: "$1".into(),
                 filter: Input::default(),
-                cursor: 0,
+                on: None,
             }
             .into(),
             RecoveryKey("EsTc abcd".into()).into(),

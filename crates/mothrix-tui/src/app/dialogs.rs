@@ -1204,6 +1204,36 @@ mod tests {
     }
 
     #[test]
+    fn corrections_offered_for_a_text_that_was_replaced_do_no_harm() {
+        let mut app = spelling();
+        type_text(&mut app, "hello teh ");
+        app.on_event(key(KeyCode::Left));
+        assert!(!app.spelling_rows().is_empty());
+        // The message box gets other text without a key (as when an
+        // edit is given up for the user: its thread could not be opened).
+        app.composer.set("ab");
+        app.on_event(key(KeyCode::Tab));
+        app.on_event(ctrl('w'));
+        assert!(app.composer.cursor() <= app.composer.text().chars().count());
+
+        // Where an update replaces it, the corrections go with the text.
+        let mut app = spelling();
+        app.compose = Compose::Edit {
+            event_id: "$2".into(),
+        };
+        type_text(&mut app, "hello teh ");
+        app.on_event(key(KeyCode::Left));
+        assert!(!app.spelling_rows().is_empty());
+        app.state.open_thread = Some("$1".into());
+        app.on_update(Update::ThreadFailed {
+            room_id: "!a".into(),
+            root: "$1".into(),
+        });
+        assert_eq!(app.composer.text(), "");
+        assert!(app.spelling_rows().is_empty());
+    }
+
+    #[test]
     fn enter_still_sends_while_the_spelling_popup_is_open() {
         let mut app = spelling();
         type_text(&mut app, "teh ");

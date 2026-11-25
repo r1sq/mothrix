@@ -7,8 +7,9 @@ Everything the terminal client can do, by topic. Keys and commands are in
 
 - Invitations, pinned chats, rooms, direct chats and low-priority rooms,
   with unread and mention counts
-- An invitation is joined by opening it twice: the first time mothrix
-  says what it is; its menu's "Leave…" turns it down
+- An invitation is joined by opening it twice in a row: the first time
+  mothrix says what it is, and any other key or click (or a minute)
+  takes the question back; its menu's "Leave…" turns it down
 - Right-click a room or person for its menu: open, pin, move to a
   section, low priority, notifications
 - Pin a room or person to the top (the menu, or `p`); pins use the
@@ -125,7 +126,10 @@ Everything the terminal client can do, by topic. Keys and commands are in
   messages
 - Verify this device against another of yours, or another person, by
   comparing emoji (`/verify`, `v` on them in the room info, or accept the
-  request that pops up)
+  request that pops up); "They match" is offered only while all seven
+  emoji are on the screen
+- A dialog the terminal is too small to show says so and takes no key
+  but `Esc`: nothing is confirmed unseen
 - Key backup from inside mothrix: `/backup` sets it up and shows the
   recovery key once; `/reset-identity` starts over when no device and no
   key is left

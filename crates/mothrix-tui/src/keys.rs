@@ -25,6 +25,14 @@ pub const ACTIONS: [(&str, &str); 14] = [
     ("scroll_up", "pageup"),
 ];
 
+/// Keys with a meaning that is not among [`ACTIONS`] and would be lost to
+/// a binding: (the key, what it does, as the refusal says it).
+const FIXED: [(&str, &str); 3] = [
+    ("f1", "opens the help"),
+    ("ctrl+c", "quits"),
+    ("alt+enter", "starts a new line"),
+];
+
 /// A key as written in the config: `ctrl+k`, `alt+up`, `f5`, `ctrl+shift+p`.
 pub fn parse_key(spec: &str) -> Option<KeyEvent> {
     let mut modifiers = KeyModifiers::NONE;
@@ -121,6 +129,13 @@ pub fn keymap(
                     .filter_map(|editing| parse_key(editing))
                     .any(|editing| same(&editing, &key))
                     .then(|| "edits the text being written".to_owned())
+            })
+            .or_else(|| {
+                FIXED
+                    .iter()
+                    .filter_map(|(fixed, does)| Some((parse_key(fixed)?, does)))
+                    .find(|(fixed, _)| same(fixed, &key))
+                    .map(|(_, does)| (*does).to_owned())
             });
         if let Some(taken) = taken {
             problems.push(format!("[keys] {action}: '{spec}' {taken}"));
@@ -161,6 +176,31 @@ mod tests {
         assert_eq!(map.len(), 2, "{problems:?}");
         assert_eq!(problems.len(), 3, "{problems:?}");
         assert!(problems.iter().any(|problem| problem.contains("find_room")));
+    }
+
+    #[test]
+    fn the_keys_for_help_quitting_and_a_new_line_are_not_given_away() {
+        let configured = [
+            ("search", "f1"),
+            ("emoji", "ctrl+c"),
+            ("format", "alt+enter"),
+            ("theme", "alt+t"),
+        ]
+        .into_iter()
+        .map(|(action, key)| (action.to_owned(), key.to_owned()))
+        .collect();
+        let (map, problems) = keymap(&configured);
+        assert_eq!(map.len(), 1, "{problems:?}");
+        for said in [
+            "'f1' opens the help",
+            "'ctrl+c' quits",
+            "'alt+enter' starts",
+        ] {
+            assert!(
+                problems.iter().any(|problem| problem.contains(said)),
+                "{said}: {problems:?}"
+            );
+        }
     }
 
     #[test]

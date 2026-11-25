@@ -306,12 +306,23 @@ pub fn custom(entry: &CustomTheme) -> Result<Palette, String> {
 }
 
 /// The user's own themes, in the order written, and what could not be
-/// read of them (those themes are left out).
+/// read of them (those themes are left out). So is one with the name of
+/// a built-in theme or of an own one before it: a theme is known by its
+/// name (found by it, the next one after it), and of two with one name
+/// only the first would ever be reached.
 pub fn own(entries: &[CustomTheme]) -> (Vec<Palette>, Vec<String>) {
-    let mut themes = Vec::new();
+    let mut themes: Vec<Palette> = Vec::new();
     let mut problems = Vec::new();
     for entry in entries {
         match custom(entry) {
+            Ok(theme) if find(BUILT_IN, &theme.name).is_some() => problems.push(format!(
+                "theme '{}': a built-in theme has that name",
+                theme.name
+            )),
+            Ok(theme) if find(&themes, &theme.name).is_some() => problems.push(format!(
+                "theme '{}': the name is taken twice (the first one counts)",
+                theme.name
+            )),
             Ok(theme) => themes.push(theme),
             Err(problem) => problems.push(problem),
         }
@@ -439,6 +450,36 @@ mod tests {
         assert_eq!(config.palette().name, "mine");
         assert_eq!(config.palette().background, Rgb(255, 255, 255));
         assert_eq!(Config::default().palette(), BUILT_IN[0]);
+    }
+
+    #[test]
+    fn a_name_taken_twice_is_refused_and_the_first_theme_of_it_stays() {
+        let config: Config = toml::from_str(
+            r##"
+            [[themes]]
+            name = "mine"
+            accent = "#111111"
+            [[themes]]
+            name = "Mine "
+            accent = "#222222"
+            [[themes]]
+            name = "NORD"
+            [[themes]]
+            name = "other"
+            "##,
+        )
+        .unwrap();
+        let (themes, problems) = own(&config.themes);
+        assert_eq!(
+            problems,
+            [
+                "theme 'Mine': the name is taken twice (the first one counts)",
+                "theme 'NORD': a built-in theme has that name",
+            ]
+        );
+        let names: Vec<&str> = themes.iter().map(|theme| &*theme.name).collect();
+        assert_eq!(names, ["mine", "other"]);
+        assert_eq!(themes[0].accent, Rgb(0x11, 0x11, 0x11));
     }
 
     #[test]

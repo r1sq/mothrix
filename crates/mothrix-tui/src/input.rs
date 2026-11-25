@@ -144,6 +144,7 @@ impl Input {
     /// Delete the word before the cursor (Ctrl+W).
     pub fn delete_word(&mut self) {
         let chars: Vec<char> = self.text.chars().collect();
+        self.cursor = self.cursor.min(chars.len());
         let mut start = self.cursor;
         while start > 0 && chars[start - 1].is_whitespace() {
             start -= 1;
@@ -158,8 +159,11 @@ impl Input {
     }
 
     /// Replace the chars in `start..end` with `with` and put the cursor
-    /// right after the inserted text.
+    /// right after the inserted text. A range past the end of the text
+    /// (one made for a text that was replaced since) ends with the text:
+    /// the cursor is never left beyond it.
     pub fn replace_range(&mut self, start: usize, end: usize, with: &str) {
+        let start = start.min(self.len_chars());
         let from = self.byte_index(start);
         let to = self.byte_index(end.max(start));
         self.text.replace_range(from..to, with);
@@ -171,7 +175,6 @@ impl Input {
         self.cursor = index.min(self.len_chars());
     }
 
-    /// The text before the cursor.
     /// Move the cursor to the line above, in text with line breaks.
     /// False (and nothing moves) on the first line.
     pub fn line_up(&mut self) -> bool {
@@ -213,6 +216,7 @@ impl Input {
         true
     }
 
+    /// The text before the cursor.
     pub fn before_cursor(&self) -> &str {
         &self.text[..self.byte_index(self.cursor)]
     }
@@ -302,6 +306,28 @@ mod tests {
         input.delete_word();
         assert_eq!(input.text(), "");
         assert_eq!(input.cursor(), 0);
+    }
+
+    #[test]
+    fn a_range_past_the_end_leaves_the_cursor_inside_the_text() {
+        // A range made for a longer text that was replaced since.
+        let mut input = Input::default();
+        input.set("ab");
+        input.replace_range(6, 9, "there");
+        assert_eq!(input.text(), "abthere");
+        assert_eq!(input.cursor(), 7);
+        // Every key after it works on the text that is there.
+        input.delete_word();
+        assert_eq!(input.text(), "");
+        input.set("ab");
+        input.replace_range(6, 9, "");
+        input.insert('c');
+        input.backspace();
+        input.delete();
+        input.line_up();
+        input.line_down();
+        assert_eq!((input.text(), input.cursor()), ("ab", 2));
+        assert_eq!(input.before_cursor(), "ab");
     }
 
     #[test]

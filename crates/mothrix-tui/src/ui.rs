@@ -37,6 +37,8 @@ use crate::{
 };
 
 const MAX_COMPOSER_ROWS: usize = 5;
+/// Shown in place of a dialog the terminal has no room for.
+pub(crate) const TOO_SMALL: &str = " Terminal too small for this dialog: enlarge it, or Esc ";
 const JUMP_LABEL: &str = " ↓ jump to newest ";
 const POLL_BUTTON: &str = " + poll ";
 const FILE_BUTTON: &str = " + file ";
@@ -139,7 +141,11 @@ fn unsafe_on_screen(c: char) -> bool {
 /// where it closes that way), never to what is underneath.
 fn draw_overlays(frame: &mut Frame, app: &mut App, area: Rect) {
     let overlays: Vec<Overlay> = app.overlays.iter().cloned().collect();
+    app.overlay_unseen = false;
     for overlay in overlays {
+        // What the last one drawn (the one on top, which gets the keys)
+        // says counts.
+        app.overlay_unseen = false;
         app.hits.push(Hit {
             rect: area,
             action: if overlay.closes_on_outside_click() {
@@ -167,6 +173,26 @@ fn draw_overlays(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// The terminal is too small for the dialog on top (or for all it has to
+/// show before it is answered): say so in the middle of the screen, and
+/// tell the app, which then gives the dialog no key but Esc. A dialog
+/// nobody sees must not take an Enter as its answer.
+fn unseen(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.overlay_unseen = true;
+    let style = Style::new()
+        .fg(app.theme.selection_fg)
+        .bg(app.theme.selection_bg);
+    let text = fit(TOO_SMALL, area.width as usize);
+    let row = Rect {
+        y: area.y + area.height / 2,
+        height: 1.min(area.height),
+        width: (text.width() as u16).min(area.width),
+        ..area
+    };
+    put(frame, Clear, row);
+    put(frame, Paragraph::new(Span::styled(text, style)), row);
+}
+
 fn panel<'a>(theme: &Theme, focused: bool) -> Block<'a> {
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -174,7 +200,17 @@ fn panel<'a>(theme: &Theme, focused: bool) -> Block<'a> {
 }
 
 /// Cut `text` to at most `width` terminal cells, marking the cut with `…`.
+/// A tab or a line end in it (a name, a topic, a line of a message)
+/// becomes a space: the terminal library draws no control character, and
+/// the words on both sides of it would stand together.
 fn fit(text: &str, width: usize) -> String {
+    let spaced;
+    let text = if text.contains(['\t', '\n', '\r']) {
+        spaced = text.replace(['\t', '\n', '\r'], " ");
+        spaced.as_str()
+    } else {
+        text
+    };
     if text.width() <= width {
         return text.to_owned();
     }
@@ -1040,18 +1076,15 @@ fn draw_composer(frame: &mut Frame, app: &mut App, area: Rect) {
             .add_modifier(Modifier::UNDERLINED),
         _ => normal,
     };
-    let within = |marks: &[(usize, usize)], index: usize| {
-        marks
-            .iter()
-            .any(|(start, end)| (*start..*end).contains(&index))
-    };
-    let kind_at = |index: usize| {
-        if within(&app.misspelled, index) {
-            1
-        } else if within(&app.grammar_marks, index) {
-            2
-        } else {
-            0
+    let mut misspelled = Marks::new(&app.misspelled);
+    let mut grammar = Marks::new(&app.grammar_marks);
+    let mut kind_at = |index: usize| {
+        // Both are asked, each character in turn (see `Marks`).
+        let (misspelled, grammar) = (misspelled.at(index), grammar.at(index));
+        match (misspelled, grammar) {
+            (true, _) => 1,
+            (false, true) => 2,
+            (false, false) => 0,
         }
     };
     let mut char_index = 0;
@@ -1105,6 +1138,42 @@ pub fn composer_index_at(text: &str, width: u16, row: usize, column: u16) -> usi
         within += 1;
     }
     before + within
+}
+
+/// The marked stretches of the message box (char ranges), asked about one
+/// character after the other: each mark is looked at once for the whole
+/// text, not once per character and frame.
+struct Marks {
+    /// By where they start.
+    marks: Vec<(usize, usize)>,
+    /// How many of them start at or before the character asked about last.
+    begun: usize,
+    /// Where the longest of those ends.
+    until: usize,
+}
+
+impl Marks {
+    fn new(marks: &[(usize, usize)]) -> Self {
+        let mut marks = marks.to_vec();
+        marks.sort_unstable();
+        Self {
+            marks,
+            begun: 0,
+            until: 0,
+        }
+    }
+
+    /// Whether the character at `index` is in a mark. `index` must not
+    /// be smaller than the one asked about before.
+    fn at(&mut self, index: usize) -> bool {
+        while let Some((start, end)) = self.marks.get(self.begun).copied()
+            && start <= index
+        {
+            self.until = self.until.max(end);
+            self.begun += 1;
+        }
+        index < self.until
+    }
 }
 
 use mothrix_core::art::{MOTH, MOTH_WIDTH, Part};
@@ -1208,6 +1277,12 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect, state: VerifyState)
     let text = Style::new().fg(theme.fg);
     let dim = Style::new().fg(theme.dim);
 
+    // The room the dialog can have: its border and the margin taken off.
+    let width = 58.min(area.width.saturating_sub(2));
+    let inner_height = area.height.saturating_sub(4);
+    let body_width = width.saturating_sub(6);
+    let mut all_shown = true;
+
     let mut lines: Vec<Line> = vec![Line::default()];
     let buttons: Vec<(&str, VerifyInput)> = match &state {
         VerifyState::Incoming { device } => {
@@ -1237,22 +1312,53 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect, state: VerifyState)
                 "Do both devices show these emoji, in this order?",
                 text,
             )));
-            lines.push(Line::default());
-            // One to a line; on a low terminal several, so that all seven
-            // are there to compare before "They match" is offered.
-            let per_line = if area.height >= 16 { 1 } else { 4 };
-            for row in emojis.chunks(per_line) {
-                let mut spans = Vec::new();
-                for (symbol, name) in row {
-                    spans.push(Span::raw(format!("   {symbol}  ")));
-                    spans.push(Span::styled(name.clone(), text));
+            // One to a line; on a low terminal as many as a line holds.
+            // "They match" is offered (and Enter taken, see `unseen`)
+            // only when all of them are there to compare, whole.
+            let rows = usize::from(inner_height);
+            let one_each = verify_emoji_rows(emojis, usize::from(body_width), true);
+            let flowed = verify_emoji_rows(emojis, usize::from(body_width), false);
+            // With the empty lines around them, or without on the lowest.
+            let (shown, spaced) = match (one_each, flowed) {
+                (Some(each), _) if each.len() + 5 <= rows => (Some(each), true),
+                (_, Some(flowed)) if flowed.len() + 5 <= rows => (Some(flowed), true),
+                (_, Some(flowed)) if flowed.len() + 2 <= rows => (Some(flowed), false),
+                _ => (None, false),
+            };
+            match shown {
+                Some(shown) => {
+                    if spaced {
+                        lines.push(Line::default());
+                    } else {
+                        lines.remove(0);
+                    }
+                    for row in shown {
+                        let mut spans = Vec::new();
+                        for (symbol, name) in row {
+                            spans.push(Span::raw(format!("   {symbol}  ")));
+                            spans.push(Span::styled(name.clone(), text));
+                        }
+                        lines.push(Line::from(spans));
+                    }
+                    vec![
+                        ("Enter They match", VerifyInput::Confirm),
+                        ("Esc They differ", VerifyInput::Cancel),
+                    ]
                 }
-                lines.push(Line::from(spans));
+                None => {
+                    all_shown = false;
+                    lines.remove(0);
+                    lines.push(Line::from(Span::styled(
+                        "The terminal is too small to show them all:",
+                        Style::new().fg(theme.error),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "enlarge it to compare.",
+                        Style::new().fg(theme.error),
+                    )));
+                    vec![("Esc Cancel", VerifyInput::Cancel)]
+                }
             }
-            vec![
-                ("Enter They match", VerifyInput::Confirm),
-                ("Esc They differ", VerifyInput::Cancel),
-            ]
         }
         VerifyState::Confirming => {
             lines.push(Line::from(Span::styled(
@@ -1283,11 +1389,12 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect, state: VerifyState)
     };
     lines.push(Line::default());
 
-    let width = 58.min(area.width.saturating_sub(2));
     let height = (lines.len() as u16 + 3).min(area.height.saturating_sub(2));
     if width < 30 || height < 6 {
-        return;
+        return unseen(frame, app, area);
     }
+    // Shown, but not all of what is to be compared: nothing to confirm.
+    app.overlay_unseen = !all_shown;
     let rect = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -1334,6 +1441,35 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect, state: VerifyState)
         column += label_width + 2;
     }
     put(frame, Paragraph::new(Line::from(spans)), button_row);
+}
+
+/// The emoji to compare as lines of at most `width` cells: one to a line,
+/// or as many as fit. None when one of them does not fit whole.
+fn verify_emoji_rows(
+    emojis: &[(String, String)],
+    width: usize,
+    one_each: bool,
+) -> Option<Vec<Vec<&(String, String)>>> {
+    let mut rows: Vec<Vec<&(String, String)>> = Vec::new();
+    let mut used = 0;
+    for emoji in emojis {
+        // As drawn: three cells, the symbol, two cells, the name.
+        let cells = 5 + emoji.0.width() + emoji.1.width();
+        if cells > width {
+            return None;
+        }
+        match rows.last_mut() {
+            Some(row) if !one_each && used + cells <= width => {
+                row.push(emoji);
+                used += cells;
+            }
+            _ => {
+                rows.push(vec![emoji]);
+                used = cells;
+            }
+        }
+    }
+    Some(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,6 +1604,7 @@ fn dialog(
     let width = width.min(area.width.saturating_sub(2));
     let height = height.min(area.height.saturating_sub(2));
     if width < 30 || height < 6 {
+        unseen(frame, app, area);
         return None;
     }
     let rect = Rect {
@@ -1964,7 +2101,7 @@ fn draw_format_menu(frame: &mut Frame, app: &mut App, area: Rect, menu: crate::a
     let width = (rows[0].1.width() + example_width + 3) as u16;
     let height = rows.len() as u16 + 2;
     if area.width < width || area.height < height {
-        return;
+        return unseen(frame, app, area);
     }
     // Above the button (the message box is at the bottom), else below.
     // (Where the button was when the menu opened: the terminal may have
@@ -2121,7 +2258,8 @@ fn draw_forward(frame: &mut Frame, app: &mut App, area: Rect, forward: Forward) 
     frame.set_cursor_position((inner.x + 3 + column, inner.y));
 
     let rows = inner.height.saturating_sub(4) as usize;
-    let first = forward.cursor.saturating_sub(rows.saturating_sub(1));
+    let cursor = app.forward_cursor();
+    let first = cursor.unwrap_or(0).saturating_sub(rows.saturating_sub(1));
     for (offset, (index, (name, is_dm, room_id))) in targets
         .iter()
         .enumerate()
@@ -2135,7 +2273,7 @@ fn draw_forward(frame: &mut Frame, app: &mut App, area: Rect, forward: Forward) 
             ..inner
         };
         let mut style = Style::new().fg(theme.fg);
-        if index == forward.cursor {
+        if Some(index) == cursor {
             style = style.bg(theme.selection_bg).fg(theme.selection_fg);
         }
         let icon = if *is_dm { "@" } else { "#" };
@@ -2481,7 +2619,7 @@ fn draw_room_menu(frame: &mut Frame, app: &mut App, area: Rect, menu: RoomMenu) 
         + 4;
     let height = rows.len() as u16 + 2;
     if area.width < width || area.height < height {
-        return;
+        return unseen(frame, app, area);
     }
     let rect = Rect {
         // Just below the click, so the room stays in view.
@@ -2981,12 +3119,10 @@ mod tests {
             !screen.contains(|c: char| c != '\n' && unsafe_on_screen(c)),
             "{screen:?}"
         );
-        // The text around them stays (ratatui 0.30 leaves them out itself;
+        // The text around them stays, a tab or line end as a space
+        // (`fit`; ratatui 0.30 leaves control characters out itself, and
         // `scrub` is what makes sure, whatever a widget does).
-        assert!(
-            screen.contains("abc") || screen.contains("a b c"),
-            "{screen}"
-        );
+        assert!(screen.contains("a b c"), "{screen}");
     }
 
     #[test]
@@ -3047,6 +3183,123 @@ mod tests {
             }
             assert!(screen.contains("They match"), "{screen}");
         }
+    }
+
+    #[test]
+    fn they_match_is_offered_and_taken_only_with_all_seven_emoji_shown_whole() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let names = ["Dog", "Cat", "Lion", "Horse", "Unicorn", "Pig", "Elephant"];
+        let confirms =
+            |commands: &[Command]| matches!(commands, [Command::Verify(VerifyInput::Confirm)]);
+        let mut offered = 0;
+        for width in [100, 60, 40, 34, 30] {
+            for height in 3..=20 {
+                let mut app = sample();
+                app.on_update(Update::Verify(Some(VerifyState::Emojis(
+                    names
+                        .iter()
+                        .map(|name| ("*".to_owned(), (*name).to_owned()))
+                        .collect(),
+                ))));
+                let screen = render_to_text(&mut app, width, height);
+                let offers = screen.contains("They match");
+                if offers {
+                    offered += 1;
+                    for name in names {
+                        assert!(
+                            screen.contains(&format!("*  {name}")),
+                            "{width}x{height}, {name}: {screen}"
+                        );
+                    }
+                } else {
+                    assert!(screen.contains("too small"), "{width}x{height}: {screen}");
+                }
+                // Enter confirms just when the screen offers it.
+                let commands = app.on_event(Event::Key(KeyEvent::from(KeyCode::Enter)));
+                assert_eq!(confirms(&commands), offers, "{width}x{height}: {screen}");
+                // Esc always says no.
+                let commands = app.on_event(Event::Key(KeyEvent::from(KeyCode::Esc)));
+                assert!(
+                    matches!(&commands[..], [Command::Verify(VerifyInput::Cancel)]),
+                    "{width}x{height}: {commands:?}"
+                );
+            }
+        }
+        // 8 and 9 rows were the ones with the buttons over the emoji.
+        assert!(offered > 20, "{offered}");
+        let mut app = sample();
+        app.on_update(Update::Verify(Some(VerifyState::Emojis(
+            names
+                .iter()
+                .map(|name| ("*".to_owned(), (*name).to_owned()))
+                .collect(),
+        ))));
+        assert!(render_to_text(&mut app, 100, 9).contains("They match"));
+    }
+
+    #[test]
+    fn a_dialog_the_terminal_has_no_room_for_takes_esc_only_and_says_so() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let key = |code| Event::Key(KeyEvent::from(code));
+        // "Sign out?" of the accounts dialog.
+        let mut app = sample();
+        let mut second = app.state.accounts[0].clone();
+        second.profile = "work".into();
+        app.state.accounts.push(second);
+        app.overlays.open(AccountsDialog {
+            cursor: 1,
+            mode: crate::app::AccountsMode::Remove,
+        });
+        let screen = render_to_text(&mut app, 100, 7);
+        assert!(screen.contains("Terminal too small"), "{screen}");
+        app.on_event(key(KeyCode::Enter));
+        app.on_event(key(KeyCode::Char('y')));
+        assert_eq!(app.take_account_request(), None);
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("too small"))
+        );
+        // Esc still backs out of it.
+        app.on_event(key(KeyCode::Esc));
+        assert!(matches!(
+            app.overlays
+                .get::<AccountsDialog>()
+                .map(|dialog| &dialog.mode),
+            None | Some(crate::app::AccountsMode::List)
+        ));
+
+        // Large enough again: the answer counts.
+        let mut app = sample();
+        let mut second = app.state.accounts[0].clone();
+        second.profile = "work".into();
+        app.state.accounts.push(second);
+        app.overlays.open(AccountsDialog {
+            cursor: 1,
+            mode: crate::app::AccountsMode::Remove,
+        });
+        render_to_text(&mut app, 30, 24);
+        app.on_event(key(KeyCode::Enter));
+        assert_eq!(app.take_account_request(), None);
+        render_to_text(&mut app, 100, 24);
+        app.on_event(key(KeyCode::Enter));
+        assert!(app.take_account_request().is_some());
+
+        // The recovery key and the identity reset.
+        let mut app = sample();
+        app.on_update(Update::RecoveryKey("EsTc 1234".into()));
+        render_to_text(&mut app, 100, 6);
+        app.on_event(key(KeyCode::Enter));
+        assert!(app.overlays.is_open::<RecoveryKey>());
+        let mut app = sample();
+        let mut prompt = crate::input::Input::default();
+        prompt.set("password");
+        app.overlays.open(ResetPrompt(prompt));
+        render_to_text(&mut app, 31, 20);
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert!(app.overlays.is_open::<ResetPrompt>());
+        app.on_event(key(KeyCode::Esc));
+        assert!(!app.overlays.is_open::<ResetPrompt>());
     }
 
     #[test]
@@ -3511,7 +3764,7 @@ mod tests {
         app.overlays.open(crate::app::Forward {
             event_id: "4".into(),
             filter: Default::default(),
-            cursor: 0,
+            on: None,
         });
         render_to_text(&mut app, 100, 24);
         let rect = app
@@ -4005,6 +4258,50 @@ mod tests {
         assert_eq!((row, col), (1, 0));
         let (_, row, col) = composer_layout("abcdefgh", 2, 5);
         assert_eq!((row, col), (0, 2));
+    }
+
+    #[test]
+    fn marks_asked_in_turn_say_what_looking_at_each_of_them_says() {
+        // Overlapping, touching, empty, out of order, as LanguageTool's
+        // findings can be.
+        let marks = [
+            (12, 15),
+            (2, 5),
+            (4, 9),
+            (9, 10),
+            (20, 20),
+            (30, 31),
+            (2, 3),
+        ];
+        let mut asked = Marks::new(&marks);
+        for index in 0..40 {
+            let naive = marks
+                .iter()
+                .any(|(start, end)| (*start..*end).contains(&index));
+            assert_eq!(asked.at(index), naive, "{index}");
+        }
+        assert!(!Marks::new(&[]).at(0));
+    }
+
+    #[test]
+    fn a_tab_in_a_message_or_a_name_shows_as_space() {
+        let mut app = sample();
+        app.state.rooms[0].name = "Lunch\tClub".into();
+        open_lunch(&mut app);
+        app.on_update(Update::Timeline {
+            room_id: "!lunch".into(),
+            items: vec![message(
+                "1",
+                "Amy",
+                "Name\tAge\n- Amy\t31",
+                1_700_000_000_000,
+            )],
+        });
+        let screen = render_to_text(&mut app, 100, 24);
+        assert!(screen.contains("Name    Age"), "{screen}");
+        assert!(screen.contains("• Amy    31"), "{screen}");
+        assert!(screen.contains("Lunch Club"), "{screen}");
+        assert_eq!(fit("a\tb", 10), "a b");
     }
 
     #[test]

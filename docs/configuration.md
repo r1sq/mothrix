@@ -85,7 +85,9 @@ senders = ["#00ffcc", "#ffee00", "#ff00aa"]   # error, success; names of people
 
 The built-in themes are `mothrix`, `tokyo-night`, `catppuccin`,
 `gruvbox`, `nord`, `everforest` and `rose-pine`. `Ctrl+T` goes through
-them all, yours included.
+them all, yours included. A theme of yours needs a name of its own: one
+called like a built-in theme, or like another of yours before it, is left
+out, and the status bar says so at the start.
 
 ## Your own keys
 
@@ -100,5 +102,8 @@ settings = "f9"
 Shortcuts that can get another key: `quit`, `find_room`, `search`,
 `settings`, `accounts`, `unread`, `emoji`, `format`, `theme`, `paste`,
 `previous_room`, `next_room`, `switch_pane`, `scroll_up`. A key needs
-Ctrl or Alt, or is an F key, so that typing stays possible. A mistake in
-these entries is named in the status bar at the start.
+Ctrl or Alt, or is an F key, so that typing stays possible, and it must
+not be one that does something already: another shortcut's key, one that
+edits the text (`Ctrl+A`, `Ctrl+E`, `Ctrl+U`, `Ctrl+W`), `F1` (help),
+`Ctrl+C` (quit) or `Alt+Enter` (a new line). A mistake in these entries
+is named in the status bar at the start.

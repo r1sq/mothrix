@@ -31,6 +31,7 @@ const ROOM_LIST: &[(&str, &str)] = &[
     ("l", "low priority, or normal"),
     ("i", "the room's info"),
     ("M", "change its notifications"),
+    ("U", "only unread chats, or all"),
     ("s", "sort: recent, name, unread first"),
     ("a", "go through the accounts"),
     ("m", "rooms and people in one list, or two"),
@@ -72,7 +73,10 @@ const MESSAGE: &[(&str, &str)] = &[
 
 const MESSAGE_BOX: &[(&str, &str)] = &[
     ("Enter", "send"),
-    ("Alt+Enter", "a new line"),
+    (
+        "Alt+Enter  Shift+Enter",
+        "a new line (Shift+Enter where the terminal tells it from Enter)",
+    ),
     (
         "@name",
         "suggests members: ↑ ↓ choose, Tab or Enter completes",
@@ -201,6 +205,7 @@ impl App {
             }
             lines.push(entry(&keys, shortcut(name)));
         }
+        lines.push(entry("Ctrl+C", "quit, as Ctrl+Q does"));
         lines.push(entry("Esc", "close a dialog"));
         for (section, entries) in [
             ("In the room list", ROOM_LIST),
@@ -321,6 +326,22 @@ mod tests {
                 "{} is not in the help",
                 action.key
             );
+        }
+    }
+
+    #[test]
+    fn the_keys_and_commands_with_a_second_name_are_in_the_help_too() {
+        let app = App::new(theme::THEMES[0], "@me:x".into());
+        let help = text(&app);
+        for wanted in [
+            "/upload",
+            "/q)",
+            "/verify [who] |",
+            "U | only unread",
+            "Ctrl+C | quit",
+            "Shift+Enter",
+        ] {
+            assert!(help.contains(wanted), "{wanted} is not in the help");
         }
     }
 

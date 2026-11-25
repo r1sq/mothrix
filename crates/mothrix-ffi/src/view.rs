@@ -1108,6 +1108,13 @@ impl View {
     fn open(&mut self, room: String) -> Vec<Command> {
         // Again: out of a thread, back to the room.
         let opening = self.state.open(&room);
+        // An invitation is not joined by one tap (on the list, or on the
+        // notification "X invited you"): the second one joins.
+        if let Opening::Invitation { name } = &opening {
+            self.notice(format!(
+                "{name} is an invitation: open it again to join it."
+            ));
+        }
         if let Opening::Opened { .. } = opening {
             self.pictures.clear();
             self.events.push(Event::Timeline {

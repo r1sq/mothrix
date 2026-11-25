@@ -126,7 +126,11 @@ With
 .BR \-\-snapshot :
 send
 .I TEXT
-into the opened room as a message. It is really sent. A text starting
+into the room that
+.B \-\-room
+names as a message. It is really sent, so without
+.B \-\-room
+mothrix refuses and ends. A text starting
 with
 .B keys:
 is not sent but pressed as keys: words are typed, names in angle brackets
@@ -170,7 +174,7 @@ The emoji picker: search every emoji and put one into the message box.
 .BR Alt+Up ", " Alt+Down
 Previous and next room.
 .TP
-.B Ctrl+Q
+.BR Ctrl+Q ", " Ctrl+C
 Quit.
 .PP
 Typing

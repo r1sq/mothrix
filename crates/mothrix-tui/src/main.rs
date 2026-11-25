@@ -117,9 +117,10 @@ Usage:
                                         without a keyboard: sync that long, print
                                         the screen as text and end. --room names
                                         the room to open (else the first one);
-                                        --say SENDS its text there as a message
-                                        (\"keys:...\" presses keys instead);
-                                        --size is the screen's (110x36)
+                                        --say (only with --room) SENDS its text
+                                        there as a message (\"keys:...\" presses
+                                        keys instead); --size is the screen's
+                                        (110x36)
   mothrix --help | --version
 
 Inside mothrix (F1 or ? shows every key and command):
@@ -133,9 +134,10 @@ Inside mothrix (F1 or ? shows every key and command):
   F5           all emoji: search, pick one for the message box
   F6           format the word or line at the cursor (bold, code, lists …)
   PgUp/PgDn    scroll the conversation Ctrl+T        next colour theme
-  Enter        open room / send        Ctrl+Q        quit
+  Enter        open room / send        Ctrl+Q, Ctrl+C  quit
   room list    p pin, l low priority, s sort, i room info, M notifications,
-               m mix rooms and people, g section, z fold, a accounts
+               m mix rooms and people, g section, z fold, a accounts,
+               U only unread chats
   messages     Up from the message box selects one; then r reply, a react,
                c copy, e edit, d delete, o open, t thread, p pin, f forward,
                u first new message, x more (long text, all who reacted);
@@ -357,7 +359,23 @@ fn parse_args() -> Result<Option<Args>> {
             other => bail!("unknown argument '{other}' (try --help)"),
         }
     }
+    if let Mode::Snapshot { room, say, .. } = &mode {
+        said_into_a_named_room(room.as_deref(), say.as_deref())?;
+    }
     Ok(Some(Args { profile, mode }))
+}
+
+/// `--say` sends a real message (or presses keys that can): only into a
+/// room that `--room` names. Without a name the first room of the list
+/// would be opened, whichever that is today.
+fn said_into_a_named_room(room: Option<&str>, say: Option<&str>) -> Result<()> {
+    let named = room.is_some_and(|room| room.split('>').all(|name| !name.trim().is_empty()));
+    if say.is_some() && !named {
+        bail!(
+            "--say needs --room NAME: the room its text is sent into (or its keys are pressed in)"
+        );
+    }
+    Ok(())
 }
 
 /// Close the folders with drafts and opened attachments to other users of
@@ -993,10 +1011,14 @@ fn restart(version: &str, installed: update::Installed) {
     }
 }
 
-/// The signals that ask a program to end: SIGTERM and SIGHUP.
+/// The signals that ask a program to end: SIGTERM and SIGHUP, and SIGINT
+/// and SIGQUIT, which the keyboard does not send while mothrix has the
+/// terminal (Ctrl+C comes as a key) but `kill -INT` does. Left to
+/// themselves they end the program where it stands: the terminal stays
+/// as mothrix set it up, and what was being written is not saved.
 struct EndSignals {
     #[cfg(unix)]
-    signals: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+    signals: Vec<tokio::signal::unix::Signal>,
 }
 
 impl EndSignals {
@@ -1005,9 +1027,15 @@ impl EndSignals {
         {
             use tokio::signal::unix::{SignalKind, signal};
             Self {
-                signals: signal(SignalKind::terminate())
-                    .and_then(|terminate| Ok((terminate, signal(SignalKind::hangup())?)))
-                    .ok(),
+                signals: [
+                    SignalKind::terminate(),
+                    SignalKind::hangup(),
+                    SignalKind::interrupt(),
+                    SignalKind::quit(),
+                ]
+                .into_iter()
+                .filter_map(|kind| signal(kind).ok())
+                .collect(),
             }
         }
         #[cfg(not(unix))]
@@ -1017,12 +1045,19 @@ impl EndSignals {
     /// Comes back when one arrived; never, where there are none.
     async fn next(&mut self) {
         #[cfg(unix)]
-        if let Some((terminate, hangup)) = &mut self.signals {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = hangup.recv() => {}
-            }
-            return;
+        if !self.signals.is_empty() {
+            return std::future::poll_fn(|context| {
+                let arrived = self
+                    .signals
+                    .iter_mut()
+                    .any(|signal| signal.poll_recv(context).is_ready());
+                if arrived {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
         }
         std::future::pending::<()>().await;
     }
@@ -1105,14 +1140,25 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
         });
     }
 
+    // Asked to end from outside (the terminal's window closed, `kill`):
+    // as with a quit, drafts are saved and the terminal is put right.
+    // Listened for before the terminal is changed, so that none of them
+    // ends the program with a terminal left as it is.
+    let mut asked_to_end = EndSignals::new();
+    let mut ended = false;
+
     enable_raw_mode()?;
-    execute!(
+    // A terminal that takes the first but not the rest is put back too.
+    if let Err(error) = execute!(
         stdout(),
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste,
         EnableFocusChange
-    )?;
+    ) {
+        restore_terminal();
+        return Err(error.into());
+    }
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // The screen's own thread: the program ends, on a terminal put
@@ -1133,11 +1179,6 @@ async fn run_tui(clients: Vec<(String, Client)>, paths: &Paths) -> Result<()> {
             return Err(error.into());
         }
     };
-    // Asked to end from outside (the terminal's window closed, `kill`):
-    // as with a quit, drafts are saved and the terminal is put right.
-    let mut asked_to_end = EndSignals::new();
-    let mut ended = false;
-
     let mut events = EventStream::new();
     let mut clicks = notify::ClickReader::default();
     let (toast_clicks, mut toast_clicked) = tokio::sync::mpsc::unbounded_channel();
@@ -1522,4 +1563,45 @@ fn script_keys(script: &str) -> std::collections::VecDeque<Event> {
         keys.push_back(press(code, KeyModifiers::NONE));
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn say_is_refused_without_a_room_to_say_it_in() {
+        assert!(said_into_a_named_room(None, None).is_ok());
+        assert!(said_into_a_named_room(Some("lunch"), None).is_ok());
+        assert!(said_into_a_named_room(Some("lunch"), Some("hello")).is_ok());
+        assert!(said_into_a_named_room(Some("work/>admin"), Some("keys:<f1>")).is_ok());
+        // No name, or one that every room matches: the first of the list.
+        for room in [None, Some(""), Some(" "), Some("lunch>"), Some(">lunch")] {
+            for say in ["hello", "keys:hello <enter>"] {
+                let refused = said_into_a_named_room(room, Some(say));
+                assert!(
+                    refused.is_err_and(|error| error.to_string().contains("--room")),
+                    "{room:?} {say}"
+                );
+            }
+        }
+    }
+
+    /// `kill -INT` and `kill -QUIT` from outside are heard like SIGTERM
+    /// (the loop then saves the drafts and puts the terminal right);
+    /// unheard, either ends the program, and this test with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_and_quit_from_outside_ask_to_end() {
+        let mut asked_to_end = EndSignals::new();
+        for signal in ["-INT", "-QUIT", "-TERM"] {
+            let sent = std::process::Command::new("kill")
+                .args([signal, &std::process::id().to_string()])
+                .status();
+            assert!(sent.is_ok_and(|status| status.success()), "kill {signal}");
+            tokio::time::timeout(Duration::from_secs(10), asked_to_end.next())
+                .await
+                .unwrap_or_else(|_| panic!("{signal} was not heard"));
+        }
+    }
 }
