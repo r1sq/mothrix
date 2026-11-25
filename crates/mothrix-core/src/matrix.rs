@@ -1798,7 +1798,7 @@ struct Attachment {
 
 impl Attachment {
     async fn prepare(path: &str, caption: Option<String>) -> Result<Self> {
-        let path = expand_home(path);
+        let path = crate::folders::expand_home(path);
         let metadata =
             std::fs::metadata(&path).with_context(|| format!("cannot read {}", path.display()))?;
         if !metadata.is_file() {
@@ -3353,16 +3353,6 @@ fn picture_details(path: &Path, bytes: u64) -> Option<(BaseImageInfo, Option<Thu
         data,
     };
     Some((info, Some(thumbnail)))
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    let path = path.trim();
-    match path.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir()
-            .map(|home| home.join(rest))
-            .unwrap_or_else(|| path.into()),
-        None => path.into(),
-    }
 }
 
 /// A message ready to send: plain text, optional HTML, and who is mentioned.

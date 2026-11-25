@@ -1417,6 +1417,12 @@ impl App {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key, &mut commands),
             Event::Mouse(mouse) => self.on_mouse(mouse, &mut commands),
             Event::Paste(text) if self.overlay_paste(&text) => {}
+            // Typing the room list's filter: the text is part of it.
+            Event::Paste(text) if self.filtering && self.focus == Focus::Sidebar => {
+                let line = text.split(['\r', '\n']).collect::<Vec<_>>().join(" ");
+                self.filter.insert_str(line.trim());
+                self.snap_cursor_to_filter();
+            }
             Event::Paste(text) => {
                 self.focus = Focus::Composer;
                 // Dropping a file onto the terminal pastes its path.
@@ -1851,11 +1857,9 @@ impl App {
                 "file" | "upload" if !argument.trim().is_empty() => {
                     if let Some((room_id, thread)) = self.state.conversation() {
                         self.viewport.follow_newest();
-                        // "/file picture.png | what it shows"
-                        let (path, caption) = match argument.split_once(" | ") {
-                            Some((path, caption)) => (path, caption.trim()),
-                            None => (argument, ""),
-                        };
+                        let (path, caption) = file_and_caption(argument, |path| {
+                            mothrix_core::folders::expand_home(path).is_file()
+                        });
                         commands.push(Command::SendFile {
                             room_id,
                             thread,
@@ -2271,6 +2275,23 @@ pub fn parse_poll(argument: &str) -> Result<(String, Vec<String>, bool, bool), S
     }
     let (question, answers) = crate::message::new_poll(&question, &answers)?;
     Ok((question, answers, multiple, hidden))
+}
+
+/// `/file`'s argument as path and caption: "picture.png | what it shows".
+/// A file whose name has " | " in it is taken whole (or up to the " | "
+/// where a file ends), so that it is not cut into a path and a caption.
+fn file_and_caption(argument: &str, is_file: impl Fn(&str) -> bool) -> (&str, &str) {
+    let argument = argument.trim();
+    if argument.contains(" | ") && !is_file(argument) {
+        let splits: Vec<usize> = argument.match_indices(" | ").map(|(at, _)| at).collect();
+        let at = splits
+            .iter()
+            .rev()
+            .find(|&&at| is_file(&argument[..at]))
+            .unwrap_or(&splits[0]);
+        return (argument[..*at].trim(), argument[*at + 3..].trim());
+    }
+    (argument, "")
 }
 
 #[cfg(test)]
@@ -3398,6 +3419,30 @@ mod tests {
     }
 
     #[test]
+    fn text_pasted_while_filtering_goes_into_the_filter() {
+        let mut app = app();
+        app.on_event(ctrl('k'));
+        app.on_event(Event::Paste("am\ny".into()));
+        assert_eq!(app.filter.text(), "am y");
+        assert!(app.composer.is_empty());
+        app.on_event(key(KeyCode::Backspace));
+        app.on_event(key(KeyCode::Backspace));
+        assert_eq!(
+            app.sidebar_rows(),
+            [
+                SidebarRow::Header {
+                    title: "PEOPLE".into()
+                },
+                SidebarRow::Room { index: 1 }
+            ]
+        );
+        // Not filtering: a paste is for the message box.
+        app.on_event(key(KeyCode::Esc));
+        app.on_event(Event::Paste("hello".into()));
+        assert_eq!(app.composer.text(), "hello");
+    }
+
+    #[test]
     fn typing_and_enter_sends_to_the_open_room() {
         let mut app = chat();
         type_text(&mut app, "hi there");
@@ -3760,6 +3805,27 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn a_file_named_with_a_bar_is_not_cut_into_a_caption() {
+        let files = ["a | b.png", "x.png"];
+        let is_file = |path: &str| files.contains(&path);
+        assert_eq!(file_and_caption("x.png", is_file), ("x.png", ""));
+        assert_eq!(
+            file_and_caption("x.png | what it shows", is_file),
+            ("x.png", "what it shows")
+        );
+        assert_eq!(file_and_caption("a | b.png", is_file), ("a | b.png", ""));
+        assert_eq!(
+            file_and_caption("a | b.png | a | caption", is_file),
+            ("a | b.png", "a | caption")
+        );
+        // No such file: the first bar, as typed, and the backend says so.
+        assert_eq!(
+            file_and_caption("no.png | c | d", is_file),
+            ("no.png", "c | d")
+        );
     }
 
     #[test]

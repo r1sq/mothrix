@@ -37,7 +37,6 @@ pub const SIGNATURE: &str = "release.json.sig";
 /// The key releases are signed with (base64), empty until one is made.
 const KEY: &str = include_str!("release_key.pub");
 
-const MAX_API: usize = 1 << 20;
 const MAX_MANIFEST: usize = 64 << 10;
 const MAX_SIGNATURE: usize = 1 << 10;
 const MAX_FILE: usize = 256 << 20;
@@ -103,6 +102,8 @@ pub struct Available {
 pub trait Fetch {
     /// The body at `url`; an error past `limit` bytes.
     fn get(&self, url: &str, limit: usize) -> impl Future<Output = Result<Vec<u8>>> + Send;
+    /// Where `url` leads after its redirects (asked with HEAD).
+    fn lands(&self, url: &str) -> impl Future<Output = Result<String>> + Send;
 }
 
 /// Fetching with the client of the config (its proxy).
@@ -118,10 +119,7 @@ impl Fetch for Http {
             .client
             .get(url)
             .header("User-Agent", &self.agent)
-            .header(
-                "Accept",
-                "application/vnd.github+json, application/octet-stream",
-            );
+            .header("Accept", "application/octet-stream");
         let url = url.to_owned();
         async move {
             let mut response = request
@@ -139,12 +137,27 @@ impl Fetch for Http {
             Ok(body)
         }
     }
+
+    fn lands(&self, url: &str) -> impl Future<Output = Result<String>> + Send {
+        let request = self.client.head(url).header("User-Agent", &self.agent);
+        let url = url.to_owned();
+        async move {
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("could not reach {url}"))?
+                .error_for_status()?;
+            Ok(response.url().to_string())
+        }
+    }
 }
 
 /// Where the releases of `repository` (`https://github.com/owner/name`)
-/// are, for the API and for downloads.
+/// are: the latest (a redirect to its page, which GitHub does not limit
+/// as it limits its API to 60 questions an hour for an address), the
+/// downloads and the pages.
 struct Releases {
-    api: String,
+    latest: String,
     download: String,
     page: String,
 }
@@ -156,7 +169,7 @@ impl Releases {
             .strip_prefix("https://github.com/")
             .ok_or_else(|| anyhow!("updates come from GitHub, not {repository}"))?;
         Ok(Self {
-            api: format!("https://api.github.com/repos/{path}/releases/latest"),
+            latest: format!("https://github.com/{path}/releases/latest"),
             download: format!("https://github.com/{path}/releases/download"),
             page: format!("https://github.com/{path}/releases/tag"),
         })
@@ -182,13 +195,17 @@ pub async fn check(
     key: &VerifyingKey,
 ) -> Result<Option<Available>> {
     let releases = Releases::of(repository)?;
-    #[derive(Deserialize)]
-    struct Latest {
-        tag_name: String,
-    }
-    let latest: Latest = serde_json::from_slice(&fetch.get(&releases.api, MAX_API).await?)
-        .context("GitHub's answer about the latest release was not understood")?;
-    let tag = latest.tag_name;
+    let landed = fetch.lands(&releases.latest).await?;
+    let tag = landed
+        .strip_prefix(&format!("{}/", releases.page))
+        .filter(|tag| {
+            !tag.is_empty()
+                && tag
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-+".contains(c))
+        })
+        .ok_or_else(|| anyhow!("GitHub names no latest release ({landed})"))?
+        .to_owned();
     let version = tag.strip_prefix('v').unwrap_or(&tag).to_owned();
     if !newer(&version, current) {
         return Ok(None);
@@ -485,6 +502,8 @@ mod tests {
     #[derive(Default)]
     struct Stand {
         bodies: HashMap<String, Vec<u8>>,
+        /// Where an address leads.
+        redirects: HashMap<String, String>,
         asked: Mutex<Vec<String>>,
     }
 
@@ -504,6 +523,18 @@ mod tests {
                 });
             async move { body }
         }
+
+        fn lands(&self, url: &str) -> impl Future<Output = Result<String>> + Send {
+            self.asked.lock().unwrap().push(url.to_owned());
+            let landed = Ok(self.redirects.get(url).cloned().unwrap_or(url.to_owned()));
+            async move { landed }
+        }
+    }
+
+    const LATEST: &str = "https://github.com/r1sq/mothrix/releases/latest";
+
+    fn page(tag: &str) -> String {
+        format!("https://github.com/r1sq/mothrix/releases/tag/{tag}")
     }
 
     fn key(seed: u8) -> SigningKey {
@@ -523,10 +554,7 @@ mod tests {
         let signature =
             base64::engine::general_purpose::STANDARD.encode(signer.sign(&manifest).to_bytes());
         let mut stand = Stand::default();
-        stand.bodies.insert(
-            "https://api.github.com/repos/r1sq/mothrix/releases/latest".into(),
-            format!(r#"{{"tag_name":"{tag}","name":"x"}}"#).into_bytes(),
-        );
+        stand.redirects.insert(LATEST.into(), page(tag));
         stand.bodies.insert(format!("{base}/{MANIFEST}"), manifest);
         stand
             .bodies
@@ -567,6 +595,37 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_release_is_where_its_page_leads_and_nothing_else() {
+        let signer = key(1);
+        // No release yet: GitHub leads to the list of releases.
+        let mut stand = release("v0.2.0", "0.2.0", b"x", &signer);
+        stand.redirects.insert(
+            LATEST.into(),
+            "https://github.com/r1sq/mothrix/releases".into(),
+        );
+        let error = run(check(&stand, REPO, "0.1.0", &signer.verifying_key())).unwrap_err();
+        assert!(error.to_string().contains("no latest release"), "{error}");
+        // A page of another repository, or a tag that is no plain name.
+        for elsewhere in [
+            "https://github.com/someone/else/releases/tag/v0.2.0".to_owned(),
+            page("v0.2.0/../../x"),
+            page("v0.2.0?x=1"),
+        ] {
+            stand.redirects.insert(LATEST.into(), elsewhere);
+            assert!(run(check(&stand, REPO, "0.1.0", &signer.verifying_key())).is_err());
+        }
+        // GitHub's API is not asked.
+        assert!(
+            stand
+                .asked
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|url| !url.contains("api.github.com"))
+        );
+    }
+
+    #[test]
     fn another_key_a_changed_file_or_an_old_release_renamed_are_refused() {
         let signer = key(1);
         let stranger = key(2);
@@ -576,10 +635,7 @@ mod tests {
 
         // 0.1.5's signed manifest, published as v0.2.0.
         let mut stand = release("v0.1.5", "0.1.5", b"x", &signer);
-        stand.bodies.insert(
-            "https://api.github.com/repos/r1sq/mothrix/releases/latest".into(),
-            br#"{"tag_name":"v0.2.0"}"#.to_vec(),
-        );
+        stand.redirects.insert(LATEST.into(), page("v0.2.0"));
         let old = "https://github.com/r1sq/mothrix/releases/download/v0.1.5";
         let new = "https://github.com/r1sq/mothrix/releases/download/v0.2.0";
         for name in [MANIFEST, SIGNATURE] {

@@ -47,6 +47,17 @@ fn within(name: &str, system: fn() -> Option<PathBuf>) -> Option<PathBuf> {
     }
 }
 
+/// A path as typed: trimmed, with `~/` for the home folder.
+pub fn expand_home(path: &str) -> PathBuf {
+    let path = path.trim();
+    match path.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| path.into()),
+        None => path.into(),
+    }
+}
+
 /// Make `dir` (and what is above it, if missing) a folder only the user
 /// can enter: accounts, drafts and opened attachments are in such folders,
 /// and on a shared computer the usual mode would let others read them.

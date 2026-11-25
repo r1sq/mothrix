@@ -3,6 +3,10 @@
 Most of it is in the settings dialog (`F2`); this is what the file holds,
 and what only the file can do: your own colours and keys.
 
+mothrix writes the file itself whenever a setting, a section or a fold
+changes, and writes it whole: comments and keys it does not know are not
+kept. Keep notes about your settings somewhere else.
+
 ## Where mothrix keeps its files
 
 | | Linux | macOS | Windows |
