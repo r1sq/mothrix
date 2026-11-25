@@ -38,8 +38,8 @@ struct SignInView: View {
                     Text(error).font(.mono(.footnote)).foregroundStyle(store.theme.errorColor)
                 }
                 // Accounts that are signed in but did not start, and why.
-                ForEach(store.problems, id: \.self) { problem in
-                    Text(problem).font(.mono(.footnote)).foregroundStyle(store.theme.errorColor)
+                ForEach(store.problems, id: \.profile) { problem in
+                    ProblemRow(problem: problem)
                 }
             }
             .padding()
@@ -58,6 +58,32 @@ struct SignInView: View {
 
     private func go() {
         store.signIn(server: server.trimmingCharacters(in: .whitespaces), user: user, password: password)
+    }
+}
+
+/// An account that is on the phone but did not start: why, and a way to
+/// take it off the phone (asked about first), since it is in no list to
+/// sign it out from.
+struct ProblemRow: View {
+    @EnvironmentObject var store: Store
+    let problem: Problem
+    @State private var removing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(problem.text).font(.mono(.footnote)).foregroundStyle(store.theme.errorColor)
+            WordButton("[remove from this phone]") { removing = true }
+        }
+        .confirmationDialog(
+            "Remove \(problem.profile) from this phone?",
+            isPresented: $removing,
+            titleVisibility: .visible
+        ) {
+            Button("remove", role: .destructive) { store.removeAccount(problem.profile) }
+            Button("cancel", role: .cancel) {}
+        } message: {
+            Text("Its messages and keys go from this phone. Encrypted messages can be read again after signing in only with the recovery key or another verified device.")
+        }
     }
 }
 
@@ -155,7 +181,8 @@ struct RoomList: View {
                 isPresented: Binding(get: { invitation != nil }, set: { if !$0 { invitation = nil } }),
                 titleVisibility: .visible
             ) {
-                Button("join") { if let room = invitation { store.open(room.id) } }
+                // Asked here: Rust does not ask a second time.
+                Button("join") { if let room = invitation { store.acceptInvitation(room.id) } }
                 Button("decline", role: .destructive) {
                     if let room = invitation { store.act("leave", ["room": room.id]) }
                 }
@@ -352,6 +379,9 @@ struct RoomView: View {
     @State private var pickingEmoji = false
     @State private var makingPoll = false
     @State private var takingPhoto = false
+    /// The conversation a picker, the camera or a recording was started
+    /// in: what comes of it goes there, or nowhere.
+    @State private var startedIn: Conversation?
     @StateObject private var recorder = VoiceRecorder()
     /// The people completed with @ in what is being written.
     @State private var mentioned: [Member] = []
@@ -464,8 +494,8 @@ struct RoomView: View {
             guard case .success(let url) = result else { return }
             let allowed = url.startAccessingSecurityScopedResource()
             defer { if allowed { url.stopAccessingSecurityScopedResource() } }
-            if let data = try? Data(contentsOf: url) {
-                store.sendFile(data, name: url.lastPathComponent, caption: text)
+            if stillThere(), let data = try? Data(contentsOf: url) {
+                store.sendFile(data, name: url.lastPathComponent, caption: text, in: startedIn)
                 text = ""
             }
         }
@@ -536,20 +566,33 @@ struct RoomView: View {
             }
             if recorder.recording {
                 VoiceBar(recorder: recorder) {
-                    if let voice = recorder.finish() {
-                        store.sendVoice(voice.url, durationMs: voice.durationMs, waveform: voice.waveform)
+                    if let voice = recorder.finish(), stillThere() {
+                        store.sendVoice(
+                            voice.url, durationMs: voice.durationMs, waveform: voice.waveform, in: startedIn)
                     }
                 }
             } else {
             HStack(alignment: .bottom, spacing: 8) {
                 Menu {
                     Button("emoji") { pickingEmoji = true }
-                    Button("picture") { pickingPicture = true }
-                    if CameraPicker.available {
-                        Button("take a photo") { takingPhoto = true }
+                    Button("picture") {
+                        startedIn = store.conversation
+                        pickingPicture = true
                     }
-                    Button("voice message") { recorder.start() }
-                    Button("file") { pickingFile = true }
+                    if CameraPicker.available {
+                        Button("take a photo") {
+                            startedIn = store.conversation
+                            takingPhoto = true
+                        }
+                    }
+                    Button("voice message") {
+                        startedIn = store.conversation
+                        recorder.start()
+                    }
+                    Button("file") {
+                        startedIn = store.conversation
+                        pickingFile = true
+                    }
                     Button("poll") { makingPoll = true }
                 } label: {
                     Text("[+]").font(.mono()).foregroundStyle(store.theme.accentColor)
@@ -567,8 +610,8 @@ struct RoomView: View {
             CameraPicker { photo in
                 takingPhoto = false
                 // As JPEG, like a picked photo: no location goes out.
-                if let jpeg = photo?.jpegData(compressionQuality: 0.85) {
-                    store.sendPicture(jpeg, name: "photo.jpg", caption: text)
+                if let jpeg = photo?.jpegData(compressionQuality: 0.85), stillThere() {
+                    store.sendPicture(jpeg, name: "photo.jpg", caption: text, in: startedIn)
                     text = ""
                 }
             }
@@ -585,21 +628,21 @@ struct RoomView: View {
         .onChange(of: picked) { _, item in
             guard let item else { return }
             // Loading can take seconds (a photo still in iCloud): it goes to
-            // the chat it was picked in, or nowhere.
-            let pickedIn = store.openRoom
+            // the chat (and thread) the picker was opened in, or nowhere.
+            let pickedIn = startedIn ?? store.conversation
             Task {
                 // Drawn anew as JPEG: no location or other metadata of the
                 // photo goes out, and every client can show it (not HEIC).
                 if let data = try? await item.loadTransferable(type: Data.self),
                    let jpeg = UIImage(data: data)?.jpegData(compressionQuality: 0.85)
                 {
-                    guard store.openRoom == pickedIn else {
+                    guard store.conversation == pickedIn else {
                         store.notice = "Not sent: another chat was opened meanwhile."
                         picked = nil
                         return
                     }
                     // What is in the message box goes with it as its caption.
-                    store.sendPicture(jpeg, name: "picture.jpg", caption: text)
+                    store.sendPicture(jpeg, name: "picture.jpg", caption: text, in: pickedIn)
                     text = ""
                 }
                 picked = nil
@@ -693,6 +736,15 @@ struct RoomView: View {
         text = draft
     }
 
+    /// Whether the conversation shown is still the one the picker, camera
+    /// or recording at hand was started in; says so if it is not (the
+    /// message box's text is then another chat's, and no caption).
+    private func stillThere() -> Bool {
+        guard let begun = startedIn, begun != store.conversation else { return true }
+        store.notice = "Not sent: another chat was opened meanwhile."
+        return false
+    }
+
     /// Out of the thread, or out of the room to the list.
     private func back() {
         store.act(store.thread == nil ? "close" : "close_thread")
@@ -726,6 +778,7 @@ struct MessageRow: View {
     @Binding var text: String
     @Binding var forwarding: Message?
     @State private var deleting = false
+    @State private var endingPoll = false
     @State private var reacting = false
     @State private var expanded = false
 
@@ -754,7 +807,7 @@ struct MessageRow: View {
                         Button("reply") { replyTo = message }
                     }
                     if message.can.copy {
-                        Button("copy") { UIPasteboard.general.string = message.copy }
+                        Button("copy") { copyText(message.copy) }
                     }
                     if message.can.forward {
                         Button("forward …") { forwarding = message }
@@ -763,7 +816,7 @@ struct MessageRow: View {
                         Button(message.pinned ? "unpin" : "pin for everyone") { store.togglePin(message.eventId) }
                     }
                     if message.can.endPoll {
-                        Button("end poll") { store.endPoll(message.eventId) }
+                        Button("end poll") { endingPoll = true }
                     }
                     if message.can.edit {
                         Button("edit") {
@@ -787,6 +840,11 @@ struct MessageRow: View {
                 }
                 .confirmationDialog("Delete this message?", isPresented: $deleting, titleVisibility: .visible) {
                     Button("delete", role: .destructive) { store.delete(message.eventId) }
+                }
+                .confirmationDialog("End this poll?", isPresented: $endingPoll, titleVisibility: .visible) {
+                    Button("end poll", role: .destructive) { store.endPoll(message.eventId) }
+                } message: {
+                    Text("Nobody can vote after that, and it cannot be opened again.")
                 }
                 .sheet(isPresented: $reacting) {
                     EmojiPicker { emoji in store.react(message.eventId, emoji) }
@@ -993,7 +1051,7 @@ struct RichText: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .overlay(Rectangle().stroke(store.theme.line))
                         .overlay(alignment: .topTrailing) {
-                            WordButton("[copy]") { UIPasteboard.general.string = content }
+                            WordButton("[copy]") { copyText(content) }
                                 .padding(4)
                         }
                 }
@@ -1051,6 +1109,8 @@ struct MenuView: View {
     @State private var newName = ""
     /// The account to sign out: asked about first.
     @State private var signingOut: Account?
+    /// The section to remove: asked about first.
+    @State private var removingSection: String?
 
     /// The room list's order: recent, then by name, then unread first.
     private func sortButton(_ prefs: Prefs) -> some View {
@@ -1093,7 +1153,7 @@ struct MenuView: View {
                     Section {
                         Text(key).textSelection(.enabled)
                         HStack(spacing: 16) {
-                            WordButton("[copy]") { UIPasteboard.general.string = key }
+                            WordButton("[copy]") { copyText(key, secret: true) }
                             WordButton("[done, I kept it]") { store.recoveryKey = nil }
                         }
                     } header: {
@@ -1175,9 +1235,8 @@ struct MenuView: View {
                     .buttonStyle(.plain)
                     .listRowBackground(store.theme.bg)
                     // Accounts that are signed in but did not start, and why.
-                    ForEach(store.problems, id: \.self) { problem in
-                        Text(problem).font(.mono(.footnote)).foregroundStyle(store.theme.errorColor)
-                            .listRowBackground(store.theme.bg)
+                    ForEach(store.problems, id: \.profile) { problem in
+                        ProblemRow(problem: problem).listRowBackground(store.theme.bg)
                     }
                 } header: {
                     Text("ACCOUNTS").foregroundStyle(store.theme.faint)
@@ -1198,7 +1257,7 @@ struct MenuView: View {
                                     renaming = name
                                     newName = name
                                 }
-                                WordButton("[remove]") { store.act("remove_section", ["name": name]) }
+                                WordButton("[remove]") { removingSection = name }
                             }
                             .listRowBackground(store.theme.bg)
                         }
@@ -1263,6 +1322,18 @@ struct MenuView: View {
                 Button("cancel", role: .cancel) {}
             } message: {
                 Text("Its messages and keys go from this phone. Encrypted messages can be read again after signing in only with the recovery key or another verified device.")
+            }
+            .confirmationDialog(
+                "Remove the section \(removingSection ?? "")?",
+                isPresented: Binding(get: { removingSection != nil }, set: { if !$0 { removingSection = nil } }),
+                titleVisibility: .visible
+            ) {
+                Button("remove", role: .destructive) {
+                    if let name = removingSection { store.act("remove_section", ["name": name]) }
+                }
+                Button("cancel", role: .cancel) {}
+            } message: {
+                Text("Its subsections go with it. The rooms stay, in the list's own sections.")
             }
             .sheet(isPresented: $addingAccount) {
                 AddAccountView().environmentObject(store)
@@ -1692,6 +1763,9 @@ struct PollView: View {
     @State private var answers = ["", ""]
     @State private var multiple = false
     @State private var hidden = false
+    /// The conversation the sheet was opened over: the poll goes there,
+    /// or nowhere (a notification tapped meanwhile shows another).
+    @State private var place: Conversation?
 
     private var ready: Bool {
         !question.trimmingCharacters(in: .whitespaces).isEmpty
@@ -1733,7 +1807,7 @@ struct PollView: View {
                         store.createPoll(
                             question: question,
                             answers: answers.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty },
-                            multiple: multiple, hidden: hidden)
+                            multiple: multiple, hidden: hidden, in: place)
                         dismiss()
                     }
                     .disabled(!ready)
@@ -1745,6 +1819,7 @@ struct PollView: View {
         }
         .presentationBackground(store.theme.bg)
         .notices()
+        .onAppear { if place == nil { place = store.conversation } }
     }
 
     private func field(_ hint: String, _ text: Binding<String>) -> some View {
@@ -2012,4 +2087,18 @@ struct SidewaysSwipe: UIGestureRecognizerRepresentable {
             return speed.x > 0 && speed.x > abs(speed.y) * 2 && pan.location(in: nil).x > 40
         }
     }
+}
+
+/// Put text on the pasteboard. `secret` (a recovery key): on this device
+/// only, not on the user's other devices through the shared clipboard,
+/// and gone from it after two minutes.
+@MainActor
+func copyText(_ text: String, secret: Bool = false) {
+    guard secret else {
+        UIPasteboard.general.string = text
+        return
+    }
+    UIPasteboard.general.setItems(
+        [["public.utf8-plain-text": text]],
+        options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
 }

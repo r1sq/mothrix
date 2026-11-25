@@ -734,6 +734,15 @@ async fn sign_in_held(
     let passphrase = if from_app.is_some() {
         from_app.clone()
     } else if SHARED_AS.get().is_some() {
+        // The iPhone app, whose Keychain gave no passphrase (it is
+        // locked away, or could not be written): said, as it is said
+        // of a desktop without a keyring.
+        tracing::warn!("no passphrase from the app for the store");
+        say(
+            "The Keychain gave no passphrase: this account's encryption keys are kept \
+             without one, protected by the phone's own file protection only."
+                .to_owned(),
+        );
         None
     } else {
         let data_dir = paths.data_dir.clone();

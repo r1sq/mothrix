@@ -23,7 +23,8 @@ enum MothrixEvent: Decodable {
     case rooms([RoomEntry])
     case sidebar([Line])
     case opened(room: String?, thread: String?)
-    case timeline(room: String, thread: String?, items: [Message])
+    /// `dropped`: how many of its messages could not be read.
+    case timeline(room: String, thread: String?, items: [Message], dropped: Int)
     case picture(eventId: String, url: String)
     case typing(room: String, names: [String])
     case notice(String)
@@ -39,12 +40,14 @@ enum MothrixEvent: Decodable {
     case members(room: String, members: [Member])
     case media(eventId: String, path: String)
     case linkPreview(url: String, title: String, description: String)
+    case problems([Problem])
     /// Something the app does not show yet.
     case other(String)
 
     private enum Keys: String, CodingKey {
         case type, snapshot, accounts, rooms, lines, room, thread, items, eventId, url, names,
-             text, emoji, title, query, hits, details, state, key, members, path, description
+             text, emoji, title, query, hits, details, state, key, members, path, description,
+             problems
     }
 
     init(from decoder: Decoder) throws {
@@ -60,10 +63,11 @@ enum MothrixEvent: Decodable {
                 room: try c.decodeIfPresent(String.self, forKey: .room),
                 thread: try c.decodeIfPresent(String.self, forKey: .thread))
         case "timeline":
+            let items = try c.decode(Lossy<Message>.self, forKey: .items)
             self = .timeline(
                 room: try c.decode(String.self, forKey: .room),
                 thread: try c.decodeIfPresent(String.self, forKey: .thread),
-                items: try c.decode([Message].self, forKey: .items))
+                items: items.kept, dropped: items.dropped)
         case "picture":
             self = .picture(
                 eventId: try c.decode(String.self, forKey: .eventId),
@@ -101,7 +105,32 @@ enum MothrixEvent: Decodable {
             self = .members(
                 room: try c.decode(String.self, forKey: .room),
                 members: try c.decode([Member].self, forKey: .members))
+        case "problems": self = .problems(try c.decode([Problem].self, forKey: .problems))
         default: self = .other(type)
+        }
+    }
+}
+
+/// A list read item by item: one that cannot be read (a number too large
+/// for this app, a kind it does not know) is left out and counted, and
+/// the others stay. A conversation is not lost to one message.
+struct Lossy<Element: Decodable>: Decodable {
+    var kept: [Element] = []
+    var dropped = 0
+
+    /// Reads any value and keeps nothing: to step over an item.
+    private struct Skipped: Decodable {}
+
+    init(from decoder: Decoder) throws {
+        var list = try decoder.unkeyedContainer()
+        while !list.isAtEnd {
+            if let item = try? list.decode(Element.self) {
+                kept.append(item)
+            } else {
+                // A failed read does not move on by itself.
+                _ = try list.decode(Skipped.self)
+                dropped += 1
+            }
         }
     }
 }
@@ -112,14 +141,31 @@ struct Snapshot: Decodable {
     var lines: [Line]
     var openRoom: String?
     var thread: String?
-    var items: [Message]
+    /// The conversation's messages (`items` in the JSON), read one by one.
+    private var messages: Lossy<Message>
+    var items: [Message] { messages.kept }
+    /// How many of them could not be read.
+    var dropped: Int { messages.dropped }
     // Not `pictures`: the key strategy would rename its keys (event ids
     // with "_"). Pictures come again as `picture` events.
     var settings: Settings
     var signIn: SignInState
-    var problems: [String]
+    var problems: [Problem]
     var favourites: [String]
     var emoji: [EmojiGroup]
+
+    private enum CodingKeys: String, CodingKey {
+        case accounts, rooms, lines, openRoom, thread
+        case messages = "items"
+        case settings, signIn, problems, favourites, emoji
+    }
+}
+
+/// An account that is on the phone but did not start: its profile, and
+/// the line that says why.
+struct Problem: Decodable, Hashable {
+    var profile: String
+    var text: String
 }
 
 /// Every emoji of one group: `[emoji, the words it is found by]`.

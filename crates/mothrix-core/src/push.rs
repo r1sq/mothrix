@@ -149,6 +149,9 @@ pub struct Notification {
     pub thread_root: Option<String>,
     /// Whether the push rules ask for a sound.
     pub noisy: bool,
+    /// It is an invitation to the room, not a message in it: there is
+    /// nothing to answer or to read there yet.
+    pub invitation: bool,
 }
 
 /// Fetch and decrypt the event a push was about, in a process of its own
@@ -184,6 +187,7 @@ pub async fn notification(
         direct: item.is_direct_message_room,
         thread_root: item.thread_id.as_ref().map(ToString::to_string),
         noisy: item.is_noisy.unwrap_or(true),
+        invitation: matches!(item.event, NotificationEvent::Invite(_)),
     }))
 }
 

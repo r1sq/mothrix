@@ -50,6 +50,11 @@ final class ShareModel: ObservableObject {
     @Published var files: [URL] = []
     @Published var sending: String?
     @Published var problem: String?
+    /// What was shared is still being read (a big file is being copied):
+    /// nothing can be sent yet, it would go without it.
+    @Published var loading = true
+    /// The sheet was cancelled: what is read from now on is not kept.
+    private var cancelled = false
     private let context: NSExtensionContext?
 
     init(context: NSExtensionContext?) { self.context = context }
@@ -71,16 +76,31 @@ final class ShareModel: ObservableObject {
             var texts: [String] = []
             for provider in providers {
                 if let file = await Self.file(from: provider) {
-                    files.append(file)
+                    if cancelled {
+                        // Copied after the sheet was given up: `tidy` is past.
+                        try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+                    } else {
+                        files.append(file)
+                    }
                 } else if let line = await Self.text(from: provider) {
                     texts.append(line)
                 }
             }
-            text = texts.joined(separator: "\n")
+            // Before what was shared, if something was typed meanwhile.
+            let shared = texts.joined(separator: "\n")
+            text = text.isEmpty ? shared : (shared.isEmpty ? text : text + "\n" + shared)
+            loading = false
         }
     }
 
     func send(to room: ShareList.Room) {
+        // Not a part of it, and not nothing as if it had been sent.
+        guard !loading else { return }
+        guard !files.isEmpty || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            problem = "There is nothing to send."
+            return
+        }
+        problem = nil
         sending = room.name
         let folder = folder.path
         let text = text
@@ -103,6 +123,7 @@ final class ShareModel: ObservableObject {
     }
 
     func cancel() {
+        cancelled = true
         tidy()
         context?.cancelRequest(withError: NSError(domain: "mothrix", code: 0))
     }
@@ -132,9 +153,11 @@ final class ShareModel: ObservableObject {
             }
             return file
         }
-        let isLink = provider.hasItemConformingToTypeIdentifier(UTType.url.identifier)
-            && !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-        let isText = provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
+        // A file is a file, also one of plain text (shared from Files): it
+        // goes as it is, not as its path or as a message of its content.
+        let isFile = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        let isLink = provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) && !isFile
+        let isText = provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier) && !isFile
         guard !isLink, !isText,
               provider.hasItemConformingToTypeIdentifier(UTType.item.identifier)
         else {
@@ -158,7 +181,9 @@ final class ShareModel: ObservableObject {
         if provider.canLoadObject(ofClass: URL.self),
            let url = try? await provider.loadObject(ofClass: URL.self)
         {
-            return url.absoluteString
+            // A file that could not be copied is not sent as its path on
+            // this phone.
+            return url.isFileURL ? nil : url.absoluteString
         }
         if provider.canLoadObject(ofClass: String.self),
            let text = try? await provider.loadObject(ofClass: String.self)
@@ -224,6 +249,9 @@ struct ShareView: View {
                 .lineLimit(1...5)
             Rectangle().fill(dim.opacity(0.4)).frame(height: 1)
             TextField("", text: $filter, prompt: Text("find a room").foregroundColor(dim))
+            if model.loading {
+                HStack { ProgressView(); Text("reading what was shared …") }.foregroundStyle(dim)
+            }
             if let sending = model.sending {
                 HStack { ProgressView(); Text("sending to \(sending) …") }.foregroundStyle(dim)
             }
@@ -247,7 +275,7 @@ struct ShareView: View {
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .disabled(model.sending != nil)
+                            .disabled(model.sending != nil || model.loading)
                         }
                     }
                 }

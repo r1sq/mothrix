@@ -15,8 +15,9 @@ swipe a room to read, pin or mute it. Photos from the camera,
 voice messages, and "mothrix" in other apps' share sheet (it asks before
 sending to the room you tapped). Push
 notifications show who wrote what, decrypted on the phone; they can be
-answered or marked read right there, and go away once the room is read,
-here or on another device.
+answered or marked read right there (an invitation's cannot: a tap on it
+asks first), and go away once the app sees the room read, here or on
+another device.
 
 It is not in the App Store; testers get it through TestFlight.
 
@@ -37,8 +38,12 @@ It is not in the App Store; testers get it through TestFlight.
     (`MOTHRIX_WRITE_FIXTURES=1 cargo test -p mothrix-ffi`).
 - The app and its extensions share one store in the app group's folder.
   The SDK's cross-process locks keep them from writing at once; the
-  extensions use short-lived clients of their own (`notification`,
-  `respond`, `share` in `mothrix-ffi`).
+  extensions use short-lived clients of their own (`notification` and
+  `share` in `mothrix-ffi`), one at a time in each process. A
+  notification's action comes to the app's process (`respond`): the
+  running accounts do it, and only when none run (iOS woke the app just
+  for this) a short-lived client does. The accounts start only after
+  such a client is done.
 
 ## What is kept on the phone, and how
 
@@ -50,8 +55,14 @@ encrypted with a passphrase the app makes once and keeps in the Keychain
 (`Shared/StoreKey.swift`; the app group is its access group, so the
 extensions read it too; it never leaves the device). Accounts signed in
 before that have no passphrase until they sign out and in again. If the
-Keychain does not give the passphrase out, such an account does not
-start and the app says why.
+Keychain gives no passphrase while an account signs in, its store is
+made without one and the app says so; it stays that way until the
+account signs out and in again. If the Keychain does not give the
+passphrase out later, an account whose store has one does not start and
+the app says why.
+
+An account that did not start is listed with its reason in the menu and
+on the sign-in screen, and can be removed from the phone there.
 
 ## How a notification gets to the phone
 
@@ -65,8 +76,10 @@ start and the app says why.
 4. On the phone the notification extension opens the shared store,
    fetches and decrypts the event, and shows sender and text (within the
    extension's limits of about 24 MB and 30 seconds; otherwise "New
-   message" stays). "Reply" and "Mark as read" on the notification go
-   through the same short-lived kind of client.
+   message" stays). Every push opens the store anew. "Reply" and "Mark
+   as read" on the notification are done by the app's process: by its
+   running accounts, or by a short-lived client when the app does not
+   run. An invitation's notification offers neither.
 
 The TestFlight builds use the gateway `https://push.tmrk.de` with the app
 ids `de.tmrk.mothrix` (APNs production) and `de.tmrk.mothrix.dev` (APNs
@@ -158,9 +171,12 @@ needs a signed build on a phone; `xcrun simctl push` shows a notification
 (put `mothrix_room` and `aps.category: message` into the payload, since
 the notification extension does not run for it), and its actions work.
 
-Debug builds show a line with the item count in conversations, log every
-action and event to `mothrix-app.log`, and keep the last event of each kind
-in `debug/` (both in the app's folder).
+Debug builds show a line with the item count in conversations and say
+when an event or a message could not be read. They log each action's
+kind (not what it holds: a password or a file can be in it) and each
+event's first 120 characters to `mothrix-app.log`, and keep the last
+event of each kind but a recovery key whole in `debug/` (both in the
+app's folder).
 
 ## State
 
@@ -180,6 +196,10 @@ Known gaps:
   the app.
 - Playing audio is iOS's viewer, with the formats it knows (the Ogg/Opus
   voice messages of other clients are untried).
+- A notification goes when the app sees its room's count fall to
+  nothing. For a message that came and was read on another device while
+  the app did not run it never sees that: the notification stays until
+  the room is opened or the notification is swiped away.
 - Not there: signing in through the browser (SSO), the iPad.
 
 The conversation is drawn upside down with each message turned back, so

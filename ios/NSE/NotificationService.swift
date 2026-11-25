@@ -26,11 +26,10 @@ final class NotificationService: UNNotificationServiceExtension {
         // makes of one (`clean_profile`), so no path.
         let profile = info["mothrix_profile"] as? String ?? "default"
         // The number on the app's icon: this account's count as its
-        // server tells it, with the other accounts' last ones (`Badge`).
+        // server tells it, with the other accounts' last ones (`Badge`,
+        // which keeps it only for an account that is on this phone).
         let badge: NSNumber? = (info["unread_count"] as? NSNumber).flatMap { unread in
-            Self.isProfile(profile)
-                ? NSNumber(value: Badge.heard(profile: profile, unread: unread.intValue))
-                : nil
+            Badge.heard(profile: profile, unread: unread.intValue).map { NSNumber(value: $0) }
         }
         guard let roomId = info["room_id"] as? String,
               let eventId = info["event_id"] as? String
@@ -55,7 +54,7 @@ final class NotificationService: UNNotificationServiceExtension {
         content.userInfo.removeValue(forKey: "mothrix_room")
         content.userInfo.removeValue(forKey: "mothrix_thread")
         begin(handler, content)
-        guard Self.isProfile(profile) else { return finish() }
+        guard Badge.isProfile(profile) else { return finish() }
         let folder = FileManager.default
             .containerURL(forSecurityApplicationGroupIdentifier: "group.de.tmrk.mothrix")?.path ?? ""
         // `notification` blocks while it fetches and decrypts.
@@ -74,8 +73,10 @@ final class NotificationService: UNNotificationServiceExtension {
                 if let thread = found.threadRoot {
                     content.userInfo["mothrix_thread"] = thread
                 }
-                // Reply and Mark as read (the app registers them).
-                content.categoryIdentifier = "message"
+                // Reply and Mark as read (the app registers them). Not
+                // on an invitation: there is no message to answer, and
+                // nothing to read in a room not joined.
+                content.categoryIdentifier = found.invitation ? "" : "message"
                 content.sound = found.noisy ? .default : nil
             }
         }
@@ -84,13 +85,6 @@ final class NotificationService: UNNotificationServiceExtension {
     /// iOS ends the extension soon: show what there is.
     override func serviceExtensionTimeWillExpire() {
         finish()
-    }
-
-    /// Letters, digits, "-" and "_", at least one: a profile's name.
-    private static func isProfile(_ name: String) -> Bool {
-        !name.isEmpty && name.unicodeScalars.allSatisfy {
-            CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_"
-        }
     }
 
     private func begin(_ handler: @escaping (UNNotificationContent) -> Void, _ content: UNMutableNotificationContent) {

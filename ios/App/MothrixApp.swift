@@ -151,11 +151,22 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         print("mothrix: no push token: \(error)")
     }
 
-    /// In the front, the room list shows what is new: no banner.
+    /// In the front, the room list shows what is new: no banner, and the
+    /// icon's number stays the app's own (the push brings its server's
+    /// count, also for a message the open room has read already; the
+    /// notification extension has kept that count, so the app says its
+    /// own again). Only our own word that an answer did not go out is
+    /// shown here too.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter, willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.badge]
+        if notification.request.content.userInfo["mothrix_problem"] != nil {
+            return [.banner, .list]
+        }
+        await MainActor.run {
+            if let store = self.store { store.showBadge(again: true) }
+        }
+        return []
     }
 
     /// A tap opens the room the extension wrote into the notification;
@@ -186,10 +197,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         }
     }
 
-    /// Send (if there is text) and read the room up to its newest message,
-    /// through Rust's own short-lived client on the shared store: works
-    /// whether the app runs or iOS just woke it for this. iOS is asked for
-    /// the time it takes.
+    /// Send (if there is text) and read the room up to its newest message.
+    /// Rust's `respond` has the running app's accounts do it; when iOS
+    /// just woke the app for this and none run yet, it uses a short-lived
+    /// client of its own on the shared store. iOS is asked for the time
+    /// it takes.
     private static func answer(room: String, text: String?, thread: String?) async {
         let folder = sharedFolder().path
         let task = await MainActor.run { UIApplication.shared.beginBackgroundTask() }
@@ -213,6 +225,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             note.body = "Your answer could not be sent: \(failed)"
             note.threadIdentifier = room
             note.userInfo["mothrix_room"] = room
+            // Shown also while the app is in front (`willPresent`).
+            note.userInfo["mothrix_problem"] = true
             try? await UNUserNotificationCenter.current().add(
                 UNNotificationRequest(identifier: UUID().uuidString, content: note, trigger: nil))
         }

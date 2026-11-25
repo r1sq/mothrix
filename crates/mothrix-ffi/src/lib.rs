@@ -80,6 +80,37 @@ fn one_client() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// [`ONE_CLIENT`], held for a task: until this is dropped.
+struct Alone {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+/// Take [`ONE_CLIENT`] from a task, which can neither wait for it (it
+/// would hold up the runtime's thread) nor keep its guard over an
+/// `await`: a thread of its own waits, and keeps it for as long as the
+/// [`Alone`] lives.
+async fn alone() -> Alone {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (held, holding) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let _alone = one_client();
+        let _ = held.send(());
+        // Ends when the `Alone` is dropped (nothing is ever sent).
+        let _ = released.recv();
+    });
+    let _ = holding.await;
+    Alone { _release: release }
+}
+
+/// The accounts' task of this process, if one is running.
+fn running() -> Option<mpsc::UnboundedSender<Request>> {
+    RUNNING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .and_then(mpsc::WeakUnboundedSender::upgrade)
+}
+
 /// The accounts, running. One per app process.
 #[derive(uniffi::Object)]
 pub struct Mothrix {
@@ -123,12 +154,18 @@ impl Mothrix {
                 .unwrap_or_default();
             tracing::warn!("action {kind}");
         }
-        // The room the app showed when this was done, for what is sent
-        // into "the open room": Rust may have opened another meanwhile.
-        let in_room = serde_json::from_str::<serde_json::Value>(&json)
+        // The room (and the thread in it) the app showed when this was
+        // begun, for what is sent into "the open room": Rust may have
+        // opened another meanwhile.
+        let meant_for = serde_json::from_str::<serde_json::Value>(&json)
             .ok()
-            .and_then(|value| value["in_room"].as_str().map(str::to_owned));
-        self.requests.ask(Request::Act(action, in_room));
+            .and_then(|value| {
+                Some(Conversation {
+                    room: value["in_room"].as_str()?.to_owned(),
+                    thread: value["in_thread"].as_str().map(str::to_owned),
+                })
+            });
+        self.requests.ask(Request::Act(action, meant_for));
         Ok(())
     }
 
@@ -161,6 +198,33 @@ pub struct NotificationContent {
     pub room: String,
     pub thread_root: Option<String>,
     pub noisy: bool,
+    /// An invitation, not a message: "Reply" and "Mark as read" have
+    /// nothing to work on, so the notification does not offer them.
+    pub invitation: bool,
+}
+
+impl NotificationContent {
+    /// What the notification says about `found`, in the room `room_id`
+    /// of the account `profile`.
+    fn of(found: mothrix_core::push::Notification, profile: &str, room_id: &str) -> Self {
+        Self {
+            title: if found.direct {
+                found.sender.clone()
+            } else {
+                found.room_name.clone()
+            },
+            subtitle: if found.direct {
+                String::new()
+            } else {
+                found.sender
+            },
+            body: found.body,
+            room: format!("{}{room_id}", accounts::prefix_for(profile)),
+            thread_root: found.thread_root,
+            noisy: found.noisy,
+            invitation: found.invitation,
+        }
+    }
 }
 
 /// For the notification extension: fetch and decrypt the event a push was
@@ -178,22 +242,7 @@ pub fn notification(
     let content: anyhow::Result<_> = runtime.block_on(async {
         let client = signed_in(&profile).await?;
         let found = mothrix_core::push::notification(&client, &room_id, &event_id).await?;
-        Ok(found.map(|found| NotificationContent {
-            title: if found.direct {
-                found.sender.clone()
-            } else {
-                found.room_name.clone()
-            },
-            subtitle: if found.direct {
-                String::new()
-            } else {
-                found.sender
-            },
-            body: found.body,
-            room: format!("{}{room_id}", accounts::prefix_for(&profile)),
-            thread_root: found.thread_root,
-            noisy: found.noisy,
-        }))
+        Ok(found.map(|found| NotificationContent::of(found, &profile, &room_id)))
     });
     Ok(content?)
 }
@@ -226,27 +275,22 @@ pub fn respond(
     // The app is running in this process (in the background, say): its
     // accounts answer. A client of our own on their store would encrypt
     // with keys the running one has moved on from.
-    let running = RUNNING
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .and_then(mpsc::WeakUnboundedSender::upgrade);
-    if let Some(running) = running {
-        let (done, answer) = tokio::sync::oneshot::channel();
-        let asked = running.send(Request::Respond {
-            room: room.clone(),
-            text: text.clone(),
-            thread: thread.clone(),
-            done,
-        });
-        // Not asked, or gone before it answered: it is no longer running.
-        if asked.is_ok()
-            && let Ok(answer) = answer.blocking_recv()
-        {
+    if let Some(answer) = through_the_app(&room, &text, &thread) {
+        return Ok(answer?);
+    }
+    let mut alone = one_client();
+    // The app was opened while this waited for its turn (an earlier
+    // answer was still being sent): its accounts have the stores now, or
+    // wait for us to let go of the turn before they start on them.
+    if running().is_some() {
+        drop(alone);
+        if let Some(answer) = through_the_app(&room, &text, &thread) {
             return Ok(answer?);
         }
+        // It ended before it answered, and its clients with it.
+        alone = one_client();
     }
-    let _alone = one_client();
+    let _alone = alone;
     let runtime = start(Path::new(&folder), "action")?;
     let done: anyhow::Result<()> = runtime.block_on(async {
         let (profile, room_id) = accounts::split_by_profile(&matrix::signed_in_profiles(), &room);
@@ -254,6 +298,26 @@ pub fn respond(
         answer_in(&client, room_id, text, thread).await
     });
     Ok(done?)
+}
+
+/// Have the app's running accounts do a notification's action. `None`:
+/// no app is running in this process (or it went before it answered).
+fn through_the_app(
+    room: &str,
+    text: &Option<String>,
+    thread: &Option<String>,
+) -> Option<anyhow::Result<()>> {
+    let running = running()?;
+    let (done, answer) = tokio::sync::oneshot::channel();
+    running
+        .send(Request::Respond {
+            room: room.to_owned(),
+            text: text.clone(),
+            thread: thread.clone(),
+            done,
+        })
+        .ok()?;
+    answer.blocking_recv().ok()
 }
 
 /// A notification's action in a room: send `text` (if any), and read the
@@ -348,18 +412,30 @@ fn init_logging(folder: &Path, holder: &str) {
     }
 }
 
+/// A room (its key) and the thread shown in it, if one is.
+struct Conversation {
+    room: String,
+    thread: Option<String>,
+}
+
 /// What reaches the accounts' task.
 enum Request {
     Snapshot,
-    /// An action, and the room it was meant for if it goes into "the
-    /// open room".
-    Act(Action, Option<String>),
+    /// An action, and the conversation it was meant for if it goes into
+    /// "the open room".
+    Act(Action, Option<Conversation>),
     /// The app came to the front or went to the background.
     Focus(bool),
     /// A notification about this room was tapped.
     Clicked(String),
     /// News from a sign-in under way.
     SignIn(mothrix_core::accounts::SignInEvent),
+    /// An account that did not start was removed from the phone, or
+    /// could not be.
+    Removed {
+        profile: String,
+        result: Result<(), String>,
+    },
     /// A notification's action in a room (its key), while the app runs;
     /// `done` hears how it went.
     Respond {
@@ -431,7 +507,13 @@ async fn run(
         .map(|file| Config::load(&file))
         .unwrap_or_default();
     let _ = std::fs::remove_dir_all(upload_dir());
+    // Not while a short-lived client of this process is on the stores (a
+    // notification's Reply still being sent when the app is opened): the
+    // accounts wait for its turn to end, and `respond` looks for them
+    // again once it has the turn.
+    let turn = alone().await;
     let (clients, problems) = restore_accounts(&config).await;
+    drop(turn);
     let (mut accounts, list) = accounts::spawn(clients);
     let mut view = View::new(list, problems, &config);
     view.set_emoji_usage(mothrix_core::emoji::Usage::load());
@@ -465,16 +547,13 @@ async fn run(
                         }));
                         Vec::new()
                     }
-                    Request::Act(action, in_room) => {
-                        match in_room {
-                            // Not into a room the user did not see it go to.
-                            Some(room) if view.open_room() != Some(room.as_str()) => {
-                                view.say("Not sent: another chat was opened meanwhile.");
-                                Vec::new()
-                            }
-                            _ => view.act(action),
+                    Request::Act(action, meant_for) => match meant_for {
+                        // Not into a chat the user did not see it go to.
+                        Some(Conversation { room, thread }) => {
+                            view.act_in(action, &room, thread.as_deref())
                         }
-                    }
+                        None => view.act(action),
+                    },
                     Request::Focus(focused) => {
                         view.focus(focused);
                         Vec::new()
@@ -482,6 +561,10 @@ async fn run(
                     Request::Clicked(room) => view.notification_clicked(room),
                     Request::SignIn(event) => {
                         finish_sign_in(event, &mut view, &mut accounts);
+                        Vec::new()
+                    }
+                    Request::Removed { profile, result } => {
+                        view.removed(&profile, result);
                         Vec::new()
                     }
                     Request::Respond { room, text, thread, done } => {
@@ -536,10 +619,7 @@ fn carry_out(
         }
         // The app decides: in the foreground a banner, in the background
         // the push does it.
-        Effect::Notify { room, title } => emit(
-            listener,
-            &serde_json::json!({ "type": "notify", "room": room, "title": title }),
-        ),
+        Effect::Notify { room, title } => emit(listener, &view::notify_event(&room, &title)),
         Effect::SignIn(request) => {
             let requests = requests.clone();
             // Browser sign-in (SSO) is not there yet in the app: always
@@ -550,6 +630,16 @@ fn carry_out(
         }
         Effect::SignOut(account) => {
             accounts.sign_out(view, account);
+        }
+        Effect::Remove(profile) => {
+            // In a task: its session is signed out on the server where
+            // it still opens, which may take its time.
+            let removal = accounts.remove_left_out(&profile);
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let result = removal.await.map_err(|error| format!("{error:#}"));
+                requests.ask(Request::Removed { profile, result });
+            });
         }
         Effect::Upload {
             name,
@@ -563,7 +653,10 @@ fn carry_out(
                     caption,
                 },
             ),
-            Err(error) => tracing::warn!(%error, "could not keep the file to send"),
+            Err(error) => {
+                tracing::warn!(%error, "could not keep the file to send");
+                view.say(&format!("Not sent: the file could not be kept ({error})."));
+            }
         },
         Effect::UsedEmoji(emoji) => mothrix_core::emoji::Usage::store(&emoji),
     }
@@ -610,19 +703,101 @@ fn finish_sign_in(
             profile,
             label,
             result,
-        } => view.sign_in_done(result.map(|client| accounts.signed_in(profile, label, client))),
+        } => {
+            let signed_in = result.is_ok();
+            view.sign_in_done(result.map(|client| accounts.signed_in(profile, label, client)));
+            // The sign-in's own line about it goes away with the form.
+            if signed_in && mothrix_core::store_key::given().is_none() {
+                view.say(
+                    "Signed in, but the Keychain gave no passphrase: this account's \
+                     encryption keys are kept without one on this phone.",
+                );
+            }
+        }
     }
 }
 
 /// Every signed-in account, in the config's order. One that cannot start
 /// is left out and named.
-async fn restore_accounts(config: &Config) -> (Vec<(String, matrix_sdk::Client)>, Vec<String>) {
+async fn restore_accounts(
+    config: &Config,
+) -> (Vec<(String, matrix_sdk::Client)>, Vec<view::Problem>) {
     let mut profiles = matrix::signed_in_profiles();
     config.order_profiles(&mut profiles);
     let (clients, problems) = mothrix_core::accounts::restore_all(profiles).await;
     let problems = problems
         .into_iter()
-        .map(|(profile, error)| format!("{profile}: {error:#}"))
+        .map(|(profile, error)| view::Problem {
+            text: format!("{profile}: {error:#}"),
+            profile,
+        })
         .collect();
     (clients, problems)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn free() -> bool {
+        ONE_CLIENT.try_lock().is_ok()
+    }
+
+    fn wait_until(what: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if what() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("waited two seconds in vain");
+    }
+
+    /// The scenario of the app opened while a notification's Reply is
+    /// being sent: the accounts' task gets its turn only when the
+    /// short-lived client is done, and keeps others out until it lets go.
+    #[test]
+    fn the_accounts_wait_for_a_short_lived_client_and_keep_others_out() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let answering = one_client();
+        let (got, turn) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let turn = alone().await;
+            let _ = got.send(turn);
+        });
+        assert!(
+            turn.recv_timeout(Duration::from_millis(200)).is_err(),
+            "started on the stores beside a short-lived client"
+        );
+        drop(answering);
+        let held = turn.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!free());
+        drop(held);
+        wait_until(free);
+    }
+
+    #[test]
+    fn an_invitation_s_notification_says_that_it_is_one() {
+        let found = |invitation| mothrix_core::push::Notification {
+            room_name: "Party".into(),
+            sender: "Amy".into(),
+            body: "invited you".into(),
+            invitation,
+            ..Default::default()
+        };
+        let content = NotificationContent::of(found(true), "work", "!party:x");
+        assert!(content.invitation);
+        assert_eq!(content.room, "work/!party:x");
+        assert_eq!(
+            (content.title.as_str(), content.subtitle.as_str()),
+            ("Party", "Amy")
+        );
+        assert!(!NotificationContent::of(found(false), "default", "!a:x").invitation);
+    }
 }

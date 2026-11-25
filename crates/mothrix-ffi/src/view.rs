@@ -114,6 +114,25 @@ pub enum Event {
     Favourites {
         emoji: Vec<String>,
     },
+    /// The accounts that did not start, after one of them was removed.
+    Problems {
+        problems: Vec<Problem>,
+    },
+}
+
+/// An account that is on the phone but did not start.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Problem {
+    pub profile: String,
+    /// The line to show: the profile and why it did not start.
+    pub text: String,
+}
+
+/// What the app is told when a room has something new (it decides: in
+/// the foreground the room list shows it, in the background the push
+/// does). Not an [`Event`]: it leaves as an [`Effect`], in its order.
+pub fn notify_event(room: &str, title: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "notify", "room": room, "title": title })
 }
 
 /// A conversation item as the app gets it: with its text's Markdown
@@ -189,7 +208,7 @@ pub struct Snapshot {
     pub verify: Option<VerifyState>,
     pub sign_in: SignIn,
     /// Accounts that could not be started, and why.
-    pub problems: Vec<String>,
+    pub problems: Vec<Problem>,
     pub members: Vec<Member>,
     pub favourites: Vec<String>,
     /// Every emoji, by group, for the picker.
@@ -202,6 +221,11 @@ pub struct Snapshot {
 pub enum Action {
     // The conversation.
     Open {
+        room: String,
+    },
+    /// "Join" in the app's own question about an invitation: opens (and
+    /// so joins) it without asking again.
+    AcceptInvitation {
         room: String,
     },
     /// `mentions`: the people picked with @ (their names are in the text).
@@ -398,6 +422,11 @@ pub enum Action {
     SignOut {
         account: usize,
     },
+    /// Take an account that did not start (one of the snapshot's
+    /// `problems`) off this phone.
+    RemoveAccount {
+        profile: String,
+    },
     Prefs {
         prefs: Prefs,
     },
@@ -454,6 +483,9 @@ pub enum Effect {
     },
     SignIn(accounts::SignIn),
     SignOut(usize),
+    /// Remove the account of this profile, which is on disk but does not
+    /// run; [`View::removed`] hears how it went.
+    Remove(String),
     /// Keep this file (base64) on disk and send it to the open room.
     Upload {
         name: String,
@@ -479,7 +511,7 @@ pub struct View {
     pictures: HashMap<String, String>,
     verify: Option<VerifyState>,
     sign_in: SignIn,
-    problems: Vec<String>,
+    problems: Vec<Problem>,
     told: Told,
     events: Vec<Event>,
     effects: Vec<Effect>,
@@ -497,7 +529,7 @@ pub struct View {
 impl View {
     /// For these accounts (in the config's order), with the config file's
     /// names, sections and settings.
-    pub fn new(mut accounts: Vec<Account>, problems: Vec<String>, config: &Config) -> Self {
+    pub fn new(mut accounts: Vec<Account>, problems: Vec<Problem>, config: &Config) -> Self {
         config.name_accounts(&mut accounts);
         let account_filter = config.account_filter(&accounts);
         let mut state = ClientState::new(accounts);
@@ -647,11 +679,6 @@ impl View {
         effects
     }
 
-    /// The key of the room whose conversation is shown.
-    pub fn open_room(&self) -> Option<&str> {
-        self.state.open_room.as_deref()
-    }
-
     /// A line for the user, from outside an action.
     pub fn say(&mut self, text: &str) {
         self.notice(text);
@@ -717,11 +744,30 @@ impl View {
         }
     }
 
+    /// Do what the app asked for the conversation it showed then (`room`,
+    /// and the `thread` in it), if that is still the one shown here: a
+    /// poll sheet, a file picker or a recording begun in one chat does
+    /// not send into another opened meanwhile (a notification tapped),
+    /// nor a message of the room into a thread of it.
+    pub fn act_in(&mut self, action: Action, room: &str, thread: Option<&str>) -> Vec<Command> {
+        if self.state.open_room.as_deref() != Some(room)
+            || self.state.open_thread.as_deref() != thread
+        {
+            self.notice("Not sent: another chat was opened meanwhile.");
+            return Vec::new();
+        }
+        self.act(action)
+    }
+
     /// Do what the app asked. Returns the commands for the accounts.
     pub fn act(&mut self, action: Action) -> Vec<Command> {
         self.state.named_account = None;
         match action {
             Action::Open { room } => return self.open(room),
+            Action::AcceptInvitation { room } => {
+                let opening = self.state.accept(&room);
+                return self.opened(room, opening);
+            }
             Action::Send { text, mentions } => {
                 let text = text.trim();
                 match &self.state.open_room {
@@ -775,7 +821,9 @@ impl View {
             Action::Reply { .. } | Action::Edit { .. } => {}
             Action::Delete { event_id } => return vec![Command::Delete { event_id }],
             Action::React { event_id, key } => {
-                self.used_emoji(key.clone());
+                if message::takes_emoji(&self.state.items, &event_id, &key) {
+                    self.used_emoji(key.clone());
+                }
                 return vec![Command::React { event_id, key }];
             }
             Action::UsedEmoji { emoji } => self.used_emoji(emoji),
@@ -806,8 +854,10 @@ impl View {
             Action::Reveal { .. } => {}
             Action::ShowHit { room, event_id } => {
                 // The open room again: out of its thread.
-                let mut commands = self.open(room);
-                if self.state.open_room.is_some() {
+                let mut commands = self.open(room.clone());
+                // Not in another room that stays open because the hit's
+                // own did not open (no longer listed, or an invitation).
+                if self.state.open_room.as_deref() == Some(room.as_str()) {
                     commands.push(Command::Reveal { event_id });
                 }
                 return commands;
@@ -1082,6 +1132,16 @@ impl View {
                 self.effects.push(Effect::SignOut(account));
             }
             Action::SignOut { .. } => {}
+            // Only one that is listed as not started.
+            Action::RemoveAccount { profile } => {
+                if self
+                    .problems
+                    .iter()
+                    .any(|problem| problem.profile == profile)
+                {
+                    self.effects.push(Effect::Remove(profile));
+                }
+            }
             Action::Prefs { prefs } => {
                 let prefs = prefs.tidied(&self.dictionaries);
                 if !prefs.link_previews {
@@ -1109,6 +1169,11 @@ impl View {
     fn open(&mut self, room: String) -> Vec<Command> {
         // Again: out of a thread, back to the room.
         let opening = self.state.open(&room);
+        self.opened(room, opening)
+    }
+
+    /// What follows from opening `room` here.
+    fn opened(&mut self, room: String, opening: Opening) -> Vec<Command> {
         // An invitation is not joined by one tap (on the list, or on the
         // notification "X invited you"): the second one joins.
         if let Opening::Invitation { name } = &opening {
@@ -1163,6 +1228,26 @@ impl View {
             return Vec::new();
         }
         self.open(room)
+    }
+
+    /// Removing an account that did not start came to an end.
+    pub fn removed(&mut self, profile: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.problems.retain(|problem| problem.profile != profile);
+                self.events.push(Event::Problems {
+                    problems: self.problems.clone(),
+                });
+                // Its name is free again: the next account under it does
+                // not take over its rooms in the sections, nor its folds.
+                let prefixes = [accounts::prefix_for(profile)];
+                let mut changed = self.state.sections.forget_account(&prefixes, 0);
+                changed |= self.state.folded.forget_profile(profile);
+                self.state.config_dirty |= changed;
+                self.notice(format!("'{profile}' is removed from this phone."));
+            }
+            Err(error) => self.notice(format!("'{profile}' could not be removed: {error}")),
+        }
     }
 
     fn move_to_section(&mut self, room: String, section: Option<String>) {
@@ -1778,11 +1863,148 @@ mod tests {
                 },
             ],
         });
-        let events: Vec<serde_json::Value> = view
-            .take_events()
+        view.problems = vec![Problem {
+            profile: "old".into(),
+            text: "old: its store could not be opened".into(),
+        }];
+        // What came of the above (the rooms, the conversation, what is
+        // open), and one of every other kind.
+        let mut events = view.take_events();
+        let mut failing = account("school");
+        failing.sync = SyncStatus::Error("no answer".into());
+        let verify = |state| Event::Verify { state };
+        events.extend([
+            Event::Accounts {
+                accounts: vec![account("default"), failing],
+            },
+            Event::Sidebar {
+                lines: view.lines(),
+            },
+            Event::Picture {
+                event_id: "$3".into(),
+                url: "data:image/png;base64,AQID".into(),
+            },
+            Event::LinkPreview {
+                url: "https://example.org".into(),
+                title: "Example".into(),
+                description: "A domain for examples.".into(),
+            },
+            Event::Typing {
+                room: "!a".into(),
+                names: vec!["Amy".into()],
+            },
+            Event::Notice {
+                text: "Open a room first.".into(),
+            },
+            Event::Settings(view.settings()),
+            verify(Some(VerifyState::Incoming {
+                device: "Amy's phone".into(),
+            })),
+            verify(Some(VerifyState::Waiting)),
+            verify(Some(VerifyState::Emojis(vec![
+                ("🐶".into(), "Dog".into()),
+                ("🔑".into(), "Key".into()),
+            ]))),
+            verify(Some(VerifyState::Confirming)),
+            verify(Some(VerifyState::Done)),
+            verify(Some(VerifyState::Failed("the emoji did not match".into()))),
+            verify(None),
+            Event::RecoveryKey {
+                key: "EsTc 5Sv9 fixt ure0".into(),
+            },
+            Event::RoomDetails {
+                details: RoomDetails {
+                    room_id: "!a".into(),
+                    name: "Lunch".into(),
+                    topic: "Where to".into(),
+                    alias: "#lunch:example.org".into(),
+                    encrypted: true,
+                    members: vec![mothrix_core::model::RoomMember {
+                        user_id: "@amy:example.org".into(),
+                        name: "Amy".into(),
+                        role: "admin".into(),
+                        invited: false,
+                    }],
+                    can_invite: true,
+                    ..RoomDetails::default()
+                },
+            },
+            Event::SignIn(SignIn {
+                busy: false,
+                lines: vec!["Signing in…".into()],
+                error: Some("password sign-in failed".into()),
+            }),
+            Event::Members {
+                room: "!a".into(),
+                members: vec![Member {
+                    user_id: "@amy:example.org".into(),
+                    name: "Amy".into(),
+                }],
+            },
+            Event::SearchResults {
+                query: "lunch".into(),
+                hits: vec![SearchHit {
+                    room_id: "!a".into(),
+                    room_name: "Lunch".into(),
+                    event_id: "$1".into(),
+                    sender: "Amy".into(),
+                    ts_ms: 1_763_500_000_000,
+                    text: "lunch at one?".into(),
+                }],
+            },
+            Event::Reveal {
+                event_id: "$1".into(),
+            },
+            Event::Media {
+                event_id: "$3".into(),
+                path: "/tmp/photo.jpg".into(),
+            },
+            Event::Favourites {
+                emoji: view.favourites(),
+            },
+            Event::Problems {
+                problems: view.problems.clone(),
+            },
+        ]);
+        // Every kind of event has to be among them. A new variant does
+        // not compile here until it has a number: give it the next one,
+        // raise `KINDS`, and add a sample above (and its decoding in
+        // `ios/App/Models.swift`).
+        const KINDS: usize = 20;
+        let kind = |event: &Event| match event {
+            Event::Accounts { .. } => 0,
+            Event::Rooms { .. } => 1,
+            Event::Sidebar { .. } => 2,
+            Event::Opened { .. } => 3,
+            Event::Timeline { .. } => 4,
+            Event::Picture { .. } => 5,
+            Event::LinkPreview { .. } => 6,
+            Event::Typing { .. } => 7,
+            Event::Notice { .. } => 8,
+            Event::Settings(_) => 9,
+            Event::Verify { .. } => 10,
+            Event::RecoveryKey { .. } => 11,
+            Event::RoomDetails { .. } => 12,
+            Event::SignIn(_) => 13,
+            Event::Members { .. } => 14,
+            Event::SearchResults { .. } => 15,
+            Event::Reveal { .. } => 16,
+            Event::Media { .. } => 17,
+            Event::Favourites { .. } => 18,
+            Event::Problems { .. } => 19,
+        };
+        let sampled: std::collections::BTreeSet<usize> = events.iter().map(kind).collect();
+        assert_eq!(
+            sampled,
+            (0..KINDS).collect(),
+            "a sample of every kind of event"
+        );
+        let mut events: Vec<serde_json::Value> = events
             .iter()
             .map(|event| serde_json::to_value(event).unwrap())
             .collect();
+        // What leaves as an effect.
+        events.push(notify_event("work/!b", "Standup"));
         let snapshot = serde_json::json!({ "type": "snapshot", "snapshot": view.snapshot() });
         for event in &events {
             assert!(event["type"].is_string(), "{event}");
@@ -2252,6 +2474,156 @@ mod tests {
     }
 
     #[test]
+    fn a_hit_whose_room_does_not_open_is_not_looked_for_in_the_open_one() {
+        let mut view = view();
+        let mut rooms = view.state.rooms.clone();
+        rooms.push(RoomEntry {
+            is_invite: true,
+            ..room("!party", 0)
+        });
+        view.on_update(Update::Rooms(rooms));
+        view.act(Action::Open { room: "!a".into() });
+        let hit = |room: &str| Action::ShowHit {
+            room: room.into(),
+            event_id: "$9".into(),
+        };
+        // No longer listed, and an invitation (which is only asked about).
+        assert!(view.act(hit("!gone")).is_empty());
+        assert!(view.act(hit("!party")).is_empty());
+        assert_eq!(view.snapshot().open_room.as_deref(), Some("!a"));
+        // In the open room itself: only looked for.
+        assert!(matches!(
+            &view.act(hit("!a"))[..],
+            [Command::Reveal { event_id }] if event_id == "$9"
+        ));
+    }
+
+    #[test]
+    fn an_invitation_is_asked_about_when_opened_and_joined_by_the_app_s_own_answer() {
+        let mut view = view();
+        let mut rooms = view.state.rooms.clone();
+        rooms.push(RoomEntry {
+            is_invite: true,
+            name: "Party".into(),
+            ..room("!party", 0)
+        });
+        view.on_update(Update::Rooms(rooms));
+        view.take_events();
+        // A tap on the notification "X invited you" joins nothing.
+        assert!(view.notification_clicked("!party".into()).is_empty());
+        assert!(view.take_events().iter().any(|event| matches!(
+            event, Event::Notice { text } if text.contains("Party") && text.contains("invitation")
+        )));
+        assert_eq!(view.snapshot().open_room, None);
+        // "Join" in the room list's own question: one step.
+        let mut view = self::view();
+        let mut rooms = view.state.rooms.clone();
+        rooms.push(RoomEntry {
+            is_invite: true,
+            ..room("!party", 0)
+        });
+        view.on_update(Update::Rooms(rooms));
+        view.take_events();
+        assert!(matches!(
+            &act(&mut view, serde_json::json!({"type": "accept_invitation", "room": "!party"}))[..],
+            [Command::Open(room)] if room == "!party"
+        ));
+        assert_eq!(view.snapshot().open_room.as_deref(), Some("!party"));
+        assert!(
+            !view
+                .take_events()
+                .iter()
+                .any(|event| matches!(event, Event::Notice { .. }))
+        );
+    }
+
+    #[test]
+    fn what_was_begun_in_one_conversation_is_not_sent_into_another() {
+        let mut view = view();
+        view.act(Action::Open { room: "!a".into() });
+        view.take_events();
+        let poll = || Action::CreatePoll {
+            question: "Lunch?".into(),
+            answers: vec!["Pizza".into(), "Soup".into()],
+            multiple: false,
+            hidden: false,
+        };
+        assert_eq!(view.act_in(poll(), "!a", None).len(), 1);
+        // A thread of the room was entered meanwhile.
+        view.act(Action::OpenThread {
+            event_id: "$root".into(),
+        });
+        assert!(view.act_in(poll(), "!a", None).is_empty());
+        assert!(view.act_in(send("hi"), "!a", None).is_empty());
+        assert!(matches!(
+            &view.act_in(send("hi"), "!a", Some("$root"))[..],
+            [Command::Send { thread: Some(thread), .. }, ..] if thread == "$root"
+        ));
+        // Another room was opened meanwhile (a notification tapped).
+        view.take_events();
+        view.notification_clicked("work/!b".into());
+        assert!(view.act_in(poll(), "!a", Some("$root")).is_empty());
+        assert!(view.act_in(send("hi"), "!a", None).is_empty());
+        assert!(view.take_events().iter().any(|event| matches!(
+            event, Event::Notice { text } if text.starts_with("Not sent")
+        )));
+        assert!(view.take_effects().is_empty());
+    }
+
+    #[test]
+    fn an_account_that_did_not_start_can_be_removed() {
+        let config: Config = toml::from_str(
+            r#"
+            folded = ["old:ROOMS"]
+            [[sections]]
+            name = "Family"
+            rooms = ["old/!x", "!a"]
+            "#,
+        )
+        .unwrap();
+        let mut view = View::new(
+            vec![account("default")],
+            vec![Problem {
+                profile: "old".into(),
+                text: "old: its store could not be opened".into(),
+            }],
+            &config,
+        );
+        view.take_effects();
+        // Only one that is listed as not started: not a running one, and
+        // no name the app made up.
+        for profile in ["default", "../x", ""] {
+            act(
+                &mut view,
+                serde_json::json!({"type": "remove_account", "profile": profile}),
+            );
+            assert!(view.take_effects().is_empty(), "{profile}");
+        }
+        act(
+            &mut view,
+            serde_json::json!({"type": "remove_account", "profile": "old"}),
+        );
+        assert_eq!(view.take_effects(), [Effect::Remove("old".into())]);
+        // It could not be: it stays listed, and the user reads why.
+        view.take_events();
+        view.removed("old", Err("another mothrix runs with it".into()));
+        assert_eq!(view.snapshot().problems.len(), 1);
+        assert!(view.take_events().iter().any(|event| matches!(
+            event, Event::Notice { text } if text.contains("another mothrix")
+        )));
+        // Removed: no longer listed, and its rooms and folds do not wait
+        // for the next account of that name.
+        view.removed("old", Ok(()));
+        assert!(view.snapshot().problems.is_empty());
+        assert!(view.take_events().contains(&Event::Problems {
+            problems: Vec::new()
+        }));
+        assert_eq!(view.shown().sections[0].rooms, ["!a"]);
+        assert!(view.shown().folded.is_empty());
+        assert_eq!(view.take_effects(), [Effect::SaveConfig]);
+    }
+
+    #[test]
     fn a_poll_needs_a_question_and_two_answers() {
         let mut view = view();
         view.act(Action::Open { room: "!a".into() });
@@ -2285,6 +2657,41 @@ mod tests {
             event, Event::Favourites { emoji } if emoji[0] == "🦋"
         )));
         assert_eq!(view.snapshot().favourites[0], "🦋");
+    }
+
+    #[test]
+    fn a_reaction_taken_back_or_of_plain_text_is_no_emoji_taken() {
+        let mut view = view();
+        view.act(Action::Open { room: "!a".into() });
+        view.on_update(Update::Timeline {
+            room_id: "!a".into(),
+            items: vec![Item {
+                event_id: "$1".into(),
+                reactions: vec![mothrix_core::model::Reaction {
+                    key: "🦋".into(),
+                    count: 1,
+                    mine: true,
+                    ..Default::default()
+                }],
+                ..item("hi")
+            }],
+        });
+        view.take_events();
+        view.take_effects();
+        let react = |key: &str| Action::React {
+            event_id: "$1".into(),
+            key: key.into(),
+        };
+        // Both still go to the server.
+        assert_eq!(view.act(react("🦋")).len(), 1);
+        assert_eq!(view.act(react("+1 from me")).len(), 1);
+        assert!(view.take_effects().is_empty());
+        assert!(
+            !view
+                .take_events()
+                .iter()
+                .any(|event| matches!(event, Event::Favourites { .. }))
+        );
     }
 
     #[test]

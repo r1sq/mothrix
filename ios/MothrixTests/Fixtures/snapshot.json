@@ -8093,7 +8093,12 @@
     "members": [],
     "open_room": "!a",
     "pictures": {},
-    "problems": [],
+    "problems": [
+      {
+        "profile": "old",
+        "text": "old: its store could not be opened"
+      }
+    ],
     "rooms": [
       {
         "account": 0,

@@ -112,6 +112,21 @@ pub fn for_terminal(text: &str) -> String {
         .collect()
 }
 
+/// Whether reacting with `key` to the message `event_id` of `items` is an
+/// emoji taken, to count among the user's favourites: a reaction given,
+/// not one taken back, and an emoji. Others' reactions can be any text,
+/// and joining one of those is no emoji taken.
+pub fn takes_emoji(items: &[Item], event_id: &str, key: &str) -> bool {
+    crate::emoji::is_emoji(key)
+        && !items.iter().any(|item| {
+            item.event_id == event_id
+                && item
+                    .reactions
+                    .iter()
+                    .any(|reaction| reaction.key == key && reaction.mine)
+        })
+}
+
 /// The poll of the message `event_id` among `items`.
 pub fn poll_of<'a>(items: &'a [Item], event_id: &str) -> Option<&'a Poll> {
     items.iter().find_map(|item| match &item.kind {
@@ -202,6 +217,35 @@ pub fn is_command(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::model::PollAnswer;
+
+    #[test]
+    fn only_an_emoji_given_counts_as_one_taken() {
+        let mut reacted = item(ItemKind::Text, "hi");
+        reacted.event_id = "$1".into();
+        reacted.reactions = vec![
+            crate::model::Reaction {
+                key: "👍".into(),
+                count: 2,
+                mine: true,
+                ..Default::default()
+            },
+            crate::model::Reaction {
+                key: "🦋".into(),
+                count: 1,
+                ..Default::default()
+            },
+        ];
+        let items = [reacted];
+        // Given: one nobody gave yet, and one of someone else's.
+        assert!(takes_emoji(&items, "$1", "🎉"));
+        assert!(takes_emoji(&items, "$1", "🦋"));
+        // Taken back.
+        assert!(!takes_emoji(&items, "$1", "👍"));
+        // Our own on another message is not this one's.
+        assert!(takes_emoji(&items, "$2", "👍"));
+        // A reaction of any text is no emoji.
+        assert!(!takes_emoji(&items, "$1", "+1 from me"));
+    }
 
     #[test]
     fn copy_leaves_out_what_a_terminal_or_editor_would_obey() {

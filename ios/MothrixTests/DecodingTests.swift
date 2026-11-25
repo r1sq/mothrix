@@ -35,11 +35,47 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(snapshot.items[4].kind, .dateDivider)
     }
 
+    /// The fixture holds one event of every kind Rust sends (its test does
+    /// not compile when a kind is added without a sample).
     func testEveryEventDecodes() throws {
         let events = try JSONDecoder.mothrix.decode([MothrixEvent].self, from: fixture("events"))
-        XCTAssertFalse(events.isEmpty)
+        XCTAssertGreaterThanOrEqual(events.count, 21)
         for event in events {
             if case .other(let type) = event { XCTFail("not understood: \(type)") }
+            if case .timeline(_, _, _, let dropped) = event { XCTAssertEqual(dropped, 0) }
         }
+        XCTAssertTrue(events.contains { if case .problems(let list) = $0 { return list.first?.profile == "old" }; return false })
+        XCTAssertTrue(events.contains { if case .verify(.some(.emojis(let pairs))) = $0 { return pairs.count == 2 }; return false })
+    }
+
+    /// A message this app cannot read (a number past what it holds, a
+    /// kind it does not know) is left out; the conversation stays.
+    func testABadMessageDoesNotDropTheConversation() throws {
+        let all = try JSONSerialization.jsonObject(with: fixture("events")) as? [[String: Any]] ?? []
+        guard var timeline = all.last(where: { $0["type"] as? String == "timeline" }),
+              var items = timeline["items"] as? [[String: Any]], var bad = items.first
+        else { return XCTFail("no timeline with messages in the fixture") }
+        let good = items.count
+        bad["ts_ms"] = "never"
+        items.insert(bad, at: 1)
+        items.append(["kind": ["Riddle": 1]])
+        timeline["items"] = items
+        let event = try JSONDecoder.mothrix.decode(
+            MothrixEvent.self, from: JSONSerialization.data(withJSONObject: timeline))
+        guard case .timeline(_, _, let kept, let dropped) = event else { return XCTFail("\(event)") }
+        XCTAssertEqual(kept.count, good)
+        XCTAssertEqual(dropped, 2)
+        XCTAssertEqual(kept.first?.senderName, "Amy")
+
+        // The snapshot reads its messages the same way.
+        var snapshot = try JSONSerialization.jsonObject(with: fixture("snapshot")) as? [String: Any] ?? [:]
+        var inner = snapshot["snapshot"] as? [String: Any] ?? [:]
+        inner["items"] = items
+        snapshot["snapshot"] = inner
+        let whole = try JSONDecoder.mothrix.decode(
+            MothrixEvent.self, from: JSONSerialization.data(withJSONObject: snapshot))
+        guard case .snapshot(let read) = whole else { return XCTFail("\(whole)") }
+        XCTAssertEqual(read.items.count, good)
+        XCTAssertEqual(read.dropped, 2)
     }
 }

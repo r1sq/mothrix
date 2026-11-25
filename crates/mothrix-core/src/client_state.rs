@@ -311,6 +311,21 @@ impl ClientState {
         }
     }
 
+    /// Open an invitation the front end itself asked about (the iPhone's
+    /// "join or decline" on a tap in the room list): the answer was
+    /// "join", so there is nothing left to ask. Anything else opens as
+    /// [`ClientState::open`] opens it.
+    pub fn accept(&mut self, room: &str) -> Opening {
+        if self
+            .rooms
+            .iter()
+            .any(|known| known.id == room && known.is_invite)
+        {
+            self.wanted = Some(room.to_owned());
+        }
+        self.open(room)
+    }
+
     /// When an invitation was asked about, if one was and has not been
     /// opened again yet.
     pub fn invitation_asked(&self) -> Option<Instant> {
@@ -614,6 +629,29 @@ mod tests {
         });
         state.set_rooms(rooms);
         state
+    }
+
+    #[test]
+    fn an_invitation_the_front_end_asked_about_itself_is_joined_at_once() {
+        let mut state = invited();
+        let joined = state.accept("!party");
+        assert!(matches!(&joined.commands()[..], [Command::Open(room)] if room == "!party"));
+        assert_eq!(state.open_room.as_deref(), Some("!party"));
+        // A room that is not listed is not waited for: listed later as
+        // an invitation, it is asked about like any other.
+        let mut state = two_accounts();
+        assert_eq!(state.accept("!party"), Opening::NotListed);
+        let mut rooms = state.rooms.clone();
+        rooms.push(RoomEntry {
+            is_invite: true,
+            ..room("!party", 0)
+        });
+        state.set_rooms(rooms);
+        assert!(matches!(state.open("!party"), Opening::Invitation { .. }));
+        // A room joined long ago opens as ever, and leaves nothing behind.
+        let mut state = invited();
+        assert!(matches!(state.accept("!a"), Opening::Opened { .. }));
+        assert!(matches!(state.open("!party"), Opening::Invitation { .. }));
     }
 
     #[test]

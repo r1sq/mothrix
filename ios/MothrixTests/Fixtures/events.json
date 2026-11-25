@@ -440,5 +440,345 @@
     "room": "!a",
     "thread": null,
     "type": "opened"
+  },
+  {
+    "accounts": [
+      {
+        "label": "default",
+        "own_name": null,
+        "profile": "default",
+        "sync": "Connecting",
+        "user_id": "@me:default",
+        "verified": null
+      },
+      {
+        "label": "school",
+        "own_name": null,
+        "profile": "school",
+        "sync": {
+          "Error": "no answer"
+        },
+        "user_id": "@me:school",
+        "verified": null
+      }
+    ],
+    "type": "accounts"
+  },
+  {
+    "lines": [
+      {
+        "folded": false,
+        "indent": false,
+        "label": "default",
+        "mentions": 1,
+        "row": {
+          "index": 0,
+          "type": "account"
+        },
+        "target": {
+          "key": "@default",
+          "type": "fold"
+        },
+        "unread": 2
+      },
+      {
+        "folded": false,
+        "indent": false,
+        "label": "PEOPLE",
+        "mentions": 0,
+        "row": {
+          "title": "PEOPLE",
+          "type": "header"
+        },
+        "target": {
+          "key": "default:PEOPLE",
+          "type": "fold"
+        },
+        "unread": 0
+      },
+      {
+        "folded": false,
+        "indent": false,
+        "label": "!a",
+        "mentions": 1,
+        "row": {
+          "index": 0,
+          "type": "room"
+        },
+        "target": {
+          "key": "!a",
+          "type": "room"
+        },
+        "unread": 2
+      },
+      {
+        "folded": false,
+        "indent": false,
+        "label": "work",
+        "mentions": 0,
+        "row": {
+          "index": 1,
+          "type": "account"
+        },
+        "target": {
+          "key": "@work",
+          "type": "fold"
+        },
+        "unread": 0
+      },
+      {
+        "folded": false,
+        "indent": false,
+        "label": "ROOMS",
+        "mentions": 0,
+        "row": {
+          "title": "ROOMS",
+          "type": "header"
+        },
+        "target": {
+          "key": "work:ROOMS",
+          "type": "fold"
+        },
+        "unread": 0
+      },
+      {
+        "folded": false,
+        "indent": false,
+        "label": "work/!b",
+        "mentions": 0,
+        "row": {
+          "index": 1,
+          "type": "room"
+        },
+        "target": {
+          "key": "work/!b",
+          "type": "room"
+        },
+        "unread": 0
+      }
+    ],
+    "type": "sidebar"
+  },
+  {
+    "event_id": "$3",
+    "type": "picture",
+    "url": "data:image/png;base64,AQID"
+  },
+  {
+    "description": "A domain for examples.",
+    "title": "Example",
+    "type": "link_preview",
+    "url": "https://example.org"
+  },
+  {
+    "names": [
+      "Amy"
+    ],
+    "room": "!a",
+    "type": "typing"
+  },
+  {
+    "text": "Open a room first.",
+    "type": "notice"
+  },
+  {
+    "account_filter": null,
+    "prefs": {
+      "images": "auto",
+      "languagetool_api_key": "",
+      "languagetool_languages": [],
+      "languagetool_url": "",
+      "languagetool_username": "",
+      "link_previews": false,
+      "long_messages": 15,
+      "mixed_list": false,
+      "notifications": true,
+      "proxy": "",
+      "read_receipts": true,
+      "room_events": true,
+      "sort": "recent",
+      "spaces": true,
+      "spellcheck": true,
+      "typing_notices": true,
+      "updates": true
+    },
+    "sections": [],
+    "theme": {
+      "accent": "#f2c46d",
+      "background": "#140a1e",
+      "border": "#3a2448",
+      "dim": "#7c6488",
+      "error": "#e0565b",
+      "fg": "#efdcb8",
+      "mention": "#e8608f",
+      "name": "mothrix",
+      "selection_bg": "#2e1a3d",
+      "selection_fg": "#f6e6c4",
+      "senders": [
+        "#f2c46d",
+        "#c08cf0",
+        "#ef8d27",
+        "#e87fa8",
+        "#8fb8de",
+        "#a9c98a"
+      ],
+      "success": "#a9c98a",
+      "unread": "#ef8d27"
+    },
+    "themes": [
+      "mothrix",
+      "tokyo-night",
+      "catppuccin",
+      "gruvbox",
+      "nord",
+      "everforest",
+      "rose-pine"
+    ],
+    "type": "settings",
+    "unread_only": false
+  },
+  {
+    "state": {
+      "Incoming": {
+        "device": "Amy's phone"
+      }
+    },
+    "type": "verify"
+  },
+  {
+    "state": "Waiting",
+    "type": "verify"
+  },
+  {
+    "state": {
+      "Emojis": [
+        [
+          "🐶",
+          "Dog"
+        ],
+        [
+          "🔑",
+          "Key"
+        ]
+      ]
+    },
+    "type": "verify"
+  },
+  {
+    "state": "Confirming",
+    "type": "verify"
+  },
+  {
+    "state": "Done",
+    "type": "verify"
+  },
+  {
+    "state": {
+      "Failed": "the emoji did not match"
+    },
+    "type": "verify"
+  },
+  {
+    "state": null,
+    "type": "verify"
+  },
+  {
+    "key": "EsTc 5Sv9 fixt ure0",
+    "type": "recovery_key"
+  },
+  {
+    "details": {
+      "alias": "#lunch:example.org",
+      "can_ban": false,
+      "can_invite": true,
+      "can_kick": false,
+      "can_rename": false,
+      "can_set_topic": false,
+      "encrypted": true,
+      "members": [
+        {
+          "invited": false,
+          "name": "Amy",
+          "role": "admin",
+          "user_id": "@amy:example.org"
+        }
+      ],
+      "name": "Lunch",
+      "room_id": "!a",
+      "topic": "Where to"
+    },
+    "type": "room_details"
+  },
+  {
+    "busy": false,
+    "error": "password sign-in failed",
+    "lines": [
+      "Signing in…"
+    ],
+    "type": "sign_in"
+  },
+  {
+    "members": [
+      {
+        "name": "Amy",
+        "user_id": "@amy:example.org"
+      }
+    ],
+    "room": "!a",
+    "type": "members"
+  },
+  {
+    "hits": [
+      {
+        "event_id": "$1",
+        "room_id": "!a",
+        "room_name": "Lunch",
+        "sender": "Amy",
+        "text": "lunch at one?",
+        "ts_ms": 1763500000000
+      }
+    ],
+    "query": "lunch",
+    "type": "search_results"
+  },
+  {
+    "event_id": "$1",
+    "type": "reveal"
+  },
+  {
+    "event_id": "$3",
+    "path": "/tmp/photo.jpg",
+    "type": "media"
+  },
+  {
+    "emoji": [
+      "👍",
+      "❤️",
+      "😂",
+      "🎉",
+      "😮",
+      "😢",
+      "🙏",
+      "👀",
+      "✅",
+      "🔥",
+      "👏",
+      "😀"
+    ],
+    "type": "favourites"
+  },
+  {
+    "problems": [
+      {
+        "profile": "old",
+        "text": "old: its store could not be opened"
+      }
+    ],
+    "type": "problems"
+  },
+  {
+    "room": "work/!b",
+    "title": "Standup",
+    "type": "notify"
   }
 ]

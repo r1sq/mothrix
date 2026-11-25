@@ -80,6 +80,12 @@ final class EventSink: Listener, @unchecked Sendable {
     }
 }
 
+/// A conversation: a room (its key) and the thread shown in it, if one is.
+struct Conversation: Equatable {
+    var room: String?
+    var thread: String?
+}
+
 @MainActor
 final class Store: ObservableObject {
     @Published var accounts: [Account] = []
@@ -125,7 +131,7 @@ final class Store: ObservableObject {
     /// screen).
     @Published var startProblem: String?
     /// Accounts that could not be restored, and why.
-    @Published var problems: [String] = []
+    @Published var problems: [Problem] = []
     /// The push token, once iOS gave it (base64).
     private var pushToken: String?
     private var mothrix: Mothrix?
@@ -170,6 +176,16 @@ final class Store: ObservableObject {
         #endif
     }
 
+    /// Messages of the conversation that could not be read were left out
+    /// of it (`Lossy`); the others are shown.
+    private func leftOut(_ count: Int) {
+        guard count > 0 else { return }
+        print("mothrix: \(count) message(s) could not be read")
+        #if DEBUG
+        notice = "\(count) message(s) not understood"
+        #endif
+    }
+
     func handle(_ event: MothrixEvent) {
         switch event {
         case .snapshot(let snapshot):
@@ -178,6 +194,7 @@ final class Store: ObservableObject {
             lines = snapshot.lines
             show(room: snapshot.openRoom, thread: snapshot.thread)
             items = snapshot.items
+            leftOut(snapshot.dropped)
             theme = snapshot.settings.theme
             themes = snapshot.settings.themes
             prefs = snapshot.settings.prefs
@@ -202,11 +219,12 @@ final class Store: ObservableObject {
         case .opened(let room, let thread):
             show(room: room, thread: thread)
             if let room { Self.clearNotifications(of: [room]) }
-        case .timeline(let room, let thread, let list):
+        case .timeline(let room, let thread, let list, let dropped):
             // Rust only sends the open room or thread, and may do so
             // before the `opened` event that says which it is.
             show(room: room, thread: thread)
             items = list
+            leftOut(dropped)
         case .picture: break  // Decoded by the sink, off the main thread.
         case .typing(let room, let names):
             if room == openRoom { typing = names }
@@ -240,6 +258,7 @@ final class Store: ObservableObject {
             previews[url] = (title, description)
         case .signIn(let state): signIn = state
         case .favourites(let emoji): favourites = emoji
+        case .problems(let list): problems = list
         case .notify: break  // In the foreground the room list shows it.
         case .other: break
         }
@@ -255,17 +274,26 @@ final class Store: ObservableObject {
 
     // What the user does.
 
-    /// What goes into "the open room": Rust is told which room that was
-    /// here, and does not send into another it opened meanwhile.
+    /// The conversation shown now.
+    var conversation: Conversation { Conversation(room: openRoom, thread: thread) }
+
+    /// What goes into "the open room": Rust is told which room and thread
+    /// that was here, and does not send into another it opened meanwhile.
     private static let intoTheOpenRoom: Set<String> = [
         "send", "reply", "upload", "send_voice", "create_poll",
     ]
 
-    func act(_ type: String, _ fields: [String: Any] = [:]) {
+    /// `place`: the conversation this was begun in (a sheet, a picker or
+    /// a recording takes its time, and another chat may be shown by
+    /// now); without, the one shown now.
+    func act(_ type: String, _ fields: [String: Any] = [:], in place: Conversation? = nil) {
         var action = fields
         action["type"] = type
-        if Self.intoTheOpenRoom.contains(type), let room = openRoom {
+        let place = place ?? conversation
+        if Self.intoTheOpenRoom.contains(type), let room = place.room {
             action["in_room"] = room
+            // Left out: the room itself, no thread of it.
+            if let thread = place.thread { action["in_thread"] = thread }
         }
         guard let data = try? JSONSerialization.data(withJSONObject: action),
               let json = String(data: data, encoding: .utf8)
@@ -278,6 +306,10 @@ final class Store: ObservableObject {
     }
 
     func open(_ room: String) { act("open", ["room": room]) }
+    /// "Join" in the question about an invitation: Rust does not ask again.
+    func acceptInvitation(_ room: String) { act("accept_invitation", ["room": room]) }
+    /// Take an account that did not start off this phone.
+    func removeAccount(_ profile: String) { act("remove_account", ["profile": profile]) }
     func send(_ text: String, mentions: [Member] = []) {
         act("send", ["text": text, "mentions": Self.mentionList(mentions)])
     }
@@ -291,8 +323,11 @@ final class Store: ObservableObject {
         mentions.map { ["user_id": $0.userId, "name": $0.name] }
     }
 
-    func createPoll(question: String, answers: [String], multiple: Bool, hidden: Bool) {
-        act("create_poll", ["question": question, "answers": answers, "multiple": multiple, "hidden": hidden])
+    func createPoll(
+        question: String, answers: [String], multiple: Bool, hidden: Bool, in place: Conversation? = nil
+    ) {
+        act("create_poll", ["question": question, "answers": answers, "multiple": multiple, "hidden": hidden],
+            in: place)
     }
 
     /// An emoji was put into a message: it counts among the favourites.
@@ -364,12 +399,12 @@ final class Store: ObservableObject {
         act("sign_in", ["server": server, "user": user, "password": password, "name": ""])
     }
     /// A recorded voice message (a file of the app's), into the open room.
-    func sendVoice(_ file: URL, durationMs: UInt64, waveform: [Float]) {
-        act("send_voice", ["path": file.path, "duration_ms": durationMs, "waveform": waveform])
+    func sendVoice(_ file: URL, durationMs: UInt64, waveform: [Float], in place: Conversation? = nil) {
+        act("send_voice", ["path": file.path, "duration_ms": durationMs, "waveform": waveform], in: place)
     }
 
-    func sendPicture(_ data: Data, name: String, caption: String = "") {
-        sendFile(data, name: name, caption: caption)
+    func sendPicture(_ data: Data, name: String, caption: String = "", in place: Conversation? = nil) {
+        sendFile(data, name: name, caption: caption, in: place)
     }
 
     func edit(_ eventId: String, _ text: String, mentions: [Member] = []) {
@@ -402,10 +437,10 @@ final class Store: ObservableObject {
     }
 
     /// Any file, under its own name.
-    func sendFile(_ data: Data, name: String, caption: String = "") {
+    func sendFile(_ data: Data, name: String, caption: String = "", in place: Conversation? = nil) {
         let caption = caption.trimmingCharacters(in: .whitespacesAndNewlines)
         act("upload", ["name": name, "data": data.base64EncodedString(),
-                       "caption": caption.isEmpty ? NSNull() : caption])
+                       "caption": caption.isEmpty ? NSNull() : caption], in: place)
     }
 
     func focus(_ focused: Bool) { mothrix?.focus(focused: focused) }
@@ -492,11 +527,30 @@ final class Store: ObservableObject {
 
     private var badge = -1
     private var badgeCounts: [String: Int]? = nil
+    /// The rooms that had something new when they were last listed.
+    private var hadNew = Set<String>()
+
+    /// The app icon's number follows the rooms, and notifications of
+    /// rooms that had something new and have nothing new any more (read
+    /// here, or on another device) go. Not those of every room without
+    /// anything new: the list can be behind a push that just came, and
+    /// would take its notification away again.
+    private func notificationsFollowRooms() {
+        showBadge(again: false)
+        let nowNew = Set(rooms.filter { $0.unread > 0 || $0.mentions > 0 }.map(\.id))
+        Self.clearNotifications(of: hadNew.subtracting(nowNew))
+        hadNew = nowNew
+        writeShareList()
+    }
 
     /// The app icon's number: rooms with something new (as Synapse counts
-    /// for pushes), muted ones left out. Notifications of rooms that have
-    /// nothing new any more (read here, or on another device) go.
-    private func notificationsFollowRooms() {
+    /// for pushes), muted ones left out. `again`: also when it is what
+    /// the app said last. A push that came while the app is in front left
+    /// its server's count behind (`Badge.heard`), for a message the open
+    /// room may have read already.
+    func showBadge(again: Bool) {
+        // Before the first list there is nothing to count.
+        guard started else { return }
         let new = rooms.filter { ($0.unread > 0 || $0.mentions > 0) && $0.notify != "Mute" }
         // Per account, where the notification extension finds them: it
         // goes on from these while the app does not run (`Badge`).
@@ -504,14 +558,11 @@ final class Store: ObservableObject {
         for (index, account) in accounts.enumerated() {
             perAccount[account.profile] = new.filter { $0.account == index }.count
         }
-        if perAccount != badgeCounts {
+        if again || perAccount != badgeCounts {
             badgeCounts = perAccount
             badge = Badge.know(perAccount)
             UNUserNotificationCenter.current().setBadgeCount(badge)
         }
-        let read = Set(rooms.filter { $0.unread == 0 && $0.mentions == 0 }.map(\.id))
-        Self.clearNotifications(of: read)
-        writeShareList()
     }
 
     private var shareList = Data()

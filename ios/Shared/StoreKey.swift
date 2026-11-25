@@ -39,7 +39,8 @@ enum StoreKey {
     }
 
     /// The passphrase, made if there is none yet. Nil when the Keychain
-    /// cannot be used (then stores are made without one, as before).
+    /// cannot be used: a store made then has none, and the sign-in says
+    /// so (Rust's `sign_in_held`).
     static func passphrase() -> String? {
         if let kept = read() { return kept }
         var bytes = [UInt8](repeating: 0, count: 32)
