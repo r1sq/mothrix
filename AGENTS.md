@@ -61,9 +61,10 @@ the TUI they are `crate::matrix` and so on, like its own.
 | `stable_polls.rs` | polls in the event formats the SDK does not tally |
 | `verify.rs` | emoji verification, with own devices and with other people |
 | `model.rs` | the plain data the UI shows |
-| `message.rs` | the rules about one message, alike in both front ends: what can be done to it (`offered`), what copy takes, which answers a vote sends, what a new poll needs, which mentions go out |
+| `message.rs` | the rules about one message, alike in both front ends: what can be done to it (`offered`), what copy takes (`copy_text`, `copyable`), which answers a vote sends, what a new poll needs, which mentions go out, what is a command and no text (`is_command`), which reaction counts as an emoji taken (`takes_emoji`), and other people's words made fit for printing past the drawn screen (`for_terminal`) |
+| `forward.rs` | forwarding: what the copy of a message says (who wrote it, without the HTML it came with), and taking its file along to the homeserver of the account that sends the copy (`carry`) |
 | `prefs.rs` | `Prefs`: the preferences, with their defaults |
-| `config.rs` | the config file; `Shown` is what of the UI it keeps |
+| `config.rs` | the config file; `Shown` is what of the UI it keeps; the proxy rules (`proxy_rules`: the config's proxy or the environment's, each for what it is for, `NO_PROXY`) and the HTTP clients that go by them (`http_client_at` for what is not Matrix, `matrix_http_client` for the SDK) |
 | `theme.rs` | the colour themes, built in and own (`[[themes]]`), as plain `#rrggbb` colours; a sender's colour |
 | `sidebar.rs` | the room list: sections, order, folding, filters, its lines (`Sidebar::lines`); `Folds`, the fold state |
 | `inline.rs`, `codeblock.rs` | Markdown as shown in messages |
@@ -168,8 +169,13 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   dialog drawn without `dialog()` has to call `unseen` itself.
 - **Invitations** are joined by opening them, so `ClientState::open`
   asks first (`Opening::Invitation`) and joins on the next open soon
-  after; both front ends get the rule by calling it. A room a command
-  asked for (`Update::GoTo`) opens without asking.
+  after; both front ends get the rule by calling it. `open` is for what
+  the user did (a key, a click, a tap). A room that opens by itself (the
+  one open last time, one that waited to be listed) goes through
+  `ClientState::show`, which asks too but never joins. A room a command
+  asked for (`Update::GoTo`) opens without asking, and so does one the
+  front end asked about itself (`ClientState::accept`, the iPhone's
+  "join").
 - **A new key** goes into the help too (`app/help.rs`): rebindable
   shortcuts (`keys::ACTIONS`) and slash commands (`COMMANDS`) appear by
   themselves, with a test that each has its text; the room list,
@@ -199,16 +205,27 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   into ratatui as they are; `ui::scrub` takes control characters and
   bidi overrides out of the finished screen, so no drawing code has to.
   Anything written to the terminal past ratatui (`notify.rs`, pictures)
-  has to encode what it sends itself.
+  has to encode what it sends itself. The command-line modes print a
+  server's or another person's words through `message::for_terminal`
+  (`plain` in `main.rs`).
 - **Drawing goes through `ui::put`,** never `frame.render_widget`:
   ratatui panics on a rect outside the screen, and a dialog laid out for
   more rows than a low or just shrunk terminal has must only lose them.
   `ui::line_at` gives a dialog's row, or nothing where it has none.
 - **Private files.** What holds tokens, drafts or decrypted attachments
   is written with `folders::write_private` (owner-only, whole or not at
-  all) into a `folders::private_dir`. Deleting an account's files is
+  all) into a `folders::private_dir`. It writes through a link (a
+  `config.toml` kept with one's dotfiles), and in place where no file
+  can be made beside the target. Deleting an account's files is
   `matrix::forget`, which leaves the lock file: the lock is on that
-  file. `Config::read` tells a missing config from a broken one; who
+  file. Whether a profile holds an account is `matrix::has_session`
+  (the file is there), not whether the session can be read: a damaged
+  one still has a store with keys beside it. An account that is on disk
+  but did not start is removed with `Accounts::remove_left_out` (the
+  iPhone) or `mothrix logout`; both end in `matrix::logout`, which signs
+  the device out with the session file's token alone where the store
+  does not open, and says when the server could not be told.
+  `Config::read` tells a missing config from a broken one; who
   saves the config or needs its proxy uses it, never `load`.
 - **Where a command waits.** `Session::handle` (`matrix.rs`) lists every
   `Command` and says which of three ways it goes: what uses or changes
@@ -217,7 +234,16 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   account (invite, rename, join, key backup, forwarding into a room)
   goes to `account_lane`, in order among themselves, so that a slow
   server holds up only these; lookups get a task each. A new command
-  has to be put into one of the three there.
+  has to be put into one of the three there. A fourth way is for events
+  the timeline's queue cannot send (a vote or a poll's end in a format
+  the SDK has no type for): `beside_lane`, one after the other.
+- **What writes into the conversation names it.** `Send`, `SendFile`,
+  `SendVoice`, `CreatePoll` and `PasteImage` carry the room and the
+  thread they were written in (`ClientState::conversation`), and the
+  backend refuses them when that is not what it follows
+  (`matrix::written_into`): after a thread failed to open it follows
+  the room. A refused message's text comes back (`Update::NotSent`). A
+  new command of this kind does the same.
 - **Two sync loops.** The SDK's `SyncService` runs the room list and
   encryption on separate connections. Answers the crypto layer queues
   after a message that arrived in a room (verification with another
@@ -238,10 +264,14 @@ next to the logic and one in `ui.rs` that renders the screen and clicks.
   in every round of the UIs' loops) sends an account its changed share
   (`Command::SetSections`). Nothing is sent before an account has said
   what it stores (`sections::Said`; content this build cannot read makes
-  it silent again). What is written carries who wrote it (`by`: device
-  and a time that only grows), which is how `sections::Watch` tells our
-  own writes coming back from another device's. Snapshot mode only
-  reads. The config file keeps a copy; fold state stays per device.
+  it silent again, and the user is told once). What is written carries
+  who wrote it (`by`: device and a time that only grows, made with the
+  share in `Sync::to_send`), which is how our own writes coming back
+  are told from another device's (`sections::Told::own`): `Sync` passes
+  over an older one while a newer is on its way, and the backend gives
+  up a write that has not reached the server when another device's
+  content is told (`matrix::watch_sections`), since it is a picture from
+  before that. Snapshot mode only reads. The config file keeps a copy; fold state stays per device.
   Signing an account out takes its rooms out of the sections and its
   fold state away.
 - **Unread counts** are the larger of the server's and the SDK's own
@@ -338,7 +368,23 @@ could only be tested here.
 - **mothrix-ios**: see [docs/ios.md](docs/ios.md) ("State"). Not yet:
   SSO sign-in in the app, link previews (unseen), threads' first replies
   (the SDK loads only the latest; `[older]` fetches more). Untried on a
-  phone: the camera, a real microphone, the share extension.
+  phone: the camera, a real microphone, the share extension. Of round
+  two of the second audit (issue #99) nothing was seen on a phone or in
+  the simulator, and its Swift was written where it cannot be compiled:
+  `[share …]` for an attachment that is saved and not opened
+  (`Event::MediaKept`), a refused message's text coming back
+  (`Event::NotSent`), a link's preview asked with its conversation, the
+  removal of an account whose store does not open (signing it out with
+  its token alone was never tried against a server, in the terminal
+  either), the 25 s limit of a notification's Reply.
+- **The terminal's accounts dialog** lists the accounts that run. One
+  that did not start is named in the status bar at the start and removed
+  with `mothrix logout --profile NAME`; the dialog neither shows nor
+  removes it (the iPhone app's menu does both).
+- **CI items of #98** (the keychain password on `security`'s command
+  line and the certificate imported without a fingerprint check in
+  `.forgejo/workflows/ios-sign-check.yml`) wait for the Mac: they can
+  only be changed where the workflow can be run.
 - **OAuth login** (servers without password or SSO login, as matrix.org is
   becoming): not built. The SDK needs the client to register with a public
   web address of the project: that is https://github.com/r1sq/mothrix

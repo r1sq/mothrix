@@ -56,7 +56,8 @@ no settings until the file is put right.
   `languagetool_username`, `languagetool_api_key`
 - `proxy = "http://proxy:3128"` for networks without a direct way out:
   every connection goes through it (`https://` and `socks5://`,
-  `socks5h://`, `socks4://` proxies work too). Without it the
+  `socks5h://`, `socks4://` proxies work too; `socks://`, as some
+  desktops write it into `all_proxy`, is read as `socks5://`). Without it the
   environment's, as other programs read them: `HTTPS_PROXY`,
   `HTTP_PROXY` (for `http://` addresses, a LanguageTool server for one)
   and `ALL_PROXY`, none of them for the hosts `NO_PROXY` names; else

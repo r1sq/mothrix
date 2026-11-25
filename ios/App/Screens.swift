@@ -82,7 +82,7 @@ struct ProblemRow: View {
             Button("remove", role: .destructive) { store.removeAccount(problem.profile) }
             Button("cancel", role: .cancel) {}
         } message: {
-            Text("Its messages and keys go from this phone. Encrypted messages can be read again after signing in only with the recovery key or another verified device.")
+            Text("Its messages and keys go from this phone. Encrypted messages can be read again after signing in only with the recovery key or another verified device. It is signed out on its server too; if that cannot be done, mothrix says so, and its session is then to be removed from another device.")
         }
     }
 }
@@ -480,6 +480,12 @@ struct RoomView: View {
             editing = nil
             mentioned = []
             restoreDraft(new)
+        }
+        // A message that was not sent comes back into the empty box.
+        .onChange(of: store.returned) { _, back in
+            guard let back else { return }
+            if text.isEmpty { text = back } else { store.notice = "Not sent: \(back)" }
+            store.returned = nil
         }
         .onChange(of: text) { _, now in
             store.keepDraft(draftKey, now)
@@ -960,8 +966,17 @@ struct MessageRow: View {
             .overlay { if store.fetchingMedia == message.eventId { ProgressView() } }
             if !message.caption.isEmpty { Text(message.caption).font(.mono()) }
         case .media:
-            WordButton(store.fetchingMedia == message.eventId ? "[fetching \(message.body) …]" : mediaLabel) {
-                store.openMedia(message.eventId)
+            if let kept = store.keptMedia[message.eventId] {
+                // Saved, and of a kind that is not opened here: the
+                // share sheet passes it on (to Files, to another app).
+                ShareLink(item: kept) {
+                    Text("[share \(message.body)]").font(.mono()).foregroundStyle(store.theme.accentColor)
+                }
+                .buttonStyle(.plain)
+            } else {
+                WordButton(store.fetchingMedia == message.eventId ? "[fetching \(message.body) …]" : mediaLabel) {
+                    store.openMedia(message.eventId)
+                }
             }
             if !message.caption.isEmpty { Text(message.caption).font(.mono()) }
         case .redacted:

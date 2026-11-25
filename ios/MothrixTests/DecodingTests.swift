@@ -46,6 +46,9 @@ final class DecodingTests: XCTestCase {
         }
         XCTAssertTrue(events.contains { if case .problems(let list) = $0 { return list.first?.profile == "old" }; return false })
         XCTAssertTrue(events.contains { if case .verify(.some(.emojis(let pairs))) = $0 { return pairs.count == 2 }; return false })
+        // Written in a room's own conversation: no thread.
+        XCTAssertTrue(events.contains { if case .notSent(_, let thread, _) = $0 { return thread == nil }; return false })
+        XCTAssertTrue(events.contains { if case .mediaKept(_, _, let name) = $0 { return name == "invoice.html" }; return false })
     }
 
     /// A message this app cannot read (a number past what it holds, a

@@ -751,6 +751,24 @@
     "type": "media"
   },
   {
+    "event_id": "$4",
+    "name": "invoice.html",
+    "path": "/tmp/a1b2c3-invoice.html",
+    "type": "media_kept"
+  },
+  {
+    "room": "!a",
+    "text": "written in a thread",
+    "thread": "$1",
+    "type": "not_sent"
+  },
+  {
+    "room": "work/!b",
+    "text": "written in a room",
+    "thread": null,
+    "type": "not_sent"
+  },
+  {
     "emoji": [
       "👍",
       "❤️",

@@ -49,6 +49,9 @@ pub enum Opening {
     /// the room is now.
     Again { left_thread: bool },
     /// It is open now (its notifications are read), after `previous`.
+    /// (`previous` is the room itself for an invitation of the open room,
+    /// kicked from and invited again while it was shown, that was
+    /// accepted: opening it anew is what joins it.)
     Opened {
         room: String,
         previous: Option<String>,
@@ -124,7 +127,7 @@ pub struct ClientState {
     /// A room to open as soon as it is listed (one just joined).
     pub goto: Option<String>,
     /// Link previews by address (title, description), and the addresses
-    /// asked for (once each).
+    /// asked for (once each while a room is shown).
     pub link_previews: HashMap<String, (String, String)>,
     pub link_previews_asked: HashSet<String>,
     /// Whether the user looks at mothrix: the terminal has the focus, the
@@ -145,10 +148,11 @@ pub struct ClientState {
     /// The invitation the user was just asked about, and when (see
     /// [`ClientState::open`]).
     invite_asked: Option<(String, Instant)>,
-    /// A room a command of the user asked for (joined, made, a chat
-    /// started): should the list still call it an invitation when it
-    /// opens, there is nothing left to ask.
-    wanted: Option<String>,
+    /// The rooms a command of the user asked for (joined, made, a chat
+    /// started), and since when: should the list still call one an
+    /// invitation when it opens, there is nothing left to ask. Each for
+    /// [`INVITATION_ASKED`] at most, and until it is listed as joined.
+    wanted: HashMap<String, Instant>,
 }
 
 impl Default for ClientState {
@@ -176,7 +180,7 @@ impl Default for ClientState {
             config_dirty: false,
             last_unread: HashMap::new(),
             invite_asked: None,
-            wanted: None,
+            wanted: HashMap::new(),
         }
     }
 }
@@ -281,26 +285,62 @@ impl ClientState {
     /// so the first time only says so ([`Opening::Invitation`]) and
     /// opening it again soon joins: a slip of the hand, or a tap on the
     /// notification "X invited you", would else join a stranger's room.
+    ///
+    /// This is for what the user did: a key, a click, a tap. A room that
+    /// opens by itself goes through [`ClientState::show`].
     pub fn open(&mut self, room: &str) -> Opening {
+        self.open_as(room, true)
+    }
+
+    /// Show a room nobody pressed a key for just now: the one open last
+    /// time, one the account says to go to, one that waited to be listed.
+    /// As [`ClientState::open`], but it never answers the question about
+    /// an invitation: only the user's own second open joins, however
+    /// soon after the first this comes. (An invitation asked about this
+    /// way is joined by the user's next open, as after their own first.)
+    pub fn show(&mut self, room: &str) -> Opening {
+        self.open_as(room, false)
+    }
+
+    /// `by_user`: the user opened it, so this may be the second open of
+    /// an invitation that joins it.
+    fn open_as(&mut self, room: &str, by_user: bool) -> Opening {
         let Some(known) = self.rooms.iter().find(|known| known.id == room) else {
             return Opening::NotListed;
         };
-        let asked = self
-            .invite_asked
-            .take()
-            .is_some_and(|(asked, at)| asked == room && at.elapsed() < INVITATION_ASKED);
-        let wanted = self.wanted.take_if(|wanted| wanted == room).is_some();
-        if known.is_invite && !asked && !wanted {
-            let name = known.name.clone();
-            self.invite_asked = Some((room.to_owned(), Instant::now()));
-            return Opening::Invitation { name };
+        let is_invite = known.is_invite;
+        let name = known.name.clone();
+        let wanted = self
+            .wanted
+            .remove(room)
+            .is_some_and(|since| since.elapsed() < INVITATION_ASKED);
+        if is_invite && !wanted {
+            let asked = self
+                .invite_asked
+                .as_ref()
+                .is_some_and(|(asked, at)| asked == room && at.elapsed() < INVITATION_ASKED);
+            if !(asked && by_user) {
+                // Asked already and shown by itself again: the question
+                // stands as it was put, with its time.
+                if !asked {
+                    self.invite_asked = Some((room.to_owned(), Instant::now()));
+                }
+                return Opening::Invitation { name };
+            }
         }
-        if self.open_room.as_deref() == Some(room) {
+        self.invite_asked = None;
+        // An invitation that is the open room (kicked and invited again
+        // while it was shown) is opened anew: that is what joins it.
+        if self.open_room.as_deref() == Some(room) && !is_invite {
             return Opening::Again {
                 left_thread: self.leave_thread(),
             };
         }
         let previous = self.open_room.replace(room.to_owned());
+        // Which links were asked about is the room's that was shown: an
+        // account that would not look one up there (the room encrypted,
+        // or not the one it followed yet) is asked again in the next.
+        self.link_previews_asked.clear();
         self.open_thread = None;
         self.items.clear();
         self.members.clear();
@@ -321,7 +361,7 @@ impl ClientState {
             .iter()
             .any(|known| known.id == room && known.is_invite)
         {
-            self.wanted = Some(room.to_owned());
+            self.wanted.insert(room.to_owned(), Instant::now());
         }
         self.open(room)
     }
@@ -361,6 +401,14 @@ impl ClientState {
         true
     }
 
+    /// The conversation shown, for what is written into it: the room
+    /// (its key) and the thread in it. Commands that write name it
+    /// ([`Command::Send`]), and the account refuses them when it follows
+    /// another by then.
+    pub fn conversation(&self) -> Option<(String, Option<String>)> {
+        Some((self.open_room.clone()?, self.open_thread.clone()))
+    }
+
     /// Whether the open room's pinned messages are shown: nothing can be
     /// written there.
     pub fn pinned_view(&self) -> bool {
@@ -381,7 +429,7 @@ impl ClientState {
                 }
             }
             Update::GoTo(room) => {
-                self.wanted = Some(room.clone());
+                self.wanted.insert(room.clone(), Instant::now());
                 self.goto = Some(room);
                 self.take_goto().map_or(Taken::Nothing, Taken::Show)
             }
@@ -499,6 +547,16 @@ impl ClientState {
             }
         }
         self.rooms = rooms;
+        // A room asked for is waited for until the list calls it joined,
+        // and not for long: an invitation to it that comes another day
+        // is asked about like any other.
+        let rooms = &self.rooms;
+        self.wanted.retain(|wanted, since| {
+            since.elapsed() < INVITATION_ASKED
+                && !rooms
+                    .iter()
+                    .any(|room| room.id == *wanted && !room.is_invite)
+        });
         news
     }
 }
@@ -597,8 +655,11 @@ mod tests {
         let mut state = two_accounts();
         assert_eq!(state.open("!x"), Opening::NotListed);
         assert_eq!(state.open_room, None);
+        state.link_previews_asked.insert("https://x.example".into());
         let opening = state.open("!a");
         assert!(matches!(&opening.commands()[..], [Command::Open(room)] if room == "!a"));
+        // Which links were asked about is each room's own.
+        assert!(state.link_previews_asked.is_empty());
         state.open_thread = Some("$root".into());
         state.items.push(Item::default());
         state.members.push(Member::default());
@@ -696,6 +757,91 @@ mod tests {
             Taken::Show(room) if room == "!party"
         ));
         assert!(matches!(state.open("!party"), Opening::Opened { .. }));
+    }
+
+    #[test]
+    fn a_room_that_opens_by_itself_never_answers_the_question_about_an_invitation() {
+        // The room open last time is an invitation now; every room list
+        // of the start shows it again.
+        let mut state = invited();
+        assert!(matches!(state.show("!party"), Opening::Invitation { .. }));
+        let asked = state.invitation_asked();
+        assert!(asked.is_some());
+        assert!(matches!(state.show("!party"), Opening::Invitation { .. }));
+        assert_eq!(state.open_room, None);
+        // The question stands as it was put: the user's own open joins.
+        assert_eq!(state.invitation_asked(), asked);
+        assert!(matches!(state.open("!party"), Opening::Opened { .. }));
+
+        // The user asked, and the room is shown by itself right after.
+        let mut state = invited();
+        assert!(matches!(state.open("!party"), Opening::Invitation { .. }));
+        assert!(matches!(state.show("!party"), Opening::Invitation { .. }));
+        assert_eq!(state.open_room, None);
+        // Any other room shows as it opens.
+        assert!(matches!(state.show("!a"), Opening::Opened { .. }));
+    }
+
+    #[test]
+    fn the_invitation_of_the_open_room_is_asked_about_and_then_joined() {
+        // Kicked and invited again while the room is shown.
+        let mut state = two_accounts();
+        state.open("!a");
+        let mut rooms = state.rooms.clone();
+        rooms[0].is_invite = true;
+        state.set_rooms(rooms);
+        assert!(matches!(state.open("!a"), Opening::Invitation { .. }));
+        let second = state.open("!a");
+        assert_eq!(
+            second,
+            Opening::Opened {
+                room: "!a".into(),
+                previous: Some("!a".into())
+            }
+        );
+        assert!(matches!(&second.commands()[..], [Command::Open(room)] if room == "!a"));
+        // The front end's own "join" does the same.
+        let mut state = two_accounts();
+        state.open("!a");
+        let mut rooms = state.rooms.clone();
+        rooms[0].is_invite = true;
+        state.set_rooms(rooms);
+        assert!(matches!(state.accept("!a"), Opening::Opened { .. }));
+    }
+
+    #[test]
+    fn rooms_asked_for_are_waited_for_each_for_a_while_and_until_joined() {
+        // Two "/join"s, the second answered first: both open unasked.
+        let mut state = invited();
+        let mut rooms = state.rooms.clone();
+        rooms.push(RoomEntry {
+            is_invite: true,
+            ..room("!club", 0)
+        });
+        state.set_rooms(rooms.clone());
+        state.take(Update::GoTo("!party".into()));
+        state.take(Update::GoTo("!club".into()));
+        assert!(matches!(state.show("!party"), Opening::Opened { .. }));
+        assert!(matches!(state.show("!club"), Opening::Opened { .. }));
+
+        // Listed as joined: no longer waited for. Left, and invited
+        // again later, it is asked about.
+        let mut state = invited();
+        state.take(Update::GoTo("!party".into()));
+        let mut joined = state.rooms.clone();
+        joined[3].is_invite = false;
+        state.set_rooms(joined.clone());
+        assert!(state.wanted.is_empty());
+        joined[3].is_invite = true;
+        state.set_rooms(joined);
+        assert!(matches!(state.open("!party"), Opening::Invitation { .. }));
+
+        // Asked for long ago (the room list never called it joined).
+        let mut state = invited();
+        state
+            .wanted
+            .insert("!party".into(), Instant::now() - INVITATION_ASKED);
+        assert!(matches!(state.show("!party"), Opening::Invitation { .. }));
     }
 
     #[test]

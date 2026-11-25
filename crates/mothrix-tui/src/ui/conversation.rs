@@ -643,7 +643,6 @@ fn rows(items: &[Item], options: &Options, collapsible: &mut HashSet<String>) ->
 /// show when the message is expanded (`x`, or a click on `+N`).
 const NAMES_SHOWN: usize = 3;
 
-/// Who reacted so: the user ("you") first, then the others in order.
 /// Where the links of a row are on the screen: (link, first column,
 /// cells) for the spans that are of a link (`links`, one entry per span).
 /// Measured the way the terminal library places a row, by what is drawn
@@ -672,6 +671,7 @@ fn link_spots(spans: &[Span], links: &[Option<usize>]) -> Vec<(usize, usize, usi
     spots
 }
 
+/// Who reacted so: the user ("you") first, then the others in order.
 fn reaction_names(reaction: &Reaction) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     if reaction.mine {

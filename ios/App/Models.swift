@@ -39,6 +39,11 @@ enum MothrixEvent: Decodable {
     case recoveryKey(String)
     case members(room: String, members: [Member])
     case media(eventId: String, path: String)
+    /// Saved and not opened (a kind that is not shown): to pass on.
+    case mediaKept(eventId: String, path: String, name: String)
+    /// A message that was not sent, back for the conversation it was
+    /// written in.
+    case notSent(room: String, thread: String?, text: String)
     case linkPreview(url: String, title: String, description: String)
     case problems([Problem])
     /// Something the app does not show yet.
@@ -47,7 +52,7 @@ enum MothrixEvent: Decodable {
     private enum Keys: String, CodingKey {
         case type, snapshot, accounts, rooms, lines, room, thread, items, eventId, url, names,
              text, emoji, title, query, hits, details, state, key, members, path, description,
-             problems
+             problems, name
     }
 
     init(from decoder: Decoder) throws {
@@ -96,6 +101,16 @@ enum MothrixEvent: Decodable {
             self = .media(
                 eventId: try c.decode(String.self, forKey: .eventId),
                 path: try c.decode(String.self, forKey: .path))
+        case "media_kept":
+            self = .mediaKept(
+                eventId: try c.decode(String.self, forKey: .eventId),
+                path: try c.decode(String.self, forKey: .path),
+                name: try c.decode(String.self, forKey: .name))
+        case "not_sent":
+            self = .notSent(
+                room: try c.decode(String.self, forKey: .room),
+                thread: try c.decodeIfPresent(String.self, forKey: .thread),
+                text: try c.decode(String.self, forKey: .text))
         case "link_preview":
             self = .linkPreview(
                 url: try c.decode(String.self, forKey: .url),

@@ -69,6 +69,11 @@ pub fn private_dir(dir: &Path) -> std::io::Result<()> {
 /// file it leads to is written, beside itself: moving the new file over
 /// the link would leave a plain file in its place and the linked one as
 /// it was.
+///
+/// Where no file may be made beside it (the linked file lies in a
+/// folder that is not the user's to write in, and is itself), it is
+/// written where it is: not "whole or not at all" then, but written,
+/// which is what was asked for.
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let path = &linked_to(path);
@@ -82,13 +87,27 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = options
-        .open(&temporary)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&temporary, path));
+    let write = |mut file: std::fs::File| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    };
+    let beside = match options.open(&temporary) {
+        Ok(file) => file,
+        // Only for this: a full disk, say, would empty the file in
+        // place and then fail to fill it.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let file = options.open(path)?;
+            // It may have been there, readable by others.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            }
+            return write(file);
+        }
+        Err(error) => return Err(error),
+    };
+    let written = write(beside).and_then(|()| std::fs::rename(&temporary, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
@@ -156,6 +175,37 @@ mod tests {
         assert!(file.exists(), "new files stay");
         sweep(&dir, std::time::Duration::ZERO);
         assert!(!file.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_in_a_folder_that_takes_no_new_files_is_written_where_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mothrix-inplace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (dotfiles, config) = (dir.join("dotfiles"), dir.join("config"));
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        // The config is linked into a folder nothing can be added to
+        // (kept by a tool that owns the folder); the file itself is the
+        // user's to write.
+        let real = dotfiles.join("mothrix.toml");
+        std::fs::write(&real, "old and long").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = config.join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::fs::set_permissions(&dotfiles, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let written = write_private(&link, b"new");
+        std::fs::set_permissions(&dotfiles, std::fs::Permissions::from_mode(0o700)).unwrap();
+        written.unwrap();
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(&dotfiles).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -74,6 +74,29 @@ static RUNNING: std::sync::Mutex<Option<mpsc::WeakUnboundedSender<Request>>> =
 /// would use one account's encryption keys at the same time.
 static ONE_CLIENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// How long a short-lived client may work while it has the turn
+/// ([`ONE_CLIENT`]). The app's start waits for a notification's Reply
+/// that is still being sent, and the SDK tries a request the server
+/// answers with an error again and again, for a quarter of an hour:
+/// nobody waits that long for the app to come up. (iOS gives a
+/// notification's extension and an action about half a minute anyway.)
+const TURN: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// The share extension's turn: a file takes its time to go up, but not
+/// for ever either. Its process is its own, so no app waits for it.
+const SHARING: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `work`, given up after `limit`.
+async fn within<T>(
+    limit: std::time::Duration,
+    work: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(limit, work).await {
+        Ok(done) => done,
+        Err(_) => Err(anyhow::anyhow!("the server did not answer in time")),
+    }
+}
+
 fn one_client() -> std::sync::MutexGuard<'static, ()> {
     ONE_CLIENT
         .lock()
@@ -239,11 +262,11 @@ pub fn notification(
 ) -> Result<Option<NotificationContent>, MothrixError> {
     let _alone = one_client();
     let runtime = start(Path::new(&folder), "nse")?;
-    let content: anyhow::Result<_> = runtime.block_on(async {
+    let content: anyhow::Result<_> = runtime.block_on(within(TURN, async {
         let client = signed_in(&profile).await?;
         let found = mothrix_core::push::notification(&client, &room_id, &event_id).await?;
         Ok(found.map(|found| NotificationContent::of(found, &profile, &room_id)))
-    });
+    }));
     Ok(content?)
 }
 
@@ -292,11 +315,11 @@ pub fn respond(
     }
     let _alone = alone;
     let runtime = start(Path::new(&folder), "action")?;
-    let done: anyhow::Result<()> = runtime.block_on(async {
+    let done: anyhow::Result<()> = runtime.block_on(within(TURN, async {
         let (profile, room_id) = accounts::split_by_profile(&matrix::signed_in_profiles(), &room);
         let client = signed_in(&profile).await?;
         answer_in(&client, room_id, text, thread).await
-    });
+    }));
     Ok(done?)
 }
 
@@ -358,7 +381,7 @@ pub fn share(
 ) -> Result<(), MothrixError> {
     let _alone = one_client();
     let runtime = start(Path::new(&folder), "share")?;
-    let done: anyhow::Result<()> = runtime.block_on(async {
+    let done: anyhow::Result<()> = runtime.block_on(within(SHARING, async {
         let (profile, room_id) = accounts::split_by_profile(&matrix::signed_in_profiles(), &room);
         let client = signed_in(&profile).await?;
         let text = text.filter(|text| !text.trim().is_empty());
@@ -370,7 +393,7 @@ pub fn share(
             matrix::send_files(&client, room_id, &files, text).await?;
         }
         Ok(())
-    });
+    }));
     Ok(done?)
 }
 
@@ -434,7 +457,8 @@ enum Request {
     /// could not be.
     Removed {
         profile: String,
-        result: Result<(), String>,
+        /// `Ok(Some(..))`: removed, but still signed in on the server.
+        result: Result<Option<String>, String>,
     },
     /// A notification's action in a room (its key), while the app runs;
     /// `done` hears how it went.
@@ -632,8 +656,8 @@ fn carry_out(
             accounts.sign_out(view, account);
         }
         Effect::Remove(profile) => {
-            // In a task: its session is signed out on the server where
-            // it still opens, which may take its time.
+            // In a task: its session is signed out on the server, which
+            // may take its time.
             let removal = accounts.remove_left_out(&profile);
             let requests = requests.clone();
             tokio::spawn(async move {
@@ -642,6 +666,8 @@ fn carry_out(
             });
         }
         Effect::Upload {
+            room_id,
+            thread,
             name,
             data,
             caption,
@@ -649,6 +675,8 @@ fn carry_out(
             Ok(path) => accounts.send(
                 view,
                 Command::SendFile {
+                    room_id,
+                    thread,
                     path: path.display().to_string(),
                     caption,
                 },
@@ -743,6 +771,27 @@ mod tests {
 
     fn free() -> bool {
         ONE_CLIENT.try_lock().is_ok()
+    }
+
+    #[test]
+    fn a_short_lived_client_s_work_is_given_up_after_its_time() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // A server that never answers (or the SDK trying it again and
+        // again): the turn ends all the same.
+        let short = std::time::Duration::from_millis(30);
+        let never = within(short, std::future::pending::<anyhow::Result<()>>());
+        let error = runtime.block_on(never).unwrap_err();
+        assert!(error.to_string().contains("in time"), "{error}");
+        let soon = within(TURN, async {
+            tokio::time::sleep(short).await;
+            Ok(7)
+        });
+        assert_eq!(runtime.block_on(soon).unwrap(), 7);
+        // Short enough for someone waiting for the app to come up.
+        assert!(TURN <= std::time::Duration::from_secs(30));
     }
 
     fn wait_until(what: impl Fn() -> bool) {

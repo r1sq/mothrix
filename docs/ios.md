@@ -62,7 +62,15 @@ passphrase out later, an account whose store has one does not start and
 the app says why.
 
 An account that did not start is listed with its reason in the menu and
-on the sign-in screen, and can be removed from the phone there.
+on the sign-in screen, and can be removed from the phone there. It is
+signed out on its server too (with its session's token alone when its
+store does not open), so that its pusher stops; when the server cannot
+be told, the app says so, and the session is to be removed from another
+device.
+
+An attachment of a kind that is not opened (a web page, a program) is
+saved, and its message then offers `[share …]`: the share sheet passes it
+on to Files or another app.
 
 ## How a notification gets to the phone
 
@@ -188,6 +196,11 @@ Not seen yet: taking a photo (the simulator has no camera), recording
 with a real microphone, a count-only push (Synapse sends one when
 something was read elsewhere; the extension then only sets the number),
 the share extension's 120 MB limit with a big upload, link previews.
+Written without a Mac at hand and seen by no one yet (round two of the
+second audit): `[share …]` for a saved attachment, a refused message's
+text coming back into the message box or its conversation's draft, the
+removal of an account whose store does not open signing it out on the
+server, the time limit of a notification's Reply (25 s).
 
 Known gaps:
 

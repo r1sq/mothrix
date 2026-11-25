@@ -86,8 +86,10 @@ def main():
         for advisory_id in ids:
             advisory = ask(f"vulns/{urllib.parse.quote(advisory_id, safe='')}")
             line = f"{name} {version}: {advisory_id} {advisory.get('summary', '')}"
-            # The same flaw can come under several names (RUSTSEC, GHSA, CVE).
-            names = {advisory_id, *advisory.get("aliases", [])}
+            # The same flaw can come under several names (RUSTSEC, GHSA,
+            # CVE): as aliases, or, where a database took it over from
+            # another, as related.
+            names = {advisory_id, *advisory.get("aliases", []), *advisory.get("related", [])}
             reasons = [(key, why) for key, why in ACCEPTED.items() if key[0] == name and key[1] in names]
             kind = informational(advisory, name)
             if reasons:

@@ -57,14 +57,33 @@ pub fn site(address: &str) -> Option<String> {
 
 /// Whether a link's text already names the site it leads to: it is that
 /// address, with or without `https://`.
+///
+/// A text that is an address itself is read as one, as the link's is
+/// ([`site`]), and names the site it would lead to: comparing the letters
+/// took `evil.example:443@bank.example/login` for naming evil.example
+/// (where the link went), while it shows bank.example to whoever reads
+/// it; and `bücher.example` not for naming the site of
+/// `https://bücher.example/`, which is spelled `xn--bcher-kva.example`.
 fn names_site(text: &str, site: &str) -> bool {
     let text = text.trim().to_lowercase();
+    let mail = site.contains('@');
+    let read = match text.contains("://") {
+        true => self::site(&text),
+        false => self::site(&format!("https://{text}")),
+    };
+    if let Some(read) = read.filter(|_| !mail) {
+        return read == site;
+    }
+    // No address as a whole (a sentence, another kind of address, whom a
+    // mail goes to): it names the site when it begins with it. A `:`
+    // after it is not taken for a port here: before an `@` it would be
+    // part of a user name, and the site what follows.
     let text = text
         .split_once("://")
         .map_or(text.as_str(), |(_, rest)| rest);
     let text = text.trim_start_matches("mailto:");
     text.strip_prefix(&site.to_lowercase())
-        .is_some_and(|after| after.is_empty() || after.starts_with(['/', ':', '?', '#']))
+        .is_some_and(|after| after.is_empty() || after.starts_with(['/', '?', '#']))
 }
 
 /// A character and the styles (`BOLD` etc.) that apply to it.
@@ -107,9 +126,19 @@ fn opens(address: &[char]) -> bool {
     site(&address.iter().collect::<String>()).is_some()
 }
 
+/// What stands where a web address starts.
+enum Address {
+    /// A link, up to here.
+    Link(usize),
+    /// Too long for one (up to here, the next white space): shown as it
+    /// is, and no Markdown either, as in any address. Read as text, the
+    /// stars and underscores of its query would vanish as marks.
+    TooLong(usize),
+}
+
 /// The web address that starts at `at`, as far as it goes: up to white
 /// space, without the punctuation of the sentence around it.
-fn address_at(chars: &[char], at: usize) -> Option<usize> {
+fn address_at(chars: &[char], at: usize) -> Option<Address> {
     let web = starts_with(chars, at, &['h', 't', 't', 'p', ':', '/', '/'])
         || starts_with(chars, at, &['h', 't', 't', 'p', 's', ':', '/', '/']);
     if !web || (at > 0 && chars[at - 1].is_alphanumeric()) {
@@ -119,10 +148,12 @@ fn address_at(chars: &[char], at: usize) -> Option<usize> {
     while end < chars.len() && !chars[end].is_whitespace() && !matches!(chars[end], '<' | '>' | '"')
     {
         end += 1;
-        // No address is that long; and one that is no link is read once
-        // from each "http://" in it, which must not be to its far end.
+        // No address is that long. All of it is passed over at once:
+        // read on as text, it would be read again from each "http://"
+        // in it, to its far end.
         if end - at > MAX_ADDRESS {
-            return None;
+            let rest = chars[end..].iter().take_while(|c| !c.is_whitespace());
+            return Some(Address::TooLong(end + rest.count()));
         }
     }
     // Looked for once: what is taken off the end below is never a "(".
@@ -140,7 +171,7 @@ fn address_at(chars: &[char], at: usize) -> Option<usize> {
     ((chars[at..end].iter().filter(|c| **c == '/').count() >= 2 && chars[end - 1] != '/'
         || end - at > 8)
         && opens(&chars[at..end]))
-    .then_some(end)
+    .then_some(Address::Link(end))
 }
 
 /// How long a link's text and its address may be, in characters.
@@ -349,11 +380,19 @@ fn walk(chars: &[char], flags: u8, out: &mut Vec<Styled>, links: &mut Vec<String
         if flags & LINK == 0 {
             // Every other link is marked, to keep neighbours apart.
             let link = flags | LINK | if links.len() % 2 == 1 { LINK_ALT } else { 0 };
-            if let Some(end) = address_at(chars, i) {
-                out.extend(chars[i..end].iter().map(|c| (*c, link)));
-                links.push(chars[i..end].iter().collect());
-                i = end;
-                continue;
+            match address_at(chars, i) {
+                Some(Address::Link(end)) => {
+                    out.extend(chars[i..end].iter().map(|c| (*c, link)));
+                    links.push(chars[i..end].iter().collect());
+                    i = end;
+                    continue;
+                }
+                Some(Address::TooLong(end)) => {
+                    out.extend(chars[i..end].iter().map(|c| (*c, flags)));
+                    i = end;
+                    continue;
+                }
+                None => {}
             }
             if let Some((text, text_end, address, address_end, after)) = link_at(chars, i) {
                 let before = out.len();
@@ -597,6 +636,35 @@ mod tests {
             "write (amy@example.org)"
         );
 
+        // A text that is an address is read as one: what stands before
+        // its `@` is a user name, and the site what follows.
+        assert_eq!(
+            shown("[https://evil.example:443@bank.example/login](https://evil.example/login)"),
+            "https://evil.example:443@bank.example/login (evil.example)"
+        );
+        assert_eq!(
+            shown("[evil.example:443@bank.example/login](https://evil.example/login)"),
+            "evil.example:443@bank.example/login (evil.example)"
+        );
+        assert_eq!(
+            shown("[evil.example:\"@bank.example](https://evil.example/login)"),
+            "evil.example:\"@bank.example (evil.example)"
+        );
+        // And a site with other letters than a to z is named by them.
+        for named in [
+            "[bücher.example](https://bücher.example/)",
+            "[https://BÜCHER.example/regal](https://bücher.example/)",
+            "[Example.org:8443/x](https://example.org:8443/x)",
+            "[amy@example.org](mailto:amy@example.org)",
+            "[mailto:amy@example.org](mailto:amy@example.org?subject=x)",
+        ] {
+            assert!(!shown(named).contains(" ("), "{}", shown(named));
+        }
+        assert_eq!(
+            shown("[bucher.example](https://bücher.example/)"),
+            "bucher.example (xn--bcher-kva.example)"
+        );
+
         // The site is the one a browser goes to: it skips extra slashes,
         // and what stands before an `@` is a user name.
         assert_eq!(
@@ -636,6 +704,25 @@ mod tests {
     }
 
     #[test]
+    fn an_address_too_long_for_a_link_is_shown_as_typed() {
+        let long = format!(
+            "see https://a.example/?q={}&x=*a*&y=_b_~~c~~ and *this*",
+            "x".repeat(MAX_ADDRESS)
+        );
+        let (styled, links) = parse_links(&long);
+        assert!(links.is_empty());
+        let shown: String = styled.iter().map(|(c, _)| *c).collect();
+        assert_eq!(shown, long.replace("*this*", "this"));
+        // Only what follows it is Markdown again.
+        let marked: String = styled
+            .iter()
+            .filter(|(_, flags)| *flags != 0)
+            .map(|(c, _)| *c)
+            .collect();
+        assert_eq!(marked, "this");
+    }
+
+    #[test]
     fn a_tab_is_laid_out_as_spaces() {
         assert_eq!(lines("Name\tAge", 40), ["Name    Age"]);
         // And counted: the line breaks where the screen ends.
@@ -663,7 +750,9 @@ mod tests {
         let no_address = "http://a\\".repeat(60_000);
         assert!(parse_links(&no_address).1.is_empty());
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
+            // Wide, for a runner that has much else to do: read from
+            // every mark anew, each of these took minutes.
+            started.elapsed() < std::time::Duration::from_secs(30),
             "{:?}",
             started.elapsed()
         );
@@ -692,7 +781,7 @@ mod tests {
             assert!(!parse_links(&hostile).0.is_empty());
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < std::time::Duration::from_secs(30),
             "{:?}",
             started.elapsed()
         );

@@ -538,8 +538,21 @@ impl App {
         }
     }
 
+    /// Open a room because the user said so (a key, a click).
     fn open(&mut self, room_id: String, commands: &mut Vec<Command>) {
         let opening = self.state.open(&room_id);
+        self.opened(room_id, opening, true, commands);
+    }
+
+    /// What follows from opening `room_id` here; `by_user`: with a key
+    /// or click, not by itself.
+    fn opened(
+        &mut self,
+        room_id: String,
+        opening: Opening,
+        by_user: bool,
+        commands: &mut Vec<Command>,
+    ) {
         // Whoever was told we are writing in the room we leave hears that
         // we stopped, before the backend turns to the other room.
         if matches!(opening, Opening::Opened { .. }) && !self.typing_told.is_empty() {
@@ -552,9 +565,24 @@ impl App {
             // Opening it would accept it: the first time only asks (the
             // rule is the client state's).
             Opening::Invitation { name } => {
-                self.notice = Some(format!(
-                    "{name} is an invitation: Enter or a click again joins it; its menu (right click, m) has \"Leave\" to turn it down."
-                ));
+                // The room open last time is not waited for any longer:
+                // every room list of the start would show it again.
+                let last_time = self.reopen.as_deref() == Some(room_id.as_str());
+                if last_time {
+                    self.reopen = None;
+                }
+                if last_time && !by_user {
+                    // Nobody asked to open it now, so nothing is asked
+                    // that the next Enter would answer.
+                    self.state.forget_invitation();
+                    self.notice = Some(format!(
+                        "{name}, open last time, is an invitation now: marked in the list."
+                    ));
+                } else {
+                    self.notice = Some(format!(
+                        "{name} is an invitation: Enter or a click again joins it; its menu (right click, m) has \"Leave\" to turn it down."
+                    ));
+                }
                 self.cursor_room = Some(room_id);
                 return;
             }
@@ -585,6 +613,10 @@ impl App {
         self.notice = None;
         self.clear_selection();
         self.cancel_compose();
+        // What was typed with no room open (Enter said "Open a room
+        // first.") was waiting for this one.
+        let typed = Some(self.composer.text().to_owned())
+            .filter(|typed| previous.is_none() && !typed.trim().is_empty());
         // What was being written stays with its room.
         if let Some(previous) = previous {
             self.keep_draft(&previous);
@@ -609,6 +641,16 @@ impl App {
             if !draft.trim().is_empty() && !is_command(&draft) {
                 self.typing_told = draft;
             }
+        }
+        if let Some(typed) = typed {
+            // After the draft found there, if there is one: neither is
+            // lost.
+            let draft = self.composer.text();
+            let both = match draft.trim().is_empty() {
+                true => typed,
+                false => format!("{draft}\n{typed}"),
+            };
+            self.composer.set(&both);
         }
         self.reopen = None;
         self.state_dirty = true;
@@ -667,7 +709,7 @@ impl App {
     /// rest of the sentence would go into the new room.
     fn show_asked_for(&mut self, room: String) {
         if !self.busy() {
-            return self.open_later(room);
+            return self.show_by_itself(room);
         }
         let name = self
             .state
@@ -679,10 +721,22 @@ impl App {
         self.notice = Some(format!("{name} is there: marked in the list."));
     }
 
-    /// Open a room outside a key press or click.
+    /// Open a room the user asked for outside a key press or click in
+    /// the terminal (a click on its notification).
     pub(crate) fn open_later(&mut self, room: String) {
         let mut commands = Vec::new();
         self.open(room, &mut commands);
+        self.effects
+            .extend(commands.into_iter().map(Effect::Command));
+    }
+
+    /// Open a room nobody pressed a key for just now (the one open last
+    /// time, one a command asked for that is listed at last): an
+    /// invitation is never joined this way ([`ClientState::show`]).
+    fn show_by_itself(&mut self, room: String) {
+        let opening = self.state.show(&room);
+        let mut commands = Vec::new();
+        self.opened(room, opening, false, &mut commands);
         self.effects
             .extend(commands.into_iter().map(Effect::Command));
     }
@@ -843,7 +897,10 @@ impl App {
         self.drop_pictures();
         self.viewport.follow_newest();
         self.clear_selection();
-        self.cancel_compose();
+        // The message a reply answers is not in the other conversation
+        // (a thread, or the room around it): the text goes along, as a
+        // message.
+        self.end_compose(false);
         self.focus = Focus::Composer;
     }
 
@@ -1008,6 +1065,10 @@ impl App {
                     .unwrap_or_default()
                     .trim()
                     .to_owned();
+                // An edit under way is over: the box holds that
+                // message's text, and what was set aside for it would
+                // else come back after some later edit, anywhere.
+                self.cancel_compose();
                 self.compose = Compose::Reply {
                     event_id: item.event_id,
                     label: format!("{}: {snippet}", item.sender_name),
@@ -1029,10 +1090,12 @@ impl App {
                 // with its mentions and the message it answers.
                 let answering =
                     matches!(self.compose, Compose::Reply { .. }).then(|| self.compose.clone());
-                if !matches!(self.compose, Compose::Edit { .. })
-                    && (!self.composer.is_empty() || answering.is_some())
-                {
-                    self.set_aside = Some(SetAside {
+                // (From one edit to the next, what waits is still what
+                // was written before the first.) Whatever was set aside
+                // before goes: nothing empty leaves an older text there.
+                if !matches!(self.compose, Compose::Edit { .. }) {
+                    let waits = !self.composer.is_empty() || answering.is_some();
+                    self.set_aside = waits.then(|| SetAside {
                         text: self.composer.text().to_owned(),
                         mentions: std::mem::take(&mut self.composer_mentions),
                         answering,
@@ -1164,12 +1227,19 @@ impl App {
     }
 
     fn cancel_compose(&mut self) {
+        self.end_compose(true);
+    }
+
+    /// No reply, no edit any more. Every way out of an edit but sending
+    /// it leads through here: what was set aside for it is taken up
+    /// again, as the reply it was only with `answering`.
+    fn end_compose(&mut self, answering: bool) {
         let editing = matches!(self.compose, Compose::Edit { .. });
         self.compose = Compose::Message;
         if editing {
             self.composer.clear();
             self.composer_mentions.clear();
-            self.take_up_again();
+            self.take_up_again(answering);
         }
     }
 
@@ -1222,7 +1292,7 @@ impl App {
                         && !self.busy()
                         && self.state.rooms.iter().any(|room| room.id == *id)
                 }) {
-                    self.open_later(room);
+                    self.show_by_itself(room);
                 }
                 return;
             }
@@ -1258,6 +1328,13 @@ impl App {
             // Only for apps that show attachments themselves (iOS); the
             // terminal opens them with the desktop's viewer.
             Update::MediaFile { .. } => {}
+            Update::NotSent { room_id, text, .. } => self.not_sent(room_id, text),
+            Update::MediaKept { path, .. } => {
+                self.notice = Some(format!(
+                    "Saved as {path} and not opened: mothrix only opens pictures, sound, video \
+                     and documents by itself."
+                ));
+            }
             // Taken by `Accounts::deliver`: into the sections, on to the
             // account of the room a message is forwarded to.
             Update::Sections(_) | Update::ToForward { .. } => {}
@@ -1752,27 +1829,27 @@ impl App {
                         self.notice = Some(format!("Themes: {}", names.join(", ")));
                     }
                 },
-                "poll" => match parse_poll(argument) {
-                    Ok(_) if self.state.open_room.is_none() => self.no_room(text),
-                    Ok((question, answers, multiple, hidden)) => {
+                "poll" => match (parse_poll(argument), self.state.conversation()) {
+                    (Ok(_), None) => self.no_room(text),
+                    (Ok((question, answers, multiple, hidden)), Some((room_id, thread))) => {
                         self.viewport.follow_newest();
                         commands.push(Command::CreatePoll {
+                            room_id,
+                            thread,
                             question,
                             answers,
                             multiple,
                             hidden,
                         });
                     }
-                    Err(problem) => {
+                    (Err(problem), _) => {
                         // Keep what was typed so it can be corrected.
                         self.composer.set(text);
                         self.notice = Some(problem);
                     }
                 },
                 "file" | "upload" if !argument.trim().is_empty() => {
-                    if self.state.open_room.is_none() {
-                        self.no_room(text);
-                    } else {
+                    if let Some((room_id, thread)) = self.state.conversation() {
                         self.viewport.follow_newest();
                         // "/file picture.png | what it shows"
                         let (path, caption) = match argument.split_once(" | ") {
@@ -1780,18 +1857,22 @@ impl App {
                             None => (argument, ""),
                         };
                         commands.push(Command::SendFile {
+                            room_id,
+                            thread,
                             path: path.trim().to_owned(),
                             caption: (!caption.is_empty()).then(|| caption.to_owned()),
                         });
+                    } else {
+                        self.no_room(text);
                     }
                 }
                 "paste" => {
-                    if self.state.open_room.is_none() {
-                        self.no_room(text);
-                    } else {
+                    if let Some((room_id, thread)) = self.state.conversation() {
                         self.viewport.follow_newest();
                         self.notice = Some("Sending the picture from the clipboard…".to_owned());
-                        commands.push(Command::PasteImage);
+                        commands.push(Command::PasteImage { room_id, thread });
+                    } else {
+                        self.no_room(text);
                     }
                 }
                 "verify" if !argument.trim().is_empty() => commands.push(Command::VerifyUser {
@@ -1859,8 +1940,32 @@ impl App {
                     text,
                     mentions: mentions.clone(),
                 });
-                self.take_up_again();
+                self.take_up_again(true);
             }
+        }
+    }
+
+    /// The account refused a message: the conversation it was written
+    /// in is not the one followed (a thread that did not open, and the
+    /// room is shown in its place). Its text is not lost: back into the
+    /// message box when that is empty, else into its room's draft when
+    /// that room is not shown and has none, else at least on the screen.
+    fn not_sent(&mut self, room_id: String, text: String) {
+        const WHY: &str = "Not sent: that conversation is no longer open.";
+        let shown = self.state.open_room.as_deref() == Some(room_id.as_str());
+        if self.composer.is_empty()
+            && self.compose == Compose::Message
+            && (shown || self.state.open_room.is_none())
+        {
+            self.composer.set(&text);
+            self.focus = Focus::Composer;
+            self.notice = Some(format!("{WHY} Your text is back in the message box."));
+        } else if !shown && !self.drafts.contains_key(&room_id) {
+            self.drafts.insert(room_id, text);
+            self.state_dirty = true;
+            self.notice = Some(format!("{WHY} Your text is kept as that room's draft."));
+        } else {
+            self.notice = Some(format!("{WHY} It was: {text}"));
         }
     }
 
@@ -1871,14 +1976,15 @@ impl App {
         self.notice = Some("Open a room first.".to_owned());
     }
 
-    /// The edit is over: what was being written before it is back, as a
-    /// reply if it was one, with its mentions.
-    fn take_up_again(&mut self) {
+    /// The edit is over: what was being written before it is back, with
+    /// its mentions, and as a reply if it was one (`answering`: unless
+    /// the conversation shown is another now).
+    fn take_up_again(&mut self, answering: bool) {
         if let Some(aside) = self.set_aside.take() {
             self.composer.set(&aside.text);
             self.composer_mentions = aside.mentions;
-            if let Some(answering) = aside.answering {
-                self.compose = answering;
+            if let Some(reply) = aside.answering.filter(|_| answering) {
+                self.compose = reply;
             }
         }
     }
@@ -2585,6 +2691,52 @@ mod tests {
             "{commands:?}"
         );
         assert_eq!(app.state.open_room.as_deref(), Some("!party"));
+    }
+
+    #[test]
+    fn the_room_open_last_time_is_not_joined_at_the_start_when_it_is_an_invitation_now() {
+        let mut app = App::new(theme::THEMES[0], "@me:x".into());
+        app.restore_session(Some("!party".into()), HashMap::new());
+        let rooms = vec![
+            RoomEntry {
+                id: "!a".into(),
+                name: "A".into(),
+                ..RoomEntry::default()
+            },
+            RoomEntry {
+                id: "!party".into(),
+                name: "Party".into(),
+                is_invite: true,
+                ..RoomEntry::default()
+            },
+        ];
+        // The start brings several room lists within the minute.
+        for _ in 0..3 {
+            app.on_update(Update::Rooms(rooms.clone()));
+        }
+        assert_eq!(app.state.open_room, None);
+        let effects = app.take_effects();
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Command(Command::Open(_)))),
+            "{effects:?}"
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("invitation"))
+        );
+        // Nothing was asked that one Enter would answer: the first asks.
+        app.focus = Focus::Sidebar;
+        assert_eq!(app.cursor_room.as_deref(), Some("!party"));
+        assert!(app.on_event(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.state.open_room, None);
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::Open(room)] if room == "!party"),
+            "{commands:?}"
+        );
     }
 
     /// `chat()` with an invitation "Party" in the list, the cursor on it.
@@ -3355,7 +3507,7 @@ mod tests {
         let commands = app.on_event(key(KeyCode::Enter));
         assert!(matches!(
             &commands[..],
-            [Command::CreatePoll { question, answers, multiple: true, hidden: false }]
+            [Command::CreatePoll { question, answers, multiple: true, hidden: false, .. }]
                 if question == "Lunch?" && answers == &["Pizza".to_owned(), "Sushi".to_owned()]
         ));
     }
@@ -3652,7 +3804,9 @@ mod tests {
         app.composer.clear();
         type_text(&mut app, "/paste");
         let commands = app.on_event(key(KeyCode::Enter));
-        assert!(matches!(&commands[..], [Command::PasteImage]));
+        assert!(
+            matches!(&commands[..], [Command::PasteImage { room_id, thread: None }] if room_id == "!a")
+        );
     }
 
     #[test]
@@ -3661,7 +3815,7 @@ mod tests {
         type_text(&mut app, "/file ~/cat.png | our new cat");
         let commands = app.on_event(key(KeyCode::Enter));
         assert!(
-            matches!(&commands[..], [Command::SendFile { path, caption: Some(caption) }]
+            matches!(&commands[..], [Command::SendFile { path, caption: Some(caption), .. }]
                 if path == "~/cat.png" && caption == "our new cat"),
             "{commands:?}"
         );
@@ -3840,6 +3994,126 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_begun_during_an_edit_ends_the_edit_and_leaves_nothing_set_aside() {
+        let mut app = chat();
+        type_text(&mut app, "half a sentence");
+        app.select("$2".into());
+        app.on_bar(BarAction::Edit, &mut Vec::new());
+        assert_eq!(app.composer.text(), "mine");
+        // Now a reply to another message: the edit is given up, the
+        // sentence is back and becomes the reply.
+        app.select("$1".into());
+        app.on_bar(BarAction::Reply, &mut Vec::new());
+        assert_eq!(app.composer.text(), "half a sentence");
+        assert!(matches!(app.compose, Compose::Reply { .. }));
+        assert!(app.set_aside.is_none());
+        // Sent; a later edit with an empty box brings nothing back.
+        app.on_event(key(KeyCode::Enter));
+        assert!(app.composer.is_empty());
+        app.select("$2".into());
+        app.on_bar(BarAction::Edit, &mut Vec::new());
+        app.on_event(key(KeyCode::Esc));
+        assert_eq!(app.composer.text(), "");
+
+        // Starting an edit always says anew what waits: here nothing.
+        let mut app = chat();
+        app.set_aside = Some(SetAside {
+            text: "from long ago".into(),
+            mentions: Vec::new(),
+            answering: None,
+        });
+        app.select("$2".into());
+        app.on_bar(BarAction::Edit, &mut Vec::new());
+        app.on_event(key(KeyCode::Esc));
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn a_reply_set_aside_for_an_edit_is_not_taken_into_another_conversation() {
+        let mut app = chat();
+        app.select("$1".into());
+        app.on_bar(BarAction::Reply, &mut Vec::new());
+        type_text(&mut app, "an answer");
+        app.select("$2".into());
+        app.on_bar(BarAction::Edit, &mut Vec::new());
+        // Into a thread while editing: the text comes along, but not as
+        // a reply to a message of the room.
+        app.enter_thread("$3".into(), &mut Vec::new());
+        assert_eq!(app.composer.text(), "an answer");
+        assert_eq!(app.compose, Compose::Message);
+        assert!(app.set_aside.is_none());
+    }
+
+    #[test]
+    fn what_is_written_names_its_conversation_and_a_refused_message_comes_back() {
+        let mut app = chat();
+        app.enter_thread("$1".into(), &mut Vec::new());
+        // Everything that writes into the thread says so.
+        for typed in [
+            "/file /tmp/a.png",
+            "/paste",
+            "/poll Lunch? | Yes | No",
+            "hello",
+        ] {
+            app.composer.set(typed);
+            let commands = app.on_event(key(KeyCode::Enter));
+            let named = match &commands[..] {
+                [
+                    Command::SendFile {
+                        room_id, thread, ..
+                    },
+                    ..,
+                ]
+                | [Command::PasteImage { room_id, thread }, ..]
+                | [
+                    Command::CreatePoll {
+                        room_id, thread, ..
+                    },
+                    ..,
+                ]
+                | [
+                    Command::Send {
+                        room_id, thread, ..
+                    },
+                    ..,
+                ] => room_id == "!a" && thread.as_deref() == Some("$1"),
+                _ => false,
+            };
+            assert!(named, "{typed}: {commands:?}");
+        }
+        // The thread did not open: the room is shown again, and the
+        // account refuses what was written for the thread. The text is
+        // back in the box.
+        app.on_update(Update::ThreadFailed {
+            room_id: "!a".into(),
+            root: "$1".into(),
+        });
+        let refused = || Update::NotSent {
+            room_id: "!a".into(),
+            thread: Some("$1".into()),
+            text: "hello".into(),
+        };
+        app.on_update(refused());
+        assert_eq!(app.composer.text(), "hello");
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("Not sent"))
+        );
+        // With other text there by now, it is shown at least.
+        app.composer.set("something else");
+        app.on_update(refused());
+        assert_eq!(app.composer.text(), "something else");
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("hello")));
+        // Another room is shown meanwhile: it is that room's draft.
+        app.composer.clear();
+        app.open("!b".into(), &mut Vec::new());
+        app.on_update(refused());
+        assert_eq!(app.composer.text(), "");
+        assert_eq!(app.drafts["!a"], "hello");
+    }
+
+    #[test]
     fn enter_without_a_room_keeps_what_was_typed() {
         let mut app = app();
         app.focus = Focus::Composer;
@@ -3855,6 +4129,39 @@ mod tests {
             assert_eq!(app.composer.text(), typed);
             assert_eq!(app.notice.as_deref(), Some("Open a room first."));
         }
+        // And it is there when a room is opened: that is what it stayed
+        // for.
+        app.composer.set("a long message written too early");
+        app.on_event(key(KeyCode::Enter));
+        app.open("!a".into(), &mut Vec::new());
+        assert_eq!(app.composer.text(), "a long message written too early");
+        let commands = app.on_event(key(KeyCode::Enter));
+        assert!(
+            matches!(&commands[..], [Command::Send { text, .. }, ..] if text.starts_with("a long")),
+            "{commands:?}"
+        );
+        // It stays that room's: another one opens with its own draft.
+        type_text(&mut app, "for a");
+        app.open("!b".into(), &mut Vec::new());
+        assert_eq!(app.composer.text(), "");
+        assert_eq!(app.drafts["!a"], "for a");
+
+        // A room that has a draft keeps it, with what was typed after it.
+        let mut app = app_with_draft();
+        app.composer.set("written too early");
+        app.open("!a".into(), &mut Vec::new());
+        assert_eq!(app.composer.text(), "left here\nwritten too early");
+    }
+
+    /// `app()` with a draft "left here" in room `!a`, and no room open.
+    fn app_with_draft() -> App {
+        let mut app = app();
+        app.focus = Focus::Composer;
+        app.restore_session(
+            None,
+            HashMap::from([("!a".to_owned(), "left here".to_owned())]),
+        );
+        app
     }
 
     #[test]

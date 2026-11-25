@@ -456,13 +456,15 @@ impl Accounts {
     /// at the start (the second list of [`restore_all`]: its store could
     /// not be opened, its session file is damaged), which is not in the
     /// list [`Accounts::sign_out`] goes by. It is signed out on the server
-    /// where its session still opens, and deleted here; its name is then
-    /// free for a new sign-in. An error says why not (another mothrix
-    /// runs with it), for the user to read.
+    /// (with its session's token alone where its store does not open),
+    /// and deleted here; its name is then free for a new sign-in. `Some`
+    /// says that the server still has the device signed in, and what to
+    /// do about it ([`matrix::logout`]). An error says why it was not
+    /// removed (another mothrix runs with it), for the user to read.
     pub fn remove_left_out(
         &self,
         profile: &str,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+    ) -> impl Future<Output = anyhow::Result<Option<String>>> + Send + 'static {
         let running = self.is_running(profile);
         let profile = profile.to_owned();
         async move {
@@ -665,15 +667,28 @@ impl Accounts {
             *room_id = format!("{prefix}{room_id}");
         }
         match update {
-            Update::Sections(said) => {
+            Update::Sections(told) => {
                 let prefixes = self.prefixes();
-                if self.slots[account].sections.said(
+                let heard = self.slots[account].sections.said(
                     &mut app.state_mut().sections,
                     &prefixes,
                     account,
-                    said,
-                ) {
+                    told,
+                );
+                if heard.changed {
                     app.state_mut().config_dirty = true;
+                }
+                // Said, since from here on this account's other devices
+                // do not see what is changed here, with no other sign.
+                if heard.unreadable {
+                    let whose = match app.state().accounts.get(account) {
+                        Some(known) if self.slots.len() > 1 => format!(" of {}", known.label),
+                        _ => String::new(),
+                    };
+                    app.on_update(Update::Notice(format!(
+                        "The sections kept in the account{whose} cannot be read by this mothrix \
+                         (a newer one wrote them?): what is changed here stays on this device."
+                    )));
                 }
             }
             Update::Rooms(mut rooms) => {
@@ -808,9 +823,14 @@ impl Accounts {
         self.welcome(app);
         let prefixes = self.prefixes();
         let sections = &app.state_mut().sections;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
         for (account, slot) in self.slots.iter_mut().enumerate() {
-            if let Some(share) = slot.sections.to_send(sections, &prefixes, account) {
-                let _ = slot.commands.send(Command::SetSections(share));
+            if let Some((write, sections)) =
+                slot.sections.to_send(sections, &prefixes, account, now_ms)
+            {
+                let _ = slot.commands.send(Command::SetSections { write, sections });
             }
         }
     }

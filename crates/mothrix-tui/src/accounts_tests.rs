@@ -277,9 +277,9 @@ async fn a_signed_out_account_s_rooms_and_folds_do_not_wait_for_the_next_of_its_
         rooms: rooms.iter().map(|room| (*room).into()).collect(),
     };
     work.updates
-        .send(Update::Sections(crate::sections::Said::Sections(vec![
-            section("Clients", &["!c"]),
-        ])))
+        .send(Update::Sections(
+            crate::sections::Said::Sections(vec![section("Clients", &["!c"])]).into(),
+        ))
         .unwrap();
     pump(&mut accounts, &mut app).await;
     app.state.sections.assign("!a", Some("Clients")).unwrap();
@@ -305,7 +305,7 @@ async fn a_signed_out_account_s_rooms_and_folds_do_not_wait_for_the_next_of_its_
     accounts.newly_signed_in();
     other_fake
         .updates
-        .send(Update::Sections(crate::sections::Said::Nothing))
+        .send(Update::Sections(crate::sections::Said::Nothing.into()))
         .unwrap();
     pump(&mut accounts, &mut app).await;
     accounts.sync_sections(&mut app);
@@ -377,16 +377,17 @@ async fn sections_come_from_each_account_and_changes_here_go_back_to_it() {
 
     // Home stores nothing yet: this device's sections go up to it.
     home.updates
-        .send(Update::Sections(crate::sections::Said::Nothing))
+        .send(Update::Sections(crate::sections::Said::Nothing.into()))
         .unwrap();
     // Work stores a section of its own: it is merged in, under keys.
     work.updates
-        .send(Update::Sections(crate::sections::Said::Sections(vec![
-            crate::model::Section {
+        .send(Update::Sections(
+            crate::sections::Said::Sections(vec![crate::model::Section {
                 name: "Clients".into(),
                 rooms: vec!["!c".into()],
-            },
-        ])))
+            }])
+            .into(),
+        ))
         .unwrap();
     pump(&mut accounts, &mut app).await;
     assert_eq!(app.state.sections.len(), 2);
@@ -509,7 +510,7 @@ async fn swapped_accounts_take_their_rooms_commands_and_sections_along() {
 
     // Home's share of the sections still goes to home.
     home.updates
-        .send(Update::Sections(crate::sections::Said::Nothing))
+        .send(Update::Sections(crate::sections::Said::Nothing.into()))
         .unwrap();
     pump(&mut accounts, &mut app).await;
     app.state.sections.assign("!a", Some("Mine")).unwrap();
@@ -602,4 +603,55 @@ async fn a_link_s_preview_is_asked_of_its_room_s_account_whoever_was_named_last(
                 == r#"PreviewLink { room_id: "!a", url: "https://example.org/a" }"#),
         "{asked:?}"
     );
+}
+
+#[tokio::test]
+async fn sections_that_cannot_be_read_are_said_once_and_what_is_written_names_its_room() {
+    let (mut accounts, mut app, mut home, mut work) = two_accounts();
+    // Work's sections are in a form this mothrix does not read: from
+    // here on nothing of them is kept in step, and the user hears why.
+    let unreadable = || Update::Sections(crate::sections::Said::Unreadable.into());
+    work.updates.send(unreadable()).unwrap();
+    pump(&mut accounts, &mut app).await;
+    let notice = app.notice.take().unwrap_or_default();
+    assert!(
+        notice.contains("cannot be read") && notice.contains("work"),
+        "{notice}"
+    );
+    // Once: the store is looked at every few seconds.
+    work.updates.send(unreadable()).unwrap();
+    pump(&mut accounts, &mut app).await;
+    assert_eq!(app.notice, None);
+    app.state.sections.assign("work/!b", Some("Team")).unwrap();
+    accounts.sync_sections(&mut app);
+    assert!(work.sent().is_empty());
+
+    // A file for a room of the work account goes to that account, under
+    // the room's id, with the thread it was written in.
+    accounts.send(
+        &app,
+        Command::SendFile {
+            room_id: "work/!b".into(),
+            thread: Some("$root".into()),
+            path: "/tmp/a.png".into(),
+            caption: None,
+        },
+    );
+    assert!(home.sent().is_empty());
+    let sent = work.sent();
+    assert!(
+        sent.len() == 1 && sent[0].contains(r#"room_id: "!b""#) && sent[0].contains("$root"),
+        "{sent:?}"
+    );
+    // And a refused message comes back under the room's key.
+    work.updates
+        .send(Update::NotSent {
+            room_id: "!b".into(),
+            thread: None,
+            text: "hello".into(),
+        })
+        .unwrap();
+    pump(&mut accounts, &mut app).await;
+    assert_eq!(app.drafts.get("work/!b").map(String::as_str), None);
+    assert_eq!(app.composer.text(), "hello");
 }

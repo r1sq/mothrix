@@ -327,11 +327,16 @@ impl ProxyRule {
                  (or https://, socks5://)"
             )
         };
-        // "proxy:3128" is an HTTP proxy.
-        let address = if self.address.contains("://") {
-            self.address.clone()
-        } else {
-            format!("http://{}", self.address)
+        // "proxy:3128" is an HTTP proxy. And "socks://", which some
+        // desktops put into `all_proxy` for the SOCKS proxy of their
+        // network settings, is the kind in use today: without this, a
+        // start on such a desktop would reach no account.
+        let address = match self.address.split_once("://") {
+            Some((kind, rest)) if kind.eq_ignore_ascii_case("socks") => {
+                format!("socks5://{rest}")
+            }
+            Some(_) => self.address.clone(),
+            None => format!("http://{}", self.address),
         };
         // Checked here: the HTTP library takes any address with a host,
         // and then goes without a proxy where it does not know the kind
@@ -532,6 +537,14 @@ mod tests {
             (name == "http_proxy").then(|| "http://plain:3128".to_owned())
         });
         assert_eq!(http[0].takes, Takes::Http);
+        // As a desktop's network settings export a SOCKS proxy.
+        let desktop = proxy_rules("", |name| {
+            (name == "all_proxy").then(|| "socks://127.0.0.1:1080/".to_owned())
+        });
+        assert_eq!(desktop.len(), 1);
+        desktop[0].proxy().expect("socks:// is a SOCKS proxy");
+        let config: Config = toml::from_str(r#"proxy = "SOCKS://127.0.0.1:1080""#).unwrap();
+        assert!(config.matrix_http_client().is_ok());
     }
 
     #[test]

@@ -115,6 +115,12 @@ final class Store: ObservableObject {
     @Published var revealed: String?
     @Published var mediaFile: URL?
     @Published var fetchingMedia: String?
+    /// Attachments that were saved and not opened (a web page, a
+    /// program), by their message: its row offers to pass the file on.
+    @Published var keptMedia: [String: URL] = [:]
+    /// The text of a message that was not sent, for the message box of
+    /// the conversation shown (which takes it and empties this).
+    @Published var returned: String?
     /// What is behind links: title and summary, by address.
     @Published var previews: [String: (title: String, description: String)] = [:]
     private var askedPreviews = Set<String>()
@@ -160,6 +166,8 @@ final class Store: ObservableObject {
             typing = []
             members = []
             pictures = [:]
+            // As Rust forgets which links it asked about (`ClientState::open`).
+            askedPreviews = []
         }
         if room != openRoom || thread != self.thread {
             // Its file would open over another conversation.
@@ -254,6 +262,20 @@ final class Store: ObservableObject {
                 fetchingMedia = nil
                 mediaFile = URL(fileURLWithPath: path)
             }
+        case .mediaKept(let eventId, let path, _):
+            if fetchingMedia == eventId { fetchingMedia = nil }
+            keptMedia[eventId] = URL(fileURLWithPath: path)
+        case .notSent(let room, let thread, let text):
+            // Back where it was written: the message box, if that
+            // conversation is shown; else its draft, if it has none.
+            let key = room + "|" + (thread ?? "")
+            if room == openRoom && thread == self.thread {
+                returned = text
+            } else if draft(key).isEmpty {
+                keepDraft(key, text)
+            } else {
+                notice = "Not sent: \(text)"
+            }
         case .linkPreview(let url, let title, let description):
             previews[url] = (title, description)
         case .signIn(let state): signIn = state
@@ -280,7 +302,7 @@ final class Store: ObservableObject {
     /// What goes into "the open room": Rust is told which room and thread
     /// that was here, and does not send into another it opened meanwhile.
     private static let intoTheOpenRoom: Set<String> = [
-        "send", "reply", "upload", "send_voice", "create_poll",
+        "send", "reply", "upload", "send_voice", "create_poll", "preview_link",
     ]
 
     /// `place`: the conversation this was begun in (a sheet, a picker or

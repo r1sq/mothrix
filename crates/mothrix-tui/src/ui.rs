@@ -49,6 +49,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits.clear();
     app.pictures.start_frame();
     app.ensure_logo();
+    // The line about a dialog that did not fit goes with the dialog,
+    // whichever way it closed (Esc, a click beside it, the other side
+    // ending a verification).
+    if app.overlays.is_empty() && app.notice.as_deref() == Some(TOO_SMALL.trim()) {
+        app.notice = None;
+    }
     let area = frame.area();
     let [main, status] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
 
@@ -3268,6 +3274,21 @@ mod tests {
                 .map(|dialog| &dialog.mode),
             None | Some(crate::app::AccountsMode::List)
         ));
+        assert_eq!(app.notice, None);
+        // The line does not outlive a dialog that closed another way
+        // either (here: the other side gave the verification up).
+        let mut app = sample();
+        app.on_update(Update::Verify(Some(VerifyState::Incoming {
+            device: "Phone".into(),
+        })));
+        render_to_text(&mut app, 100, 4);
+        assert!(app.overlay_unseen);
+        app.on_event(key(KeyCode::Enter));
+        assert!(app.notice.is_some());
+        app.on_update(Update::Verify(None));
+        let screen = render_to_text(&mut app, 100, 4);
+        assert!(!screen.contains("too small"), "{screen}");
+        assert_eq!(app.notice, None);
 
         // Large enough again: the answer counts.
         let mut app = sample();

@@ -232,6 +232,10 @@ impl RoomWatch {
     }
 }
 
+/// How far a server's clock may be ahead of this computer's for a time
+/// it gives to be believed, in milliseconds.
+const CLOCKS_APART: u64 = 5 * 60 * 1000;
+
 /// The event the threads-included receipt is for: the newest of the
 /// conversation, or the reply in a thread that is newer still. The
 /// conversation's newest is the last in it, whatever time it claims; a
@@ -239,8 +243,13 @@ impl RoomWatch {
 /// says it comes from the future is not believed. Going by the largest
 /// time alone, one message dated next year would be "the newest" for a
 /// year, and no receipt would follow it.
+///
+/// "The future" begins some minutes from now ([`CLOCKS_APART`]): the
+/// times are the senders' servers', and with this computer's clock a
+/// little behind, a reply that just came in would be from the future
+/// and get no receipt.
 fn newest_with_threads(seen: &Seen) -> Option<String> {
-    let believed = |at: &u64| *at <= seen.now;
+    let believed = |at: &u64| *at <= seen.now.saturating_add(CLOCKS_APART);
     let newest_at = seen.times.iter().copied().filter(believed).max();
     let reply = seen
         .replies
@@ -318,20 +327,31 @@ mod tests {
 
     #[test]
     fn a_message_dated_in_the_future_does_not_stop_the_receipts() {
-        // It is 100; "$late" says it was sent at 5000.
+        // It is 100; "$late" says it was sent hours later.
+        let (late, later) = (100 + 20 * CLOCKS_APART, 100 + 40 * CLOCKS_APART);
         let mut watch = RoomWatch::new(Shown::Room);
-        let todo = watch.see(seen(&[(1, "$1"), (5000, "$late")], &[]));
+        let todo = watch.see(seen(&[(1, "$1"), (late, "$late")], &[]));
         assert_eq!(todo.read_with_threads.as_deref(), Some("$late"));
         // What comes after it is the newest, though its time is smaller.
-        let after = [(1, "$1"), (5000, "$late"), (50, "$3")];
+        let after = [(1, "$1"), (late, "$late"), (50, "$3")];
         let todo = watch.see(seen(&after, &[]));
         assert_eq!(todo.read_with_threads.as_deref(), Some("$3"));
         // Nor does a reply from the future stay the newest for ever.
-        let todo = watch.see(seen(&after, &[(9000, "$reply")]));
+        let todo = watch.see(seen(&after, &[(later, "$reply")]));
         assert_eq!(todo.read_with_threads, None);
-        let more = [(1, "$1"), (5000, "$late"), (50, "$3"), (60, "$4")];
-        let todo = watch.see(seen(&more, &[(9000, "$reply"), (55, "$other")]));
+        let more = [(1, "$1"), (late, "$late"), (50, "$3"), (60, "$4")];
+        let todo = watch.see(seen(&more, &[(later, "$reply"), (55, "$other")]));
         assert_eq!(todo.read_with_threads.as_deref(), Some("$4"));
+    }
+
+    #[test]
+    fn a_reply_a_little_ahead_of_our_clock_still_gets_its_receipt() {
+        // Our clock is half a minute behind the server's: the reply that
+        // just came in says it was sent at 30 100, and it is 100 here.
+        let mut watch = RoomWatch::new(Shown::Room);
+        watch.see(seen(&[(1, "$1"), (2, "$2")], &[]));
+        let todo = watch.see(seen(&[(1, "$1"), (2, "$2")], &[(30_100, "$reply")]));
+        assert_eq!(todo.read_with_threads.as_deref(), Some("$reply"));
     }
 
     #[test]

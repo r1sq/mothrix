@@ -50,6 +50,13 @@ fn plain(text: impl AsRef<str>) -> String {
     message::for_terminal(text.as_ref())
 }
 
+/// What the status line says when the settings could not be written.
+fn not_saved(error: &anyhow::Error) -> String {
+    plain(format!(
+        "The settings are not saved, and hold only until mothrix ends: {error:#}"
+    ))
+}
+
 /// Fetching releases through the config's proxy.
 fn release_fetch(paths: &Paths) -> update::Http {
     update::Http {
@@ -459,9 +466,12 @@ async fn run() -> Result<()> {
 
     match args.mode {
         Mode::Logout => {
-            matrix::logout(&paths).await?;
+            let left = matrix::logout(&paths).await?;
             forget_in_config(&paths, &primary);
-            println!("Signed out; local data for profile '{primary}' removed.");
+            match left {
+                None => println!("Signed out; local data for profile '{primary}' removed."),
+                Some(left) => println!("Local data for profile '{primary}' removed. {left}"),
+            }
             Ok(())
         }
         Mode::Accounts => {
@@ -1237,6 +1247,7 @@ async fn run_tui(
     let mut clicks = notify::ClickReader::default();
     let (toast_clicks, mut toast_clicked) = tokio::sync::mpsc::unbounded_channel();
     let mut notifier = notify::Notifier::new(toast_clicks);
+    let mut save_failed_said = false;
     let result: Result<()> = async {
         let mut updated = false;
         loop {
@@ -1405,8 +1416,14 @@ async fn run_tui(
                         let file = &paths.config_file;
                         // Never over a file with a mistake in it: that
                         // would cost what the user wrote there.
-                        if let Ok(config) = Config::read(file) {
-                            let _ = config.updated(&app).save(file);
+                        let saved = Config::read(file)
+                            .and_then(|config| config.updated(&app).save(file));
+                        // Said once: what is set holds while mothrix
+                        // runs, and every later change would say it again.
+                        if let Err(error) = saved
+                            && !std::mem::replace(&mut save_failed_said, true)
+                        {
+                            app.notice = Some(not_saved(&error));
                         }
                     }
                     Effect::Quit => quit = true,

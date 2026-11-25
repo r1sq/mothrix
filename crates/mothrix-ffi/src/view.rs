@@ -110,6 +110,20 @@ pub enum Event {
         event_id: String,
         path: String,
     },
+    /// An attachment is on disk and of a kind that is not opened: for
+    /// the app to offer for sharing, under the name its sender gave it.
+    MediaKept {
+        event_id: String,
+        path: String,
+        name: String,
+    },
+    /// A message was not sent, since its conversation (`room`, `thread`)
+    /// was not the open one any more: its text, to give back.
+    NotSent {
+        room: String,
+        thread: Option<String>,
+        text: String,
+    },
     /// The emoji to offer first, the user's favourites.
     Favourites {
         emoji: Vec<String>,
@@ -488,6 +502,9 @@ pub enum Effect {
     Remove(String),
     /// Keep this file (base64) on disk and send it to the open room.
     Upload {
+        /// The conversation it goes into.
+        room_id: String,
+        thread: Option<String>,
         name: String,
         data: String,
         caption: Option<String>,
@@ -750,10 +767,28 @@ impl View {
     /// not send into another opened meanwhile (a notification tapped),
     /// nor a message of the room into a thread of it.
     pub fn act_in(&mut self, action: Action, room: &str, thread: Option<&str>) -> Vec<Command> {
+        // A link is looked up for the room its message was seen in (the
+        // thread makes no difference to whom is asked), or not at all,
+        // and without a word: nobody sent anything.
+        if matches!(action, Action::PreviewLink { .. }) {
+            return match self.state.open_room.as_deref() == Some(room) {
+                true => self.act(action),
+                false => Vec::new(),
+            };
+        }
         if self.state.open_room.as_deref() != Some(room)
             || self.state.open_thread.as_deref() != thread
         {
             self.notice("Not sent: another chat was opened meanwhile.");
+            // The app emptied its message box when it sent this: the
+            // text goes back to it (an answer's too, as a message).
+            if let Action::Send { text, .. } | Action::Reply { text, .. } = action {
+                self.events.push(Event::NotSent {
+                    room: room.to_owned(),
+                    thread: thread.map(str::to_owned),
+                    text,
+                });
+            }
             return Vec::new();
         }
         self.act(action)
@@ -867,17 +902,22 @@ impl View {
                 answers,
                 multiple,
                 hidden,
-            } => match message::new_poll(&question, &answers) {
-                Ok((question, answers)) if self.state.open_room.is_some() => {
+            } => match (
+                message::new_poll(&question, &answers),
+                self.state.conversation(),
+            ) {
+                (Ok((question, answers)), Some((room_id, thread))) => {
                     return vec![Command::CreatePoll {
+                        room_id,
+                        thread,
                         question,
                         answers,
                         multiple,
                         hidden,
                     }];
                 }
-                Ok(_) => self.notice("Open a room first."),
-                Err(problem) => self.notice(problem),
+                (Ok(_), None) => self.notice("Open a room first."),
+                (Err(problem), _) => self.notice(problem),
             },
             Action::Vote { event_id, answer } => {
                 if let Some(poll) = message::poll_of(&self.state.items, &event_id)
@@ -952,25 +992,34 @@ impl View {
                 path,
                 duration_ms,
                 waveform,
-            } if self.state.open_room.is_some() => {
-                return vec![Command::SendVoice {
-                    path,
-                    duration_ms,
-                    waveform,
-                }];
-            }
+            } => match self.state.conversation() {
+                Some((room_id, thread)) => {
+                    return vec![Command::SendVoice {
+                        room_id,
+                        thread,
+                        path,
+                        duration_ms,
+                        waveform,
+                    }];
+                }
+                None => self.notice("Open a room first."),
+            },
+            // The file is kept on disk first, outside: it goes into the
+            // conversation shown now, whatever is shown by then.
             Action::Upload {
                 name,
                 data,
                 caption,
-            } if self.state.open_room.is_some() => {
-                self.effects.push(Effect::Upload {
+            } => match self.state.conversation() {
+                Some((room_id, thread)) => self.effects.push(Effect::Upload {
+                    room_id,
+                    thread,
                     name,
                     data,
                     caption,
-                });
-            }
-            Action::SendVoice { .. } | Action::Upload { .. } => self.notice("Open a room first."),
+                }),
+                None => self.notice("Open a room first."),
+            },
 
             Action::Fold { key } => {
                 self.state.folded.toggle(&key);
@@ -1172,6 +1221,14 @@ impl View {
         self.opened(room, opening)
     }
 
+    /// Show a room nobody tapped just now (one the account says to go
+    /// to, one that waited to be listed): an invitation is never joined
+    /// this way.
+    fn show(&mut self, room: String) -> Vec<Command> {
+        let opening = self.state.show(&room);
+        self.opened(room, opening)
+    }
+
     /// What follows from opening `room` here.
     fn opened(&mut self, room: String, opening: Opening) -> Vec<Command> {
         // An invitation is not joined by one tap (on the list, or on the
@@ -1231,9 +1288,9 @@ impl View {
     }
 
     /// Removing an account that did not start came to an end.
-    pub fn removed(&mut self, profile: &str, result: Result<(), String>) {
+    pub fn removed(&mut self, profile: &str, result: Result<Option<String>, String>) {
         match result {
-            Ok(()) => {
+            Ok(left) => {
                 self.problems.retain(|problem| problem.profile != profile);
                 self.events.push(Event::Problems {
                     problems: self.problems.clone(),
@@ -1244,7 +1301,10 @@ impl View {
                 let mut changed = self.state.sections.forget_account(&prefixes, 0);
                 changed |= self.state.folded.forget_profile(profile);
                 self.state.config_dirty |= changed;
-                self.notice(format!("'{profile}' is removed from this phone."));
+                // Still signed in on the server: its pusher goes on
+                // sending this phone notifications nobody can read.
+                let left = left.map(|left| format!(" {left}")).unwrap_or_default();
+                self.notice(format!("'{profile}' is removed from this phone.{left}"));
             }
             Err(error) => self.notice(format!("'{profile}' could not be removed: {error}")),
         }
@@ -1310,13 +1370,13 @@ impl Frontend for View {
                     rooms: self.state.rooms.clone(),
                 });
                 if let Some(room) = show {
-                    let commands = self.open(room);
+                    let commands = self.show(room);
                     self.later.extend(commands);
                 }
                 return;
             }
             Taken::Show(room) => {
-                let commands = self.open(room);
+                let commands = self.show(room);
                 self.later.extend(commands);
                 return;
             }
@@ -1386,6 +1446,35 @@ impl Frontend for View {
             Update::Reveal(event_id) => self.events.push(Event::Reveal { event_id }),
             Update::MediaFile { event_id, path } => {
                 self.events.push(Event::Media { event_id, path })
+            }
+            // The app's own folders are none its user gets to: no use
+            // in saying where it lies. The app offers to pass it on.
+            Update::MediaKept {
+                event_id,
+                path,
+                name,
+            } => {
+                self.notice(format!(
+                    "{name} was saved and not opened: mothrix only opens pictures, sound, \
+                     video and documents. It can be shared from its message."
+                ));
+                self.events.push(Event::MediaKept {
+                    event_id,
+                    path,
+                    name,
+                });
+            }
+            Update::NotSent {
+                room_id,
+                thread,
+                text,
+            } => {
+                self.notice("Not sent: that conversation is no longer open.");
+                self.events.push(Event::NotSent {
+                    room: room_id,
+                    thread,
+                    text,
+                });
             }
             // Taken by `Accounts::deliver`: into the sections, on to the
             // account of the room a message is forwarded to.
@@ -1959,6 +2048,21 @@ mod tests {
                 event_id: "$3".into(),
                 path: "/tmp/photo.jpg".into(),
             },
+            Event::MediaKept {
+                event_id: "$4".into(),
+                path: "/tmp/a1b2c3-invoice.html".into(),
+                name: "invoice.html".into(),
+            },
+            Event::NotSent {
+                room: "!a".into(),
+                thread: Some("$1".into()),
+                text: "written in a thread".into(),
+            },
+            Event::NotSent {
+                room: "work/!b".into(),
+                thread: None,
+                text: "written in a room".into(),
+            },
             Event::Favourites {
                 emoji: view.favourites(),
             },
@@ -1970,7 +2074,7 @@ mod tests {
         // not compile here until it has a number: give it the next one,
         // raise `KINDS`, and add a sample above (and its decoding in
         // `ios/App/Models.swift`).
-        const KINDS: usize = 20;
+        const KINDS: usize = 22;
         let kind = |event: &Event| match event {
             Event::Accounts { .. } => 0,
             Event::Rooms { .. } => 1,
@@ -1992,6 +2096,8 @@ mod tests {
             Event::Media { .. } => 17,
             Event::Favourites { .. } => 18,
             Event::Problems { .. } => 19,
+            Event::MediaKept { .. } => 20,
+            Event::NotSent { .. } => 21,
         };
         let sampled: std::collections::BTreeSet<usize> = events.iter().map(kind).collect();
         assert_eq!(
@@ -2069,6 +2175,23 @@ mod tests {
                 path: "/tmp/x.jpg".into()
             }]
         );
+        // One of a kind that is not opened: the app is told too (its
+        // row would else say "fetching" for ever), and the notice names
+        // the file as its sender did.
+        view.on_update(Update::MediaKept {
+            event_id: "$2".into(),
+            path: "/tmp/a1b2c3-invoice.html".into(),
+            name: "invoice.html".into(),
+        });
+        let events = view.take_events();
+        assert!(
+            matches!(
+                &events[..],
+                [Event::Notice { text }, Event::MediaKept { event_id, name, .. }]
+                    if text.starts_with("invoice.html was saved") && event_id == "$2" && name == "invoice.html"
+            ),
+            "{events:?}"
+        );
     }
 
     #[test]
@@ -2080,7 +2203,7 @@ mod tests {
         view.act(Action::Open { room: "!a".into() });
         assert!(matches!(
             &act(&mut view, voice)[..],
-            [Command::SendVoice { path, duration_ms: 4200, waveform }]
+            [Command::SendVoice { path, duration_ms: 4200, waveform, .. }]
                 if path == "/tmp/v.m4a" && waveform.len() == 2
         ));
     }
@@ -2377,6 +2500,20 @@ mod tests {
             [Command::PreviewLink { room_id, .. }] if room_id == "!a"
         ));
         assert!(view.act(url()).is_empty());
+        // The app saw the link in one room, and another is open here by
+        // now: not asked, not of the other room's account, and no word.
+        view.act(Action::Open {
+            room: "work/!b".into(),
+        });
+        view.take_events();
+        assert!(view.act_in(url(), "!a", None).is_empty());
+        assert!(view.take_events().is_empty());
+        // In the room shown it is asked anew (also from a thread of it):
+        // what was asked about is each room's own.
+        assert!(matches!(
+            &view.act_in(url(), "work/!b", Some("$root"))[..],
+            [Command::PreviewLink { room_id, .. }] if room_id == "work/!b"
+        ));
     }
 
     #[test]
@@ -2564,10 +2701,58 @@ mod tests {
         view.notification_clicked("work/!b".into());
         assert!(view.act_in(poll(), "!a", Some("$root")).is_empty());
         assert!(view.act_in(send("hi"), "!a", None).is_empty());
-        assert!(view.take_events().iter().any(|event| matches!(
+        let events = view.take_events();
+        assert!(events.iter().any(|event| matches!(
             event, Event::Notice { text } if text.starts_with("Not sent")
         )));
+        // The app emptied its message box: the text goes back, once, for
+        // the conversation it was written in. (A poll's sheet is still
+        // open, and holds what was typed.)
+        let back: Vec<&Event> = events
+            .iter()
+            .filter(|event| matches!(event, Event::NotSent { .. }))
+            .collect();
+        assert_eq!(
+            back,
+            [&Event::NotSent {
+                room: "!a".into(),
+                thread: None,
+                text: "hi".into()
+            }]
+        );
         assert!(view.take_effects().is_empty());
+        // The account refuses one too, when it follows another
+        // conversation than the app shows (a thread that did not open).
+        view.on_update(Update::NotSent {
+            room_id: "work/!b".into(),
+            thread: Some("$root".into()),
+            text: "in the thread".into(),
+        });
+        assert!(view.take_events().contains(&Event::NotSent {
+            room: "work/!b".into(),
+            thread: Some("$root".into()),
+            text: "in the thread".into()
+        }));
+        // A file and a voice message name the conversation they go into.
+        let voice = Action::SendVoice {
+            path: "/tmp/v.m4a".into(),
+            duration_ms: 1,
+            waveform: Vec::new(),
+        };
+        assert!(matches!(
+            &view.act_in(voice, "work/!b", None)[..],
+            [Command::SendVoice { room_id, thread: None, .. }] if room_id == "work/!b"
+        ));
+        let file = Action::Upload {
+            name: "a.txt".into(),
+            data: String::new(),
+            caption: None,
+        };
+        view.act_in(file, "work/!b", None);
+        assert!(matches!(
+            &view.take_effects()[..],
+            [Effect::Upload { room_id, thread: None, .. }] if room_id == "work/!b"
+        ));
     }
 
     #[test]
@@ -2613,11 +2798,18 @@ mod tests {
         )));
         // Removed: no longer listed, and its rooms and folds do not wait
         // for the next account of that name.
-        view.removed("old", Ok(()));
+        // (The server could not be told: that is said with it.)
+        let left = "The device is still signed in on the server (no answer): remove it.";
+        view.removed("old", Ok(Some(left.into())));
         assert!(view.snapshot().problems.is_empty());
-        assert!(view.take_events().contains(&Event::Problems {
+        let events = view.take_events();
+        assert!(events.contains(&Event::Problems {
             problems: Vec::new()
         }));
+        assert!(events.iter().any(|event| matches!(
+            event, Event::Notice { text }
+                if text.starts_with("'old' is removed") && text.contains("still signed in")
+        )));
         assert_eq!(view.shown().sections[0].rooms, ["!a"]);
         assert!(view.shown().folded.is_empty());
         assert_eq!(view.take_effects(), [Effect::SaveConfig]);

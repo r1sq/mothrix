@@ -199,11 +199,14 @@ type SectionsToKeep = Option<(u64, Vec<Section>)>;
 /// Tell the UI what the account stores of its sections: first as the
 /// server has it (or, offline, the local store), then each change a sync
 /// brings into the local store ([`crate::sections::Watch`] says which of
-/// them are news). `written`: the number of this device's newest write
-/// asked for.
+/// them are news). `waiting`: the write [`keep_sections`] has still to
+/// get to the server, if any. It is given up when another device's
+/// content is told: it is a picture from before that, and would go over
+/// what the other device made of the sections, hours later when it waited
+/// for the network.
 async fn watch_sections(
     client: Client,
-    written: Arc<std::sync::atomic::AtomicU64>,
+    waiting: tokio::sync::watch::Sender<SectionsToKeep>,
     tx: mpsc::UnboundedSender<Update>,
 ) {
     use matrix_sdk::ruma::events::GlobalAccountDataEventType;
@@ -235,8 +238,11 @@ async fn watch_sections(
     // The store first: what it holds now is older than the server's
     // answer, or the same.
     let mut watch = crate::sections::Watch::new(&device, in_store().await);
-    let tell = |said| {
-        let _ = tx.send(Update::Sections(said));
+    let tell = |told: crate::sections::Told| {
+        if told.ends_waiting_write() {
+            waiting.send_if_modified(|waiting| waiting.take().is_some());
+        }
+        let _ = tx.send(Update::Sections(told));
     };
     match client.account().fetch_account_data(kind.clone()).await {
         Ok(raw) => tell(watch.fetched(json(raw))),
@@ -255,9 +261,8 @@ async fn watch_sections(
         if tx.is_closed() {
             break;
         }
-        let latest = written.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some(said) = watch.look(in_store().await, latest) {
-            tell(said);
+        if let Some(told) = watch.look(in_store().await) {
+            tell(told);
         }
         if watch.has_told() {
             continue;
@@ -289,7 +294,8 @@ const SECTIONS_TRIES_SAID: usize = 5;
 /// time and always the newest asked for: two changes in quick succession
 /// cannot reach the server the wrong way round, and one that did not get
 /// there (no network) is tried again, further and further apart, until it
-/// is there or a newer one takes its place.
+/// is there, a newer one takes its place, or it is given up
+/// ([`watch_sections`] empties `wanted`).
 async fn keep_sections(
     client: Client,
     mut wanted: tokio::sync::watch::Receiver<SectionsToKeep>,
@@ -549,35 +555,121 @@ pub async fn sign_out(client: Client, paths: Paths) {
     // Not for as long as an unreachable server lets us wait: quitting
     // meanwhile would leave the account on the disk, back at the next
     // start.
-    let _ = tokio::time::timeout(Duration::from_secs(15), client.matrix_auth().logout()).await;
+    let _ = tokio::time::timeout(SIGN_OUT_WAIT, client.matrix_auth().logout()).await;
     // The client first: it has the store's files open.
     drop(client);
     let _ = forget(&paths);
     release(&paths);
 }
 
-/// Remove the saved session and local store (does not sign the device out
-/// server-side when the server is unreachable). Not while another mothrix
-/// runs with the account: that one would go on with files that are gone,
-/// still signed in.
-pub async fn logout(paths: &Paths) -> Result<()> {
+/// Sign the device out on the server and remove the saved session and
+/// local store. Not while another mothrix runs with the account: that one
+/// would go on with files that are gone, still signed in.
+///
+/// The files go whatever the server says. When the device could not be
+/// signed out there, `Some` says so, for the user: the device stays in
+/// the account's list, and a phone's pusher goes on sending it
+/// notifications, until its session is removed from another device.
+pub async fn logout(paths: &Paths) -> Result<Option<String>> {
     if !paths.data_dir.exists() {
-        return Ok(());
+        return Ok(None);
     }
     hold(paths)?;
-    // An account whose session or store no longer opens (a damaged file,
-    // a passphrase the keyring lost) is only deleted here.
     let stored = std::fs::read(paths.session_file())
         .ok()
         .and_then(|bytes| serde_json::from_slice::<StoredSession>(&bytes).ok());
-    if let Some(stored) = stored
-        && let Ok(client) = restore_held(paths, stored).await
-    {
-        let _ = tokio::time::timeout(Duration::from_secs(15), client.matrix_auth().logout()).await;
-    }
+    let left = match stored {
+        Some(stored) => sign_out_on_server(paths, stored).await.err(),
+        // A session file that cannot be read has no token to go by.
+        None if has_session(paths) => Some(anyhow!("its session file cannot be read")),
+        None => None,
+    };
     let forgotten = forget(paths);
     release(paths);
-    Ok(forgotten?)
+    forgotten?;
+    Ok(left.map(|why| {
+        format!(
+            "The device is still signed in on the server ({why:#}): remove its session from \
+             another device of the account."
+        )
+    }))
+}
+
+/// How long a sign-out waits for the server: quitting meanwhile would
+/// leave the account on the disk, back at the next start.
+const SIGN_OUT_WAIT: Duration = Duration::from_secs(15);
+
+/// Sign the device of a saved session out on its server: through the SDK
+/// where the store still opens, else with the session file's access token
+/// alone. An account is mostly removed this way because its store does
+/// not open (a passphrase the keyring or the Keychain lost, a damaged
+/// file), and its device and pusher would else stay on the server.
+async fn sign_out_on_server(paths: &Paths, stored: StoredSession) -> Result<()> {
+    let homeserver = stored.homeserver.clone();
+    let token = stored.session.tokens.access_token.clone();
+    match restore_held(paths, stored).await {
+        Ok(client) => {
+            // (The client goes with this arm: it has the store's files
+            // open, which are deleted next.)
+            match tokio::time::timeout(SIGN_OUT_WAIT, client.matrix_auth().logout()).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(anyhow!("the server did not take the sign-out: {error}")),
+                Err(_) => bail!("the server did not answer"),
+            }
+        }
+        Err(_) => {
+            let client = crate::config::Config::http_client_at(&paths.config_file);
+            let request = logout_request(&client, &homeserver, &token)?;
+            // Without the request's address in the words: the user knows
+            // the server, and nothing of a request belongs in a notice.
+            let response = client.execute(request).await.map_err(|error| {
+                anyhow!("the server could not be reached: {}", error.without_url())
+            })?;
+            let status = response.status().as_u16();
+            logout_answer(status, &response.text().await.unwrap_or_default())
+        }
+    }
+}
+
+/// The request that signs a device out with its access token alone
+/// (`POST /_matrix/client/v3/logout`; the server removes the device's
+/// pushers with it), for the homeserver of a session file. With a time
+/// limit, and for `client` to send: the one that goes through the
+/// proxies ([`crate::config::Config::http_client_at`]). The token is in
+/// its header only, never in the address, which errors and logs name.
+fn logout_request(
+    client: &matrix_sdk::reqwest::Client,
+    homeserver: &str,
+    access_token: &str,
+) -> Result<matrix_sdk::reqwest::Request> {
+    let homeserver = homeserver.trim().trim_end_matches('/');
+    if !(homeserver.starts_with("https://") || homeserver.starts_with("http://")) {
+        bail!("the session file names no homeserver address");
+    }
+    Ok(client
+        .post(format!("{homeserver}/_matrix/client/v3/logout"))
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .timeout(SIGN_OUT_WAIT)
+        .build()?)
+}
+
+/// What the server's answer to [`logout_request`] means. A token it no
+/// longer knows is a device that is signed out already; one that only
+/// ran out (`soft_logout`) is still a device of the account.
+fn logout_answer(status: u16, body: &str) -> Result<()> {
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    let body: Value = serde_json::from_str(body).unwrap_or_default();
+    let gone = status == 401
+        && body["errcode"] == "M_UNKNOWN_TOKEN"
+        && body["soft_logout"].as_bool() != Some(true);
+    if gone {
+        return Ok(());
+    }
+    bail!("the server answered {status}")
 }
 
 // ---------------------------------------------------------------------------
@@ -708,11 +800,21 @@ fn refuse_over_an_account(paths: &Paths) -> Result<()> {
     if has_session(paths) {
         bail!(
             "there is already an account in {} (if its session file is damaged, remove \
-             the account first: `mothrix logout`)",
-            paths.data_dir.display()
+             the account first: `{}`)",
+            paths.data_dir.display(),
+            logout_command(paths)
         );
     }
     Ok(())
+}
+
+/// What to type to remove the account of these paths: its profile is
+/// the folder's name, and only "default" goes without saying.
+fn logout_command(paths: &Paths) -> String {
+    match paths.data_dir.file_name().and_then(|name| name.to_str()) {
+        Some(profile) if profile != "default" => format!("mothrix logout --profile {profile}"),
+        _ => "mothrix logout".to_owned(),
+    }
 }
 
 async fn sign_in_held(
@@ -1000,12 +1102,30 @@ pub enum Update {
     Reveal(String),
     /// What the account stores of the user's own sections
     /// ([`crate::sections`]).
-    Sections(crate::sections::Said),
+    Sections(crate::sections::Told),
     /// An attachment asked for with [`Command::OpenMedia`] is on disk, for
     /// the app to show ([`hand_media_over`]).
     MediaFile {
         event_id: String,
         path: String,
+    },
+    /// A message ([`Command::Send`]) was refused, since the conversation
+    /// it was written in is not the one followed (any more): its text,
+    /// for the front end to give back to the user.
+    NotSent {
+        room_id: String,
+        thread: Option<String>,
+        text: String,
+    },
+    /// An attachment asked for with [`Command::OpenMedia`] is on disk and
+    /// was not opened: it is of a kind mothrix opens by nothing (a web
+    /// page, a program), or not the sound its name says. `name`: what
+    /// its sender called it. The terminal says where it lies; an app,
+    /// whose folders its user does not get to, offers to pass it on.
+    MediaKept {
+        event_id: String,
+        path: String,
+        name: String,
     },
     /// Progress of a device verification; `None` closes the dialog.
     Verify(Option<VerifyState>),
@@ -1029,6 +1149,10 @@ impl Command {
         match self {
             Self::Open(room_id)
             | Self::Send { room_id, .. }
+            | Self::SendFile { room_id, .. }
+            | Self::SendVoice { room_id, .. }
+            | Self::PasteImage { room_id, .. }
+            | Self::CreatePoll { room_id, .. }
             | Self::SetFavourite { room_id, .. }
             | Self::SetLowPriority { room_id, .. }
             | Self::SetNotify { room_id, .. }
@@ -1052,9 +1176,6 @@ impl Command {
             | Self::CloseThread
             | Self::Reply { .. }
             | Self::Edit { .. }
-            | Self::SendFile { .. }
-            | Self::SendVoice { .. }
-            | Self::PasteImage
             | Self::ClipboardPaste
             | Self::Reveal { .. }
             | Self::VerifyStart
@@ -1063,7 +1184,6 @@ impl Command {
             | Self::Delete { .. }
             | Self::React { .. }
             | Self::Paginate
-            | Self::CreatePoll { .. }
             | Self::Vote { .. }
             | Self::EndPoll { .. }
             | Self::TogglePin { .. }
@@ -1074,7 +1194,7 @@ impl Command {
             | Self::CreateRoom { .. }
             | Self::Join { .. }
             | Self::Recover(_)
-            | Self::SetSections(_)
+            | Self::SetSections { .. }
             | Self::SetPusher(_)
             | Self::RemovePusher { .. }
             | Self::Backup { .. }
@@ -1093,6 +1213,7 @@ impl Update {
             | Self::Thread { room_id, .. }
             | Self::ThreadFailed { room_id, .. }
             | Self::GoTo(room_id)
+            | Self::NotSent { room_id, .. }
             | Self::Typing { room_id, .. }
             | Self::Members { room_id, .. } => vec![room_id],
             Self::RoomDetails(details) => vec![&mut details.room_id],
@@ -1108,6 +1229,7 @@ impl Update {
             | Self::Sync(_)
             | Self::Reveal(_)
             | Self::MediaFile { .. }
+            | Self::MediaKept { .. }
             | Self::Sections(_)
             | Self::Verify(_)
             | Self::Verified(_)
@@ -1132,9 +1254,16 @@ pub enum Command {
     /// Back from the thread to the room's conversation.
     CloseThread,
     /// Text is sent as Markdown; `mentions` are the completed @-mentions.
-    /// `thread`: the thread of the room it was written in (its first
-    /// message), none for the room's own conversation. It is sent only
-    /// while that is the conversation followed.
+    ///
+    /// Like everything that writes something new into the conversation
+    /// (this, [`Command::SendFile`], [`Command::SendVoice`],
+    /// [`Command::CreatePoll`], [`Command::PasteImage`]), it names the
+    /// room it was written in and the `thread` there (its first message;
+    /// none for the room's own conversation), and is refused when that
+    /// is not the conversation followed ([`written_into`]): what the
+    /// front end shows and what the backend follows differ for a moment
+    /// after every change, and for good after a thread failed to open.
+    /// Of a refused message the text comes back ([`Update::NotSent`]).
     Send {
         room_id: String,
         thread: Option<String>,
@@ -1151,21 +1280,29 @@ pub enum Command {
         text: String,
         mentions: Vec<Member>,
     },
-    /// Upload a local file into the open room.
+    /// Upload a local file into the conversation named.
     SendFile {
+        room_id: String,
+        thread: Option<String>,
         path: String,
         /// Text to show with it.
         caption: Option<String>,
     },
-    /// Upload a recorded voice message into the open room (MSC3245):
-    /// its length and loudness over time (values 0 to 1).
+    /// Upload a recorded voice message into the conversation named
+    /// (MSC3245): its length and loudness over time (values 0 to 1).
     SendVoice {
+        room_id: String,
+        thread: Option<String>,
         path: String,
         duration_ms: u64,
         waveform: Vec<f32>,
     },
-    /// Send the picture that is on the system clipboard.
-    PasteImage,
+    /// Send the picture that is on the system clipboard into the
+    /// conversation named.
+    PasteImage {
+        room_id: String,
+        thread: Option<String>,
+    },
     /// Ctrl+V: hand the clipboard's picture (as a file) or text to the UI.
     ClipboardPaste,
     /// Search messages in one room (by id) or, with `None`, everywhere.
@@ -1194,7 +1331,10 @@ pub enum Command {
     },
     /// Load older messages of the open room.
     Paginate,
+    /// A new poll, in the conversation named.
     CreatePoll {
+        room_id: String,
+        thread: Option<String>,
         question: String,
         answers: Vec<String>,
         multiple: bool,
@@ -1304,8 +1444,12 @@ pub enum Command {
     },
     Recover(String),
     /// Store the user's own sections (this account's share) in its account
-    /// data ([`crate::sections`]).
-    SetSections(Vec<Section>),
+    /// data ([`crate::sections`]), as this device's write of this number
+    /// ([`crate::sections::Sync::to_send`] makes it).
+    SetSections {
+        write: u64,
+        sections: Vec<Section>,
+    },
     /// Have the homeserver send push notifications for this account to a
     /// phone ([`crate::push`]); or stop it.
     SetPusher(crate::push::Target),
@@ -1444,10 +1588,10 @@ async fn run(
     // (Ended with this backend: it holds a sender of the updates, and
     // whoever forwards them waits for the last sender to go, so a
     // signed-out account would else keep both tasks for good.)
-    let sections_written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (sections, sections_to_keep) = tokio::sync::watch::channel(None);
     let _watching = EndsWith(tokio::spawn(watch_sections(
         client.clone(),
-        Arc::clone(&sections_written),
+        sections.clone(),
         tx.clone(),
     )));
 
@@ -1552,7 +1696,6 @@ async fn run(
     tokio::spawn(account_lane(client.clone(), account_commands, tx.clone()));
     let (beside, beside_events) = mpsc::unbounded_channel();
     tokio::spawn(beside_lane(beside_events, tx.clone()));
-    let (sections, sections_to_keep) = tokio::sync::watch::channel(None);
     let _keeping = EndsWith(tokio::spawn(keep_sections(
         client.clone(),
         sections_to_keep,
@@ -1568,7 +1711,6 @@ async fn run(
         account,
         beside,
         sections,
-        sections_written,
     };
 
     let mut gate = EmptyListGate::default();
@@ -2053,9 +2195,6 @@ struct Session {
     beside: mpsc::UnboundedSender<Beside>,
     /// The sections to keep in the account, for [`keep_sections`].
     sections: tokio::sync::watch::Sender<SectionsToKeep>,
-    /// The number of the newest write of them asked for; the reader of
-    /// what the account stores ([`watch_sections`]) goes by it.
-    sections_written: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Session {
@@ -2073,6 +2212,13 @@ impl Session {
     /// - What only looks something up (search, room details, a link's
     ///   preview, a file, older messages) gets a task of its own.
     ///
+    /// (Events the timeline's queue cannot send, a vote in a format the
+    /// SDK has no type for, leave through [`beside_lane`].)
+    ///
+    /// What writes something new into the conversation says which one it
+    /// was written for, and is refused when another is followed
+    /// ([`written_into`]).
+    ///
     /// An error becomes a notice, whichever way.
     async fn handle(&mut self, command: Command) -> Result<()> {
         let Self {
@@ -2085,7 +2231,6 @@ impl Session {
             account,
             beside,
             sections: sections_to_keep,
-            sections_written,
         } = self;
         let (client, sync, tx) = (&*client, &*sync, &*tx);
         let own_user_id = own_user_id.as_deref();
@@ -2183,24 +2328,28 @@ impl Session {
                 text,
                 mentions,
             } => {
-                // The room and the view: a message written in a thread
-                // that then could not be opened must not go into the
-                // room's own conversation, which is followed in its place.
-                let current = open
-                    .as_ref()
-                    .filter(|current| current.room_id == room_id && current.thread == thread);
-                let current = current.ok_or_else(|| {
-                    anyhow!("The message was not sent: that conversation is no longer open.")
-                })?;
+                // Refused, the text goes back to whoever wrote it.
+                let Ok(timeline) = written_into(open, &room_id, &thread) else {
+                    let _ = tx.send(Update::NotSent {
+                        room_id,
+                        thread,
+                        text,
+                    });
+                    return Ok(());
+                };
                 let message = MessageParts::new(&text, &mentions);
-                current
-                    .timeline
+                timeline
                     .send(message.into_content().into())
                     .await
                     .context("could not send the message")?;
             }
-            Command::SendFile { path, caption } => {
-                let timeline = timeline_of(open)?;
+            Command::SendFile {
+                room_id,
+                thread,
+                path,
+                caption,
+            } => {
+                let timeline = written_into(open, &room_id, &thread)?;
                 let file = Attachment::prepare(&path, caption).await?;
                 let _ = tx.send(Update::Notice(format!("Sending {}…", file.name)));
                 timeline
@@ -2210,11 +2359,13 @@ impl Session {
                     .with_context(|| format!("could not send {}", file.name))?;
             }
             Command::SendVoice {
+                room_id,
+                thread,
                 path,
                 duration_ms,
                 waveform,
             } => {
-                let timeline = timeline_of(open)?;
+                let timeline = written_into(open, &room_id, &thread)?;
                 let mut file = Attachment::prepare(&path, None).await?;
                 file.make_voice(duration_ms, waveform);
                 timeline
@@ -2258,13 +2409,13 @@ impl Session {
                     let _ = tx.send(update);
                 });
             }
-            Command::PasteImage => {
+            Command::PasteImage { room_id, thread } => {
                 // Beside the loop, like the two below: a clipboard tool
                 // waits for the program that owns the clipboard, which
                 // may never answer, and a verification's start waits for
                 // the server. The picture goes into the conversation that
                 // was followed when it was asked for.
-                let timeline = Arc::clone(timeline_of(open)?);
+                let timeline = Arc::clone(written_into(open, &room_id, &thread)?);
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     let pasted = async {
@@ -2419,13 +2570,15 @@ impl Session {
                     .context("could not send the reaction")?;
             }
             Command::CreatePoll {
+                room_id,
+                thread,
                 question,
                 answers,
                 multiple,
                 hidden,
             } => {
                 let content = build_poll_start(&question, &answers, multiple, hidden)?;
-                timeline_of(open)?
+                written_into(open, &room_id, &thread)?
                     .send(AnyMessageLikeEventContent::UnstablePollStart(
                         UnstablePollStartEventContent::New(content),
                     ))
@@ -2577,28 +2730,18 @@ impl Session {
                             event_id,
                             path: path.display().to_string(),
                         },
-                        // In an app the folder is not one its user gets
-                        // to: there is no use in naming it.
-                        Ok((path, Opened::Kept))
-                            if HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed) =>
-                        {
-                            Update::Notice(format!(
-                                "{} was not opened: mothrix only opens pictures, sound, video \
-                                 and documents.",
-                                path.file_name().unwrap_or_default().to_string_lossy()
-                            ))
-                        }
+                        Ok((path, Opened::Kept)) => Update::MediaKept {
+                            event_id,
+                            name: unmarked(&path.file_name().unwrap_or_default().to_string_lossy())
+                                .to_owned(),
+                            path: path.display().to_string(),
+                        },
                         Ok((_, Opened::Playing)) => {
                             Update::Notice("Playing; /stop ends it.".to_owned())
                         }
                         Ok((path, Opened::Shown)) => {
                             Update::Notice(format!("Opened {}", path.display()))
                         }
-                        Ok((path, Opened::Kept)) => Update::Notice(format!(
-                            "Saved as {} and not opened: mothrix only opens pictures, sound, \
-                             video and documents by itself.",
-                            path.display()
-                        )),
                         Err(error) => Update::Notice(format!("{error:#}")),
                     };
                     let _ = tx.send(update);
@@ -2615,14 +2758,7 @@ impl Session {
                 let room = room_of(client, &room_id)?;
                 tokio::spawn(async move { read_newest(&room).await });
             }
-            Command::SetSections(sections) => {
-                use std::sync::atomic::Ordering;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_millis() as u64);
-                let write =
-                    crate::sections::next_write(sections_written.load(Ordering::Relaxed), now);
-                sections_written.store(write, Ordering::Relaxed);
+            Command::SetSections { write, sections } => {
                 let _ = sections_to_keep.send(Some((write, sections)));
             }
             Command::Leave { room_id } => {
@@ -3030,19 +3166,26 @@ fn spawn_verification(
 
 /// Start a verification of our asking: `ask` sends the request (to our
 /// other devices, or to another person), in the verification's own task,
-/// since the server may take its time over it. What the user answers
-/// meanwhile (Esc) waits there for it.
+/// since the server may take its time over it. Esc meanwhile ends it
+/// there and then ([`unless_given_up`]).
 fn start_verification(
     client: &Client,
     tx: &mpsc::UnboundedSender<Update>,
     ask: impl Future<Output = Result<VerificationRequest>> + Send + 'static,
 ) -> Verifying {
-    let (inputs_tx, inputs) = mpsc::unbounded_channel();
+    let (inputs_tx, mut inputs) = mpsc::unbounded_channel();
     let unanswered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (client, tx, waits) = (client.clone(), tx.clone(), Arc::clone(&unanswered));
     let _ = tx.send(Update::Verify(Some(VerifyState::Waiting)));
     tokio::spawn(async move {
-        let failed = match tokio::time::timeout(Duration::from_secs(60), ask).await {
+        let asking = tokio::time::timeout(Duration::from_secs(60), ask);
+        let Some(asked) = unless_given_up(asking, &mut inputs).await else {
+            // Without a word, but for closing the dialog should it
+            // still be there.
+            let _ = tx.send(Update::Verify(None));
+            return;
+        };
+        let failed = match asked {
             Ok(Ok(request)) => {
                 return verify::run(client, request, false, tx, inputs, waits).await;
             }
@@ -3054,6 +3197,28 @@ fn start_verification(
     Verifying {
         inputs: inputs_tx,
         unanswered,
+    }
+}
+
+/// What `asking` (a verification's request on its way to the server)
+/// comes to; none when the user gave it up meanwhile (Esc), or nobody
+/// waits for it any more. Left to wait for the request, the Esc was
+/// taken only once that was out, up to a minute later: the dialog, long
+/// closed, came back to say "Cancelled".
+async fn unless_given_up<T>(
+    asking: impl Future<Output = T>,
+    inputs: &mut mpsc::UnboundedReceiver<VerifyInput>,
+) -> Option<T> {
+    tokio::pin!(asking);
+    loop {
+        tokio::select! {
+            asked = &mut asking => return Some(asked),
+            input = inputs.recv() => match input {
+                Some(VerifyInput::Cancel) | None => return None,
+                // Nothing to accept or confirm yet.
+                Some(VerifyInput::Accept | VerifyInput::Confirm) => {}
+            },
+        }
     }
 }
 
@@ -3347,6 +3512,34 @@ async fn beside_lane(
     }
 }
 
+/// The conversation followed, for writing something new into it that was
+/// written for `room_id` and the `thread` there (none: the room's own
+/// conversation). Refused when that is not the one followed: a message
+/// written in a thread that then could not be opened must not go into
+/// the room's own conversation, which is followed in its place, nor a
+/// file picked in one room into another opened meanwhile.
+fn written_into<'a>(
+    open: &'a Option<OpenRoom>,
+    room_id: &str,
+    thread: &Option<String>,
+) -> Result<&'a Arc<Timeline>> {
+    open.as_ref()
+        .filter(|current| writes_into(&current.room_id, &current.thread, room_id, thread))
+        .map(|current| &current.timeline)
+        .ok_or_else(|| anyhow!("Not sent: that conversation is no longer open."))
+}
+
+/// Whether what was written for `room_id` and `thread` goes into the
+/// conversation followed (`open_room`, `open_thread`).
+fn writes_into(
+    open_room: &str,
+    open_thread: &Option<String>,
+    room_id: &str,
+    thread: &Option<String>,
+) -> bool {
+    open_room == room_id && open_thread == thread
+}
+
 fn timeline_of(open: &Option<OpenRoom>) -> Result<&Arc<Timeline>> {
     open.as_ref()
         .map(|current| &current.timeline)
@@ -3610,17 +3803,26 @@ fn saved_name(name: &str, event_id: &str, ending: Option<&'static str>, sound: b
     format!("{mark}-{name}")
 }
 
-/// What is done with a downloaded attachment saved as `name`. `sound`
-/// says of an audio message whether it begins like sound (`None`: not an
-/// audio message); `hand_over` that an app shows files itself.
-fn way_to_open(name: &str, sound: Option<bool>, hand_over: bool) -> Opened {
-    // An audio message that is no sound is something else under that
-    // name: nothing gets to open it, whatever its ending.
-    if sound == Some(false) || !opened_by_itself(name) {
+/// A saved attachment's name without the mark [`saved_name`] put in
+/// front: what its sender called it, for telling the user about it.
+fn unmarked(saved: &str) -> &str {
+    saved.split_once('-').map_or(saved, |(_, name)| name)
+}
+
+/// What is done with a downloaded attachment saved as `name`. `audio`:
+/// it came as an audio message; `sound`: it begins like sound
+/// ([`sound_ending`]); `hand_over`: an app shows files itself.
+fn way_to_open(name: &str, audio: bool, sound: bool, hand_over: bool) -> Opened {
+    // What came as sound or is called like sound, and does not begin
+    // like it, is something else under that name (a list of addresses a
+    // player would fetch): nothing gets to open it, whichever kind of
+    // message it was sent as.
+    let not_the_sound_it_says = (audio || named_as_sound(name)) && !sound;
+    if not_the_sound_it_says || !opened_by_itself(name) {
         Opened::Kept
     } else if hand_over {
         Opened::Handed
-    } else if sound == Some(true) && named_as_sound(name) {
+    } else if audio && named_as_sound(name) {
         Opened::Playing
     } else {
         Opened::Shown
@@ -3668,19 +3870,20 @@ async fn open_media(
         .join("media");
     // What an encrypted room sent lies here decrypted.
     crate::folders::private_dir(&dir)?;
-    let sound = matches!(message.msgtype(), MessageType::Audio(_));
+    let audio = matches!(message.msgtype(), MessageType::Audio(_));
     let ending = match message.msgtype() {
         MessageType::Image(_) => picture_ending(&bytes),
         MessageType::Audio(_) => sound_ending(&bytes),
         _ => None,
     };
-    let path = dir.join(saved_name(&name, event_id, ending, sound));
+    let path = dir.join(saved_name(&name, event_id, ending, audio));
     crate::folders::write_private(&path, &bytes)?;
 
     let hand_over = HAND_MEDIA_OVER.load(std::sync::atomic::Ordering::Relaxed);
     let way = way_to_open(
         &path.to_string_lossy(),
-        sound.then_some(ending.is_some()),
+        audio,
+        sound_ending(&bytes).is_some(),
         hand_over,
     );
     match way {
@@ -4014,9 +4217,9 @@ fn is_standard_poll_start(event: &AnySyncTimelineEvent) -> bool {
 
 /// Read every event that refers to a poll (its responses and end) from the
 /// server and hand them to the timeline task as raw JSON. A reading that
-/// did not get them all (no network, a server that says to wait, more
-/// pages than are read in one go) is no reading: it is made again after a
-/// pause, and again, until one is whole or the room is no longer followed.
+/// failed on the way (no network, a server that says to wait) is no
+/// reading: it is made again after a pause, and again, until one went
+/// through or the room is no longer followed.
 /// [`RoomWatch`] sees to it that one poll has one of these at a time.
 async fn load_poll_events(room: Room, poll_id: String, done: mpsc::UnboundedSender<PollLoaded>) {
     let Ok(event_id) = EventId::parse(&poll_id) else {
@@ -4043,35 +4246,70 @@ fn poll_retry_after(tries: usize) -> Duration {
     Duration::from_secs(WAITS[tries.min(WAITS.len() - 1)])
 }
 
-/// One reading of a poll's answers; none unless it got them all.
+/// One reading of a poll's answers; none when it failed on the way.
+/// Half an answer is none: counting only what came before the network
+/// failed would show a poll with votes missing, and the reading is made
+/// again.
 async fn read_poll_events(room: &Room, event_id: &EventId) -> Option<Vec<Value>> {
-    let mut events = Vec::new();
+    let mut read = PollPages::default();
     let mut from = None;
-    // Polls with thousands of votes are not a thing; cap the paging anyway.
-    for _ in 0..40 {
+    loop {
         let options = RelationsOptions {
-            from: from.clone(),
+            from: from.take(),
             include_relations: IncludeRelations::RelationsOfType(RelationType::Reference),
             // Not the server's own page size, which can be a handful.
             limit: Some(100u32.into()),
             ..Default::default()
         };
-        // Half an answer is none: counting only what came before the
-        // network failed would show a poll with votes missing or none.
         let page = room.relations(event_id.to_owned(), options).await.ok()?;
-        for event in &page.chunk {
-            if let Ok(value) = serde_json::from_str::<Value>(event.raw().json().get()) {
-                events.push(value);
-            }
-        }
-        match page.next_batch_token {
-            Some(token) => from = Some(token),
-            None => return Some(events),
+        let events = page
+            .chunk
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.raw().json().get()).ok());
+        match read.take(events, page.next_batch_token) {
+            Some(next) => from = Some(next),
+            None => break,
         }
     }
-    // Cut off with pages still to come: not all of them either.
-    tracing::warn!(poll_id = %event_id, "a poll has more answers than are read at once");
-    None
+    if read.cut_off {
+        tracing::warn!(
+            poll_id = %event_id,
+            "a poll has more answers than are read: it is counted from the first {}",
+            read.events.len()
+        );
+    }
+    Some(read.events)
+}
+
+/// How many pages of a poll's answers are read.
+const POLL_PAGES: usize = 40;
+
+/// A poll's answers as they are read from the server, page by page.
+#[derive(Default)]
+struct PollPages {
+    events: Vec<Value>,
+    pages: usize,
+    /// There were more pages than are read.
+    cut_off: bool,
+}
+
+impl PollPages {
+    /// A page was read: its events, and where the next one begins if
+    /// there is one. Returns where to read on; none when that was the
+    /// last page, or it is enough ([`POLL_PAGES`]). What was read by
+    /// then is the reading: calling it a failure had a poll with
+    /// thousands of answers read again for ever, and shown with no votes
+    /// at all.
+    fn take(
+        &mut self,
+        events: impl Iterator<Item = Value>,
+        next: Option<String>,
+    ) -> Option<String> {
+        self.events.extend(events);
+        self.pages += 1;
+        self.cut_off = next.is_some() && self.pages >= POLL_PAGES;
+        next.filter(|_| !self.cut_off)
+    }
 }
 
 /// A poll's answers as read from the server, all of them.
@@ -4465,18 +4703,203 @@ mod tests {
         assert_eq!(sound_ending(b"https://x"), None);
 
         // Hand a file to the app only when it is of a kind that is
-        // opened; `sound` is what an audio message's bytes say.
-        let way = |name: &str, sound: Option<bool>| way_to_open(name, sound, false);
-        assert_eq!(way("a.png", None), Opened::Shown);
-        assert_eq!(way("voice.ogg", Some(true)), Opened::Playing);
+        // opened. An audio message that begins like sound is played.
+        assert_eq!(way_to_open("a.png", false, false, false), Opened::Shown);
+        assert_eq!(way_to_open("voice.ogg", true, true, false), Opened::Playing);
         // A sound file sent as a file goes to the desktop's player.
-        assert_eq!(way("song.mp3", None), Opened::Shown);
+        assert_eq!(way_to_open("song.mp3", false, true, false), Opened::Shown);
         for name in ["invoice.html", "x.svg", "page.webarchive", "model.usdz"] {
-            assert_eq!(way(name, None), Opened::Kept, "{name}");
-            assert_eq!(way_to_open(name, None, true), Opened::Kept, "{name}");
+            assert_eq!(
+                way_to_open(name, false, false, false),
+                Opened::Kept,
+                "{name}"
+            );
+            assert_eq!(
+                way_to_open(name, false, false, true),
+                Opened::Kept,
+                "{name}"
+            );
         }
-        assert_eq!(way_to_open("a.png", None, true), Opened::Handed);
-        assert_eq!(way_to_open("voice.ogg", Some(true), true), Opened::Handed);
+        assert_eq!(way_to_open("a.png", false, false, true), Opened::Handed);
+        assert_eq!(way_to_open("voice.ogg", true, true, true), Opened::Handed);
+        // The user is told of a kept file by its sender's name.
+        let saved = saved_name("in-voice 3.html", "$1", None, false);
+        assert_eq!(super::unmarked(&saved), "in-voice 3.html");
+    }
+
+    #[test]
+    fn what_is_called_like_sound_and_is_none_reaches_no_player_as_a_file_or_video_either() {
+        use super::{Opened, saved_name, sound_ending, way_to_open};
+        // A list of addresses called `voice.ogg`, sent as a file or as a
+        // video: the desktop would hand it to its player by its name.
+        let list = b"#EXTM3U\nhttps://example.org/a.mp3";
+        let name = saved_name("voice.ogg", "$1", None, false);
+        let sound = sound_ending(list).is_some();
+        for hand_over in [false, true] {
+            assert_eq!(way_to_open(&name, false, sound, hand_over), Opened::Kept);
+        }
+        // Real sound sent as a file opens as before, and so does what is
+        // not called like sound.
+        let sound = sound_ending(b"OggS\0\x02").is_some();
+        assert_eq!(way_to_open(&name, false, sound, false), Opened::Shown);
+        assert_eq!(way_to_open("film.mp4", false, false, false), Opened::Shown);
+        assert_eq!(way_to_open("notes.pdf", false, false, true), Opened::Handed);
+    }
+
+    #[test]
+    fn what_was_written_for_another_conversation_than_the_one_followed_is_refused() {
+        use super::{Command, writes_into};
+        let thread = Some("$root".to_owned());
+        // The thread did not open, and the room is followed in its
+        // place; or another room was opened meanwhile.
+        assert!(!writes_into("!a", &None, "!a", &thread));
+        assert!(!writes_into("!a", &thread, "!a", &None));
+        assert!(!writes_into("!b", &None, "!a", &None));
+        assert!(!writes_into("!a", &thread, "!a", &Some("$other".into())));
+        assert!(writes_into("!a", &None, "!a", &None));
+        assert!(writes_into("!a", &thread, "!a", &thread));
+        // Everything that writes into the conversation names it: these
+        // are routed by their room, like `Send`.
+        let place = || ("!a".to_owned(), thread.clone());
+        let (room_id, thread) = place();
+        let mut commands = vec![
+            Command::Send {
+                room_id: room_id.clone(),
+                thread: thread.clone(),
+                text: String::new(),
+                mentions: Vec::new(),
+            },
+            Command::SendFile {
+                room_id: room_id.clone(),
+                thread: thread.clone(),
+                path: String::new(),
+                caption: None,
+            },
+            Command::SendVoice {
+                room_id: room_id.clone(),
+                thread: thread.clone(),
+                path: String::new(),
+                duration_ms: 0,
+                waveform: Vec::new(),
+            },
+            Command::CreatePoll {
+                room_id: room_id.clone(),
+                thread: thread.clone(),
+                question: String::new(),
+                answers: Vec::new(),
+                multiple: false,
+                hidden: false,
+            },
+            Command::PasteImage { room_id, thread },
+        ];
+        for command in &mut commands {
+            let room = command.room_id_mut().map(|room| room.clone());
+            assert_eq!(room.as_deref(), Some("!a"), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_device_is_signed_out_with_its_token_alone_at_the_session_s_homeserver() {
+        use super::{logout_answer, logout_request};
+        let client = matrix_sdk::reqwest::Client::new();
+        for homeserver in ["https://matrix.example.org/", " https://matrix.example.org"] {
+            let request = logout_request(&client, homeserver, "syt_secret").unwrap();
+            assert_eq!(request.method().as_str(), "POST");
+            assert_eq!(
+                request.url().as_str(),
+                "https://matrix.example.org/_matrix/client/v3/logout"
+            );
+            assert_eq!(request.headers()["authorization"], "Bearer syt_secret");
+            assert!(request.timeout().is_some());
+            // The token is in the header alone.
+            assert!(!request.url().as_str().contains("syt_secret"));
+        }
+        // A server under a path keeps it; what is no address is refused.
+        let request = logout_request(&client, "http://127.0.0.1:16167/hs", "t").unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "http://127.0.0.1:16167/hs/_matrix/client/v3/logout"
+        );
+        assert!(logout_request(&client, "matrix.example.org", "t").is_err());
+        assert!(logout_request(&client, "", "t").is_err());
+
+        assert!(logout_answer(200, "{}").is_ok());
+        // Signed out already: that is what was wanted.
+        assert!(logout_answer(401, r#"{"errcode":"M_UNKNOWN_TOKEN"}"#).is_ok());
+        // A token that ran out still names a device of the account.
+        let soft = r#"{"errcode":"M_UNKNOWN_TOKEN","soft_logout":true}"#;
+        assert!(logout_answer(401, soft).is_err());
+        assert!(logout_answer(401, r#"{"errcode":"M_MISSING_TOKEN"}"#).is_err());
+        assert!(logout_answer(502, "<html>").is_err());
+    }
+
+    #[test]
+    fn the_way_to_remove_an_account_names_its_profile() {
+        let paths = |profile: &str| super::Paths {
+            config_file: "/c/config.toml".into(),
+            data_dir: std::path::Path::new("/d").join(profile),
+        };
+        assert_eq!(super::logout_command(&paths("default")), "mothrix logout");
+        assert_eq!(
+            super::logout_command(&paths("work")),
+            "mothrix logout --profile work"
+        );
+    }
+
+    #[test]
+    fn a_poll_with_more_answers_than_are_read_is_counted_from_what_was_read() {
+        use super::{POLL_PAGES, PollPages};
+        let vote = || serde_json::json!({"type": "m.poll.response"});
+        let votes = || [vote(), vote()].into_iter();
+        // Pages without end: the reading stops, and is one.
+        let mut read = PollPages::default();
+        let mut pages = 0;
+        while read.take(votes(), Some("next".to_owned())).is_some() {
+            pages += 1;
+            assert!(pages < 1000, "read for ever");
+        }
+        assert_eq!(read.pages, POLL_PAGES);
+        assert_eq!(read.events.len(), 2 * POLL_PAGES);
+        assert!(read.cut_off);
+        // A poll of three pages is read whole, from token to token.
+        let mut read = PollPages::default();
+        assert_eq!(read.take(votes(), Some("b".into())).as_deref(), Some("b"));
+        assert_eq!(read.take(votes(), Some("c".into())).as_deref(), Some("c"));
+        assert_eq!(read.take(votes(), None), None);
+        assert_eq!((read.events.len(), read.cut_off), (6, false));
+        // One of exactly as many pages as are read is whole too.
+        let mut read = PollPages::default();
+        for _ in 1..POLL_PAGES {
+            read.take(votes(), Some("next".into()));
+        }
+        assert_eq!(read.take(votes(), None), None);
+        assert!(!read.cut_off);
+    }
+
+    #[tokio::test]
+    async fn a_verification_given_up_while_its_request_is_on_the_way_ends_there() {
+        use super::{VerifyInput, mpsc, unless_given_up};
+        // The server takes its time over the request, and the user
+        // presses Esc: over at once, not when the server answers.
+        let (tx, mut inputs) = mpsc::unbounded_channel();
+        tx.send(VerifyInput::Confirm).unwrap();
+        tx.send(VerifyInput::Cancel).unwrap();
+        let never = std::future::pending::<u8>();
+        assert_eq!(unless_given_up(never, &mut inputs).await, None);
+        // Nobody waits for it any more.
+        let (tx, mut inputs) = mpsc::unbounded_channel::<VerifyInput>();
+        drop(tx);
+        let never = std::future::pending::<u8>();
+        assert_eq!(unless_given_up(never, &mut inputs).await, None);
+        // Left alone, the request goes out; a key that answers nothing
+        // yet does not end it.
+        let (tx, mut inputs) = mpsc::unbounded_channel();
+        tx.send(VerifyInput::Accept).unwrap();
+        let soon = async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            7
+        };
+        assert_eq!(unless_given_up(soon, &mut inputs).await, Some(7));
     }
 
     #[test]
@@ -4488,23 +4911,23 @@ mod tests {
         let name = saved_name("voice.ogg", "$1", sound_ending(list), true);
         assert!(name.ends_with("-voice.ogg"), "{name}");
         for hand_over in [false, true] {
-            assert_eq!(way_to_open(&name, Some(false), hand_over), Opened::Kept);
+            assert_eq!(way_to_open(&name, true, false, hand_over), Opened::Kept);
         }
         // A list that begins like sound, under a list's name: saved as
         // the sound it begins like, so that mpv does not read it by its
         // name.
         let name = saved_name("voice.m3u", "$1", sound_ending(b"OggS\nhttps://x"), true);
         assert!(name.ends_with("-voice.m3u.ogg"), "{name}");
-        assert_eq!(way_to_open(&name, Some(true), false), Opened::Playing);
+        assert_eq!(way_to_open(&name, true, true, false), Opened::Playing);
         // Also under a name that is opened, but not as sound.
         let name = saved_name("voice.txt", "$1", sound_ending(b"OggS\0"), true);
         assert!(name.ends_with("-voice.txt.ogg"), "{name}");
         // And never played under a name mpv could read as a list.
-        assert_eq!(way_to_open("voice.txt", Some(true), false), Opened::Shown);
-        assert_eq!(way_to_open("voice.m3u", Some(true), false), Opened::Kept);
+        assert_eq!(way_to_open("voice.txt", true, true, false), Opened::Shown);
+        assert_eq!(way_to_open("voice.m3u", true, true, false), Opened::Kept);
         // A voice message without an ending still plays.
         let name = saved_name("Voice message", "$1", sound_ending(b"OggS\0"), true);
-        assert_eq!(way_to_open(&name, Some(true), false), Opened::Playing);
+        assert_eq!(way_to_open(&name, true, true, false), Opened::Playing);
     }
 
     #[test]

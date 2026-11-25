@@ -116,17 +116,19 @@ fn hit_from_event(
 }
 
 /// A hit out of the server's answer: for a room that was asked about
-/// (`names`), and not for an encrypted one. The server cannot read those,
-/// so a "message" it finds there is one it made up, and would stand
-/// among the real ones under the room's and a member's name.
+/// (`names`), and only one known not to be encrypted (`plain`). The
+/// server cannot read the others, so a "message" it finds there is one
+/// it made up, and would stand among the real ones under the room's and
+/// a member's name. A room whose state is not known yet (just joined,
+/// just started) may be encrypted: it counts as that.
 fn hit_from_server(
     event: &Value,
     names: &HashMap<String, String>,
-    encrypted: &HashSet<String>,
+    plain: &HashSet<String>,
     terms: &[String],
 ) -> Option<SearchHit> {
     let room_id = event["room_id"].as_str()?;
-    if encrypted.contains(room_id) {
+    if !plain.contains(room_id) {
         return None;
     }
     hit_from_event(event, room_id, names.get(room_id)?, terms)
@@ -154,11 +156,16 @@ pub async fn search(client: &Client, query: &str, only_room: Option<&RoomId>) ->
         None => client.joined_rooms(),
     };
     let mut names = HashMap::new();
-    let mut encrypted = HashSet::new();
+    // The rooms known not to be encrypted, as for link previews
+    // (`matrix::previews_links`).
+    let mut plain = HashSet::new();
     for room in &rooms {
         names.insert(room.room_id().to_string(), room_name(room).await);
-        if room.encryption_state().is_encrypted() {
-            encrypted.insert(room.room_id().to_string());
+        if matches!(
+            room.encryption_state(),
+            matrix_sdk::EncryptionState::NotEncrypted
+        ) {
+            plain.insert(room.room_id().to_string());
         }
     }
 
@@ -196,13 +203,10 @@ pub async fn search(client: &Client, query: &str, only_room: Option<&RoomId>) ->
 
     // 2. The server, for history this device never loaded. Best effort:
     // some servers do not offer search at all.
-    // Not for one encrypted room: the server cannot search it, and would
-    // only learn what was looked for in it.
-    if let Some(room_id) = only_room
-        && let Ok(room_id) = matrix_sdk::ruma::RoomId::parse(room_id)
-        && let Some(room) = client.get_room(&room_id)
-        && room.encryption_state().is_encrypted()
-    {
+    // For one room only when it is known not to be encrypted: the server
+    // cannot search another, and would only learn what was looked for in
+    // it.
+    if only_room.is_some_and(|room_id| !plain.contains(room_id.as_str())) {
         return hits;
     }
     let mut criteria = Criteria::new(query.trim().to_owned());
@@ -217,7 +221,7 @@ pub async fn search(client: &Client, query: &str, only_room: Option<&RoomId>) ->
             let Ok(value) = serde_json::from_str::<Value>(raw.json().get()) else {
                 continue;
             };
-            if let Some(hit) = hit_from_server(&value, &names, &encrypted, &terms)
+            if let Some(hit) = hit_from_server(&value, &names, &plain, &terms)
                 && seen.insert(hit.event_id.clone())
             {
                 hits.push(hit);
@@ -307,21 +311,24 @@ mod tests {
     #[test]
     fn the_server_s_hits_for_encrypted_and_unknown_rooms_are_dropped() {
         let terms = terms("iban");
-        let names: HashMap<String, String> = [("!open", "Club"), ("!dm", "Amy")]
+        let names: HashMap<String, String> = [("!open", "Club"), ("!dm", "Amy"), ("!new", "Ben")]
             .into_iter()
             .map(|(id, name)| (id.to_owned(), name.to_owned()))
             .collect();
-        let encrypted: HashSet<String> = ["!dm".to_owned()].into();
+        // Known not to be encrypted: only that one. "!dm" is encrypted,
+        // and of "!new" (just joined) nothing is known yet.
+        let plain: HashSet<String> = ["!open".to_owned()].into();
         let event = |room: &str| {
             json!({
                 "type": "m.room.message", "event_id": "$1", "sender": "@amy:x", "room_id": room,
                 "content": {"msgtype": "m.text", "body": "my new IBAN is DE00"},
             })
         };
-        let hit = |room: &str| hit_from_server(&event(room), &names, &encrypted, &terms);
+        let hit = |room: &str| hit_from_server(&event(room), &names, &plain, &terms);
         assert_eq!(hit("!open").expect("a hit").room_name, "Club");
         // The server cannot read the direct chat: this one is invented.
         assert!(hit("!dm").is_none());
+        assert!(hit("!new").is_none());
         assert!(hit("!elsewhere").is_none());
     }
 }

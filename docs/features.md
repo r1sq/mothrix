@@ -9,7 +9,9 @@ Everything the terminal client can do, by topic. Keys and commands are in
   with unread and mention counts
 - An invitation is joined by opening it twice in a row: the first time
   mothrix says what it is, and any other key or click (or a minute)
-  takes the question back; its menu's "Leave…" turns it down
+  takes the question back; its menu's "Leave…" turns it down. Only your
+  own key, click or tap joins: a room that opens by itself (the one open
+  last time, which is an invitation now) is marked in the list instead
 - Right-click a room or person for its menu: open, pin, move to a
   section, low priority, notifications
 - Pin a room or person to the top (the menu, or `p`); pins use the
@@ -25,7 +27,9 @@ Everything the terminal client can do, by topic. Keys and commands are in
   not encrypted): every device of it, the iPhone app too, lists rooms
   alike, under the same rules: names match regardless of case, a section
   goes once nothing is left in it, and a folded section stays folded
-  when it is renamed
+  when it is renamed. A change made without network is sent when it is
+  back, unless another device changed the sections meanwhile: then
+  theirs stand
 - Sort each section by recent activity, name, or unread first (`s`, or
   click `sort:` below the list)
 - Spaces: their rooms are listed under the space's name, subspaces one
@@ -76,7 +80,8 @@ Everything the terminal client can do, by topic. Keys and commands are in
   (food.example)`
 - Opening an attachment hands pictures, sound, video and documents to the
   desktop's program for them; anything else (programs, scripts, web
-  pages) is only saved, and mothrix says where
+  pages, and what is called like sound but does not begin like it) is
+  only saved, and mothrix says where
 
 ## Polls
 

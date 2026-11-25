@@ -78,7 +78,10 @@ Typing `/` in the message box lists the commands; `Tab` completes one,
 `<who>` is a Matrix ID, or a name completed with `@`. A message that is to
 begin with a slash starts with two (`//usr/bin` sends `/usr/bin`); what is
 no command stays in the message box, and so does what needs a room while
-none is open.
+none is open: it is there when you open one (after that room's draft, if
+it has one). A message the account could not send into the conversation
+it was written in (a thread that did not open) comes back into the
+message box too.
 
 ## Several accounts
 
@@ -112,6 +115,9 @@ same encryption keys. An account that cannot start (its session file is
 damaged, the keyring does not give out its passphrase) is left out the
 same way and named in the status bar; nothing of it is deleted, and
 `mothrix logout --profile NAME` removes it when it is not coming back.
+That signs the device out on the server too, with the session file's
+token where the store no longer opens; when the server cannot be told,
+mothrix says so, and the session is to be removed from another device.
 
 Signing an account out takes its rooms out of your sections on this
 computer (the account keeps its sections for its other devices and for
