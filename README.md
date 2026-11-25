@@ -8,6 +8,34 @@
   A <a href="https://matrix.org">Matrix</a> client for the terminal, and for the iPhone, written in Rust.
 </p>
 
+<p align="center">
+  <a href="https://github.com/r1sq/mothrix/releases/latest"><img src="https://img.shields.io/github/v/release/r1sq/mothrix?include_prereleases&label=release" alt="latest release"></a>
+  <a href="https://github.com/r1sq/mothrix/actions/workflows/ci.yml"><img src="https://github.com/r1sq/mothrix/actions/workflows/ci.yml/badge.svg?branch=main" alt="ci"></a>
+  <a href="https://github.com/r1sq/mothrix/actions/workflows/release.yml"><img src="https://github.com/r1sq/mothrix/actions/workflows/release.yml/badge.svg" alt="release build"></a>
+  <img src="https://img.shields.io/badge/status-alpha-orange" alt="status: alpha">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/r1sq/mothrix" alt="license: MPL-2.0"></a>
+  <img src="https://img.shields.io/badge/rust-1.100-b7410e?logo=rust" alt="Rust 1.100">
+</p>
+
+> [!WARNING]
+> **mothrix is alpha software.** It is young: expect bugs, missing pieces
+> and changes between releases.
+>
+> - **Keep another way into your account.** Save your recovery key (`/backup`)
+>   and keep a second verified client (Element, or another device), so that
+>   a bug in mothrix cannot lock you out of your encrypted messages.
+> - **It has not been audited independently.** The encryption itself is
+>   [matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk)'s, but
+>   the code around it is mothrix's own and has only been reviewed by its
+>   makers (with AI tools, see [below](#developed-with-ai)). Think twice before
+>   trusting it with conversations where a mistake would hurt.
+> - **Some of it was never tried against a real server or device**: see
+>   "Open" in [AGENTS.md](AGENTS.md#open) for the list. Servers that only
+>   offer OAuth login are not supported yet, and macOS was never run.
+> - **The iPhone app** is not in the App Store; it is tried out through TestFlight.
+>
+> Bugs and surprises are welcome as [issues](https://github.com/r1sq/mothrix/issues).
+
 ![mothrix in kitty: the room list, a picture, a code block, reactions](docs/screenshots/terminal.png)
 
 mothrix is a chat client for people who live in the terminal: a room list
@@ -86,6 +114,20 @@ mothrix --snapshot 8 --room NAME   # sync for 8 s, then print the screen as text
 
 [AGENTS.md](AGENTS.md) has the rest: the layout of the code, how to try a
 change against the test server, and the things that are not obvious.
+
+## Developed with AI
+
+mothrix is developed with the help of AI. Most of its code, tests and
+documentation were written by an AI model (Claude, through Claude Code),
+with a person deciding what to build, reviewing the changes, and trying
+them out in the terminal and on the phone. The code reviews and security
+audits in its history were also done with AI, not by an independent
+auditor.
+
+That is one more reason for the warning at the top: read the code before
+you rely on it, and report what looks wrong. Every change goes through
+the same tests (`cargo test --workspace`, with screens rendered and
+clicked), lints and CI as any other.
 
 ## Thanks
 
